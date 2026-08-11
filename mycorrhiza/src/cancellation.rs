@@ -2,6 +2,10 @@
 
 use crate::delegate::Action0;
 use crate::intrinsics::RustcCLRInteropManagedStruct;
+use crate::managed_option::{
+    ManagedRef, rustc_clr_interop_managed_box_free, rustc_clr_interop_managed_box_get,
+    rustc_clr_interop_managed_box_new,
+};
 
 const CORELIB: &str = "System.Private.CoreLib";
 const TOKEN: &str = "System.Threading.CancellationToken";
@@ -11,27 +15,22 @@ const REGISTRATION: &str = "System.Threading.CancellationTokenRegistration";
 pub type CancellationToken =
     RustcCLRInteropManagedStruct<CORELIB, TOKEN, { core::mem::size_of::<usize>() }>;
 type RawRegistration = RustcCLRInteropManagedStruct<CORELIB, REGISTRATION, 16>;
+type RawAction = crate::bindings::System::Action;
 type Callback = dyn Fn() + Send + Sync;
+
+fn unregister_registration(registration: RawRegistration) -> bool {
+    registration.vt_instance0::<"Unregister", bool>()
+}
+
+fn dispose_registration(registration: RawRegistration) {
+    registration.vt_instance0::<"Dispose", ()>();
+}
 
 /// Zero-sized Rust error used by cooperative cancellation checks. Export a `Result<_,
 /// CancellationRequested>` through `#[dotnet_export(cancellation = "task")]` to turn this marker
 /// into genuine CLR task cancellation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CancellationRequested;
-
-#[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
-#[inline(never)]
-fn rustc_clr_interop_managed_box_new<T>(value: T) -> *mut u8 {
-    core::intrinsics::abort()
-}
-
-#[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
-#[inline(never)]
-unsafe fn rustc_clr_interop_managed_box_take<T>(handle: *mut u8) -> T {
-    core::intrinsics::abort()
-}
 
 impl CancellationToken {
     /// `CancellationToken.None`.
@@ -75,14 +74,12 @@ impl CancellationToken {
         let mut owner = Box::new(callback);
         let env = (&mut *owner as *mut Box<Callback>).cast::<()>();
         let action = unsafe { Action0::from_owned_env(env, cancellation_trampoline) };
-        let registration = self
-            .vt_instance1::<"Register", crate::bindings::System::Action, RawRegistration>(
-                action.handle(),
-            );
+        let registration =
+            self.vt_instance1::<"Register", RawAction, RawRegistration>(action.handle());
         CancellationRegistration {
-            registration,
+            registration: ManagedRef::from_raw(registration),
             active: true,
-            _action: action,
+            _action: ManagedRef::from_raw(action.handle()),
             callback: Some(owner),
         }
     }
@@ -98,8 +95,8 @@ impl Default for CancellationToken {
 ///
 /// The raw CLR value contains a managed reference and therefore cannot be stored directly in
 /// Rust's overlapping async-state layout. `Cancellation` keeps the boxed value behind a GCHandle
-/// token (a plain native pointer in Rust state), briefly unboxing and immediately re-rooting it in
-/// non-async helper calls when polling.
+/// token (a plain native pointer in Rust state). Polling copies the boxed value through the live
+/// root without consuming it, so even a caught managed exception cannot invalidate this wrapper.
 pub struct Cancellation {
     rooted_token: *mut u8,
 }
@@ -108,26 +105,27 @@ impl Cancellation {
     #[inline]
     pub fn from_token(token: CancellationToken) -> Self {
         Self {
-            rooted_token: rustc_clr_interop_managed_box_new(token),
+            // SAFETY: the token is an audited CLR value type and the returned opaque GCHandle is
+            // owned by this wrapper until Drop.
+            rooted_token: unsafe { rustc_clr_interop_managed_box_new(token) },
         }
     }
 
     #[inline(never)]
     pub fn is_cancellation_requested(&mut self) -> bool {
+        // SAFETY: `rooted_token` remains owned and live for this wrapper. ManagedBoxGet copies the
+        // CLR value without freeing the GCHandle, including when the property getter throws.
         let token =
-            unsafe { rustc_clr_interop_managed_box_take::<CancellationToken>(self.rooted_token) };
-        let requested = token.is_cancellation_requested();
-        self.rooted_token = rustc_clr_interop_managed_box_new(token);
-        requested
+            unsafe { rustc_clr_interop_managed_box_get::<CancellationToken>(self.rooted_token) };
+        token.is_cancellation_requested()
     }
 
     #[inline(never)]
     pub fn can_be_canceled(&mut self) -> bool {
+        // SAFETY: same non-consuming rooted read as `is_cancellation_requested`.
         let token =
-            unsafe { rustc_clr_interop_managed_box_take::<CancellationToken>(self.rooted_token) };
-        let can_be_canceled = token.can_be_canceled();
-        self.rooted_token = rustc_clr_interop_managed_box_new(token);
-        can_be_canceled
+            unsafe { rustc_clr_interop_managed_box_get::<CancellationToken>(self.rooted_token) };
+        token.can_be_canceled()
     }
 
     /// Coroutine-safe `?`-based cooperative cancellation check.
@@ -144,8 +142,7 @@ impl Cancellation {
 impl Drop for Cancellation {
     #[inline(never)]
     fn drop(&mut self) {
-        let _ =
-            unsafe { rustc_clr_interop_managed_box_take::<CancellationToken>(self.rooted_token) };
+        unsafe { rustc_clr_interop_managed_box_free(self.rooted_token) };
     }
 }
 
@@ -158,9 +155,9 @@ extern "C" fn cancellation_trampoline(env: *mut ()) {
 /// Dropping it performs the synchronous CLR `Dispose`, which waits out a racing callback before the
 /// Rust environment is reclaimed.
 pub struct CancellationRegistration {
-    registration: RawRegistration,
+    registration: ManagedRef<RawRegistration>,
     active: bool,
-    _action: Action0,
+    _action: ManagedRef<RawAction>,
     callback: Option<Box<Box<Callback>>>,
 }
 
@@ -174,7 +171,7 @@ impl CancellationRegistration {
     /// because the callback may already be running.
     pub fn try_unregister(mut self) -> Result<(), Self> {
         assert!(self.active, "registration is already inactive");
-        if self.registration.vt_instance0::<"Unregister", bool>() {
+        if self.registration.with_raw(unregister_registration) {
             self.active = false;
             self.callback.take();
             Ok(())
@@ -190,7 +187,7 @@ impl CancellationRegistration {
 
     fn dispose_inner(&mut self) {
         if self.active {
-            self.registration.vt_instance0::<"Dispose", ()>();
+            self.registration.with_raw(dispose_registration);
             self.active = false;
             self.callback.take();
         }

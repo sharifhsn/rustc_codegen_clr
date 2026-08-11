@@ -1,4 +1,4 @@
-use crate::ManagedSafe;
+use crate::{ManagedInteropType, ManagedRootableType, ManagedSafe};
 
 /// A handle to a managed reference type, identified *only* by its `(ASSEMBLY, CLASS_PATH)` const
 /// generic parameters — there is no other field that distinguishes one instantiation from another.
@@ -53,6 +53,18 @@ pub fn rustc_clr_interop_managed_get_field<
     owner: Owner,
 ) -> Ret {
     core::intrinsics::abort();
+}
+
+/// Produce the CLR default value of a concrete managed type directly in its managed destination
+/// (`initobj` for value types, `null` for references). This avoids routing opaque CLR value types
+/// through Rust's `MaybeUninit` byte-storage machinery.
+///
+/// # Safety
+/// `T` must be the exact concrete CLR type expected by the receiving managed API.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
+#[inline(never)]
+pub unsafe fn rustc_clr_interop_managed_default<T: ManagedRootableType>() -> T {
+    core::intrinsics::abort()
 }
 
 impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
@@ -567,6 +579,79 @@ pub struct RustcCLRInteropMethodGeneric<const N: usize>;
 pub struct RustcCLRInteropByRef<Inner> {
     _pd: core::marker::PhantomData<Inner>,
 }
+
+// These unsafe impls are the compiler-visible authority for raw CLR type interpretation. Keep
+// this list in lockstep with the backend's exhaustive marker-name dispatch. In particular, this
+// capability does *not* imply NativeStorageSafe: class/array/byref markers remain stack-only and a
+// managed value type needs its own audited native-storage capability before entering Rust bytes.
+unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str> ManagedInteropType
+    for RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
+{
+}
+unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str> ManagedRootableType
+    for RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
+{
+}
+unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str>
+    crate::ManagedReferenceType for RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH>
+{
+}
+unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const SIZE: usize>
+    ManagedInteropType for RustcCLRInteropManagedStruct<ASSEMBLY, CLASS_PATH, SIZE>
+{
+}
+unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, const SIZE: usize>
+    ManagedRootableType for RustcCLRInteropManagedStruct<ASSEMBLY, CLASS_PATH, SIZE>
+{
+}
+unsafe impl ManagedInteropType for RustcCLRInteropManagedChar {}
+unsafe impl ManagedRootableType for RustcCLRInteropManagedChar {}
+unsafe impl<T, const DIMENSIONS: usize> ManagedInteropType
+    for RustcCLRInteropManagedArray<T, DIMENSIONS>
+{
+}
+unsafe impl<T, const DIMENSIONS: usize> ManagedRootableType
+    for RustcCLRInteropManagedArray<T, DIMENSIONS>
+{
+}
+unsafe impl<T, const DIMENSIONS: usize> crate::ManagedReferenceType
+    for RustcCLRInteropManagedArray<T, DIMENSIONS>
+{
+}
+unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics>
+    ManagedInteropType for RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics>
+{
+}
+unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics>
+    ManagedRootableType for RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics>
+{
+}
+unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics>
+    crate::ManagedReferenceType
+    for RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics>
+{
+}
+unsafe impl<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const SIZE: usize,
+    ClassGenerics,
+> ManagedInteropType
+    for RustcCLRInteropManagedGenericStruct<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>
+{
+}
+unsafe impl<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const SIZE: usize,
+    ClassGenerics,
+> ManagedRootableType
+    for RustcCLRInteropManagedGenericStruct<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>
+{
+}
+unsafe impl<const N: usize> ManagedInteropType for RustcCLRInteropTypeGeneric<N> {}
+unsafe impl<const N: usize> ManagedInteropType for RustcCLRInteropMethodGeneric<N> {}
+unsafe impl<Inner> ManagedInteropType for RustcCLRInteropByRef<Inner> {}
 
 unsafe impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str, ClassGenerics> ManagedSafe
     for RustcCLRInteropManagedGeneric<ASSEMBLY, CLASS_PATH, ClassGenerics>

@@ -30,7 +30,11 @@ impl DayOfWeek {
     #[inline(always)]
     fn managed(self) -> RawDayOfWeek {
         // `System.DayOfWeek` is an Int32-backed managed enum.
-        unsafe { core::mem::transmute::<i32, RawDayOfWeek>(self as i32) }
+        unsafe {
+            crate::enums::rustc_clr_interop_enum_from_repr::<{ CORELIB }, { DAY_OF_WEEK }, 4, i32>(
+                self as i32,
+            )
+        }
     }
 }
 

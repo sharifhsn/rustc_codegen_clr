@@ -16,8 +16,8 @@
 //! Methods can only be attached to a class that is already registered, so we accumulate the class shape
 //! as plain data while walking the MIR and build + register everything in one shot at `finish_type`.
 
-use crate::call_info::CallInfo;
-use crate::fn_ctx::{MethodCompileCtx, fn_name};
+use crate::abi::AbiPlan;
+use crate::fn_ctx::{MethodCompileCtx, fn_name_for_instance};
 use crate::r#type::get_type;
 use crate::r#type::utilis::garg_to_string;
 use cilly::cilnode::MethodKind;
@@ -29,9 +29,12 @@ use cilly::{
 };
 use cilly::{Const, EnumDef};
 use cilly::{Float, Int};
+use rustc_data_structures::fx::FxHashSet;
+use rustc_middle::mir::interpret::{AllocId, GlobalAlloc};
 use rustc_middle::mir::{Mutability, Rvalue, StatementKind, TerminatorKind};
+use rustc_middle::mono::{CollectionMode, MonoItem};
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::{Instance, TyKind, TypingEnv};
+use rustc_middle::ty::{GenericArgs, Instance, InstanceKind, TyCtxt, TyKind, TypingEnv};
 
 use crate::utilis::{garg_to_bool, garg_to_usize};
 
@@ -490,7 +493,7 @@ pub fn interpret<'tcx>(
                 let call_instance = Instance::try_resolve(ctx.tcx(), env, *def_id, subst_ref)
                     .expect("comptime: invalid function def")
                     .expect("comptime: could not resolve callee instance");
-                let fname = fn_name(ctx.tcx().symbol_name(call_instance));
+                let fname = fn_name_for_instance(ctx.tcx(), call_instance);
 
                 let dest_local = destination
                     .as_local()
@@ -1828,6 +1831,207 @@ fn property_nullability_from_spec(spec: &str, getter: bool) -> Option<u8> {
     matches!(flag, 1 | 2).then_some(flag)
 }
 
+/// Dependency-first monomorphization closure for one comptime-declared alias target.
+///
+/// `items_of_instance` is the same pinned rustc query used by the mono collector for MIR function
+/// edges. Static allocations need the collector's small companion walk because their provenance
+/// graph, rather than MIR, owns their function/static edges. Keeping this walk here is important:
+/// lowering only the alias target leaves private generic helpers as reachable `MethodImpl::Missing`
+/// methods, while guessing from CIL call nodes would miss drop glue, vtables, and const provenance.
+struct AliasMonoClosure<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    visiting: FxHashSet<MonoItem<'tcx>>,
+    visited: FxHashSet<MonoItem<'tcx>>,
+    allocations: FxHashSet<AllocId>,
+    ordered: Vec<MonoItem<'tcx>>,
+}
+
+impl<'tcx> AliasMonoClosure<'tcx> {
+    fn collect(tcx: TyCtxt<'tcx>, target: Instance<'tcx>) -> Vec<MonoItem<'tcx>> {
+        let mut closure = Self {
+            tcx,
+            visiting: FxHashSet::default(),
+            visited: FxHashSet::default(),
+            allocations: FxHashSet::default(),
+            ordered: Vec::new(),
+        };
+        closure.visit(MonoItem::Fn(target));
+        closure.ordered
+    }
+
+    fn visit(&mut self, item: MonoItem<'tcx>) {
+        if self.visited.contains(&item) || !self.visiting.insert(item) {
+            return;
+        }
+
+        match item {
+            MonoItem::Fn(instance) => {
+                // These functions are substituted by the backend and intentionally have no Rust
+                // body. Following their aborting placeholder MIR would add a false dependency
+                // graph that ordinary codegen also discards.
+                if crate::utilis::classify_magic_fn(self.tcx, instance.def_id()).is_some()
+                    || crate::utilis::is_comptime_entrypoint(self.tcx, instance.def_id())
+                {
+                    self.visiting.remove(&item);
+                    self.visited.insert(item);
+                    return;
+                }
+                let (used, _) = self
+                    .tcx
+                    .items_of_instance((instance, CollectionMode::UsedItems))
+                    .unwrap_or_else(|error| {
+                        self.tcx.dcx().span_fatal(
+                            self.tcx.def_span(instance.def_id()),
+                            format!(
+                                "comptime: could not collect monomorphized dependencies of alias target `{}`: {error:?}",
+                                self.tcx.def_path_str(instance.def_id())
+                            ),
+                        )
+                    });
+                for dependency in used {
+                    self.visit(dependency.node);
+                }
+            }
+            MonoItem::Static(def_id) => self.visit_static(def_id),
+            MonoItem::GlobalAsm(_) => {}
+        }
+
+        self.visiting.remove(&item);
+        if self.visited.insert(item) {
+            self.ordered.push(item);
+        }
+    }
+
+    fn visit_static(&mut self, def_id: rustc_hir::def_id::DefId) {
+        let instance = Instance::mono(self.tcx, def_id);
+        if !crate::operand::static_data::static_is_nested(self.tcx, def_id) {
+            let ty = instance.ty(self.tcx, TypingEnv::fully_monomorphized());
+            let drop = Instance::resolve_drop_glue(self.tcx, ty);
+            if self.tcx.should_codegen_locally(drop)
+                && !matches!(drop.def, InstanceKind::DropGlue(_, None))
+            {
+                self.visit(MonoItem::Fn(drop));
+            }
+        }
+        if let Ok(allocation) = self.tcx.eval_static_initializer(def_id) {
+            for provenance in allocation.inner().provenance().ptrs().values() {
+                self.visit_allocation(provenance.alloc_id());
+            }
+        }
+        if self.tcx.needs_thread_local_shim(def_id) {
+            self.visit(MonoItem::Fn(Instance {
+                def: InstanceKind::ThreadLocalShim(def_id),
+                args: GenericArgs::empty(),
+            }));
+        }
+    }
+
+    fn visit_allocation(&mut self, alloc_id: AllocId) {
+        if !self.allocations.insert(alloc_id) {
+            return;
+        }
+        match self.tcx.global_alloc(alloc_id) {
+            GlobalAlloc::Static(def_id) => {
+                let instance = Instance::mono(self.tcx, def_id);
+                if self.tcx.should_codegen_locally(instance) {
+                    self.visit(MonoItem::Static(def_id));
+                }
+            }
+            GlobalAlloc::Memory(allocation) => {
+                for provenance in allocation.inner().provenance().ptrs().values() {
+                    self.visit_allocation(provenance.alloc_id());
+                }
+            }
+            GlobalAlloc::Function { instance } => {
+                if self.tcx.should_codegen_locally(instance) {
+                    self.visit(MonoItem::Fn(instance));
+                }
+            }
+            GlobalAlloc::VTable(ty, dyn_ty) => {
+                let allocation = self.tcx.vtable_allocation((
+                    ty,
+                    dyn_ty
+                        .principal()
+                        .map(|principal| self.tcx.instantiate_bound_regions_with_erased(principal)),
+                ));
+                self.visit_allocation(allocation);
+            }
+            GlobalAlloc::TypeId { .. } => {}
+        }
+    }
+}
+
+fn method_ref_for_instance<'tcx>(
+    instance: Instance<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<MethodRef> {
+    let signature = AbiPlan::from_instance(instance, ctx).signature().clone();
+    let signature = ctx.alloc_sig(signature);
+    let name = fn_name_for_instance(ctx.tcx(), instance);
+    let name = ctx.alloc_string(name);
+    let main_module = *ctx.main_module();
+    let method = MethodRef::new(main_module, name, signature, MethodKind::Static, [].into());
+    ctx.alloc_methodref(method)
+}
+
+fn method_ref_has_body(method: Interned<MethodRef>, ctx: &MethodCompileCtx<'_, '_>) -> bool {
+    ctx.method_ref_to_def(method).is_some_and(|definition| {
+        !matches!(
+            ctx.method_def(definition).implementation(),
+            MethodImpl::Missing
+        )
+    })
+}
+
+/// Ensures a comptime-declared managed member's complete Rust mono graph is defined in this shard.
+///
+/// The declaration is an extra backend reachability root: rustc cannot infer it from an
+/// interpreted comptime call. Compile rustc's dependency closure in dependency-first order so the
+/// target, its private generic callees, drop glue, and static provenance all have producers. Later
+/// ordinary CGU copies are harmless; strict shard linking compares their real bodies.
+fn ensure_alias_target_defined<'tcx>(
+    target: Instance<'tcx>,
+    target_ref: Interned<MethodRef>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) {
+    let tcx = ctx.tcx();
+    let closure = AliasMonoClosure::collect(tcx, target);
+    for item in closure {
+        if let MonoItem::Fn(instance) = item {
+            let method = if instance == target {
+                target_ref
+            } else {
+                method_ref_for_instance(instance, ctx)
+            };
+            if method_ref_has_body(method, ctx) {
+                continue;
+            }
+        }
+
+        if let Err(error) = crate::assembly::add_item(ctx, item, tcx) {
+            let detail = match error {
+                crate::codegen_error::CodegenError::UnsupportedFeature { feature, detail } => {
+                    format!("UnsupportedFeature({feature}): {detail}")
+                }
+                error => format!("{error:?}"),
+            };
+            tcx.dcx().span_fatal(
+                tcx.def_span(item.def_id()),
+                format!(
+                    "comptime: failed to lower a monomorphized dependency of managed alias target `{}`: {detail}",
+                    tcx.def_path_str(target.def_id())
+                ),
+            );
+        }
+    }
+
+    assert!(
+        method_ref_has_body(target_ref, ctx),
+        "comptime alias target `{}` was not emitted by its monomorphization closure",
+        tcx.def_path_str(target.def_id())
+    );
+}
+
 fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<'tcx>) {
     assert_eq!(class.fields.len(), class.field_nullability.len());
     assert_eq!(
@@ -2140,8 +2344,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     for (method_index, (method_name, target, parameter_names, nullability)) in
         class.methods.iter().enumerate()
     {
-        let call_info = CallInfo::sig_from_instance_(*target, ctx);
-        let fn_sig = call_info.sig().clone();
+        let fn_sig = AbiPlan::from_instance(*target, ctx).signature().clone();
         let arg_names = if parameter_names.is_empty() && fn_sig.inputs().len() > 1 {
             // Compatibility for the legacy hand-written intrinsic surface, which passes an empty
             // name list. New macro expansions always provide the exact managed names.
@@ -2162,12 +2365,13 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             names
         };
         let sig = ctx.alloc_sig(fn_sig);
-        let target_name = fn_name(ctx.tcx().symbol_name(*target));
+        let target_name = fn_name_for_instance(ctx.tcx(), *target);
         let target_name = ctx.alloc_string(target_name);
         let main_module = *ctx.main_module();
         let target_mref =
             MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
         let target_ref = ctx.alloc_methodref(target_mref);
+        ensure_alias_target_defined(*target, target_ref, ctx);
         let mname = ctx.alloc_string(method_name.clone());
         // `Access::Extern` marks this as a dead-code-elimination ROOT — a Rust-defined managed class is
         // an exported surface with no internal caller, so (like `#[unsafe(no_mangle)]` exports) its methods must
@@ -2269,10 +2473,10 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         (method_name, carrier, out_params, generic_names, parameter_names, nullability),
     ) in class.abstract_methods.iter().enumerate()
     {
-        let call_info = CallInfo::sig_from_instance_(*carrier, ctx);
+        let physical_sig = AbiPlan::from_instance(*carrier, ctx).signature().clone();
         // `&mut T` parameters => managed byrefs (C# `ref T`) — see `byref_interface_sig`'s doc.
         // `skip = 1`: input 0 is the `_this` receiver handle.
-        let fn_sig = byref_interface_sig(ctx, method_name, *carrier, call_info.sig().clone(), 1);
+        let fn_sig = byref_interface_sig(ctx, method_name, *carrier, physical_sig, 1);
         // `#[dotnet_out]` positions (1-based among the receiver-stripped params, so sequence `s`
         // is signature input `s` here — the receiver occupies index 0). The macro already
         // guarantees each is a `&mut T` parameter; this is the backend's defense-in-depth assert,
@@ -2482,12 +2686,12 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     for (method_index, (method_name, carrier, parameter_names, nullability)) in
         class.static_abstract_methods.iter().enumerate()
     {
-        let call_info = CallInfo::sig_from_instance_(*carrier, ctx);
+        let physical_sig = AbiPlan::from_instance(*carrier, ctx).signature().clone();
         // `&mut T` parameters => managed byrefs, exactly like the instance loop above — a static
         // abstract's C# implementor writes `public static … M(ref T x)` and the CLR matches it by
         // name+signature, so the byref mapping must be consistent across both member kinds.
         // `skip = 0`: a static carrier has no receiver input.
-        let fn_sig = byref_interface_sig(ctx, method_name, *carrier, call_info.sig().clone(), 0);
+        let fn_sig = byref_interface_sig(ctx, method_name, *carrier, physical_sig, 0);
         let arg_names = if parameter_names.is_empty() && !fn_sig.inputs().is_empty() {
             crate::assembly::carrier_arg_names(*carrier, 0, fn_sig.inputs().len(), ctx)
         } else {
@@ -2580,8 +2784,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                  alias, which the `#[dotnet_interface]` macro cannot see"
             );
         }
-        let call_info = CallInfo::sig_from_instance_(*target, ctx);
-        let fn_sig = call_info.sig().clone();
+        let fn_sig = AbiPlan::from_instance(*target, ctx).signature().clone();
         let arg_names = if parameter_names.is_empty() && fn_sig.inputs().len() > 1 {
             crate::assembly::carrier_arg_names(*target, 0, fn_sig.inputs().len(), ctx)
         } else {
@@ -2600,12 +2803,13 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             names
         };
         let sig = ctx.alloc_sig(fn_sig);
-        let target_name = fn_name(ctx.tcx().symbol_name(*target));
+        let target_name = fn_name_for_instance(ctx.tcx(), *target);
         let target_name = ctx.alloc_string(target_name);
         let main_module = *ctx.main_module();
         let target_mref =
             MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
         let target_ref = ctx.alloc_methodref(target_mref);
+        ensure_alias_target_defined(*target, target_ref, ctx);
         let mname = ctx.alloc_string(method_name.clone());
         // `Access::Extern` = DCE root, and the `AliasFor` edge keeps the lifted Rust fn alive —
         // same rationale as the class-virtual loop.
@@ -2661,8 +2865,7 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     for (method_index, (method_name, target, parameter_names, nullability)) in
         class.static_methods.iter().enumerate()
     {
-        let call_info = CallInfo::sig_from_instance_(*target, ctx);
-        let fn_sig = call_info.sig().clone();
+        let fn_sig = AbiPlan::from_instance(*target, ctx).signature().clone();
         let arg_names = if parameter_names.is_empty() && !fn_sig.inputs().is_empty() {
             crate::assembly::carrier_arg_names(*target, 0, fn_sig.inputs().len(), ctx)
         } else {
@@ -2680,12 +2883,13 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             names
         };
         let sig = ctx.alloc_sig(fn_sig);
-        let target_name = fn_name(ctx.tcx().symbol_name(*target));
+        let target_name = fn_name_for_instance(ctx.tcx(), *target);
         let target_name = ctx.alloc_string(target_name);
         let main_module = *ctx.main_module();
         let target_mref =
             MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
         let target_ref = ctx.alloc_methodref(target_mref);
+        ensure_alias_target_defined(*target, target_ref, ctx);
         let mname = ctx.alloc_string(method_name.clone());
         let mut mdef = MethodDef::new(
             Access::Extern,

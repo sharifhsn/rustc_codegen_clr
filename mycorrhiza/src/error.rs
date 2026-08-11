@@ -144,8 +144,8 @@ impl core::fmt::Display for ManagedException {
     }
 }
 
-// The interop try/catch built-in, recognized by the backend by symbol name (see
-// `MANAGED_TRY_CATCH` in `src/utilis/mod.rs`). It wraps an indirect `try_fn(data)` in a CIL
+// The interop try/catch built-in, recognized by the backend through its exact public metadata
+// marker. It wraps an indirect `try_fn(data)` in a CIL
 // `try/catch` that catches EVERYTHING, running `catch_fn(data)` and returning 1 on a caught
 // exception, or 0 on normal completion. The bodies below `abort()`: the backend replaces every call
 // with the real `interop_try_catch` IL, so these are never actually executed.
@@ -155,9 +155,14 @@ impl core::fmt::Display for ManagedException {
 // callback is `nounwind`, so rustc inserts an abort-on-unwind guard into it and the managed exception
 // triggers a `FailFast` ("unwinding crossed a nounwind ABI boundary") before the IL catch ever runs.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
+#[doc(hidden)]
 #[allow(unused_variables)]
 #[inline(never)]
-fn rustc_clr_interop_try_catch(try_fn: fn(*mut u8), data: *mut u8, catch_fn: fn(*mut u8)) -> i32 {
+pub unsafe fn rustc_clr_interop_try_catch(
+    try_fn: fn(*mut u8),
+    data: *mut u8,
+    catch_fn: fn(*mut u8),
+) -> i32 {
     core::intrinsics::abort();
 }
 
@@ -217,8 +222,12 @@ pub fn try_managed<T, F: FnOnce() -> T>(f: F) -> Result<T, ManagedException> {
         caught: false,
     };
     let data = (&raw mut state) as *mut u8;
-    let caught =
-        rustc_clr_interop_try_catch(try_trampoline::<F, T>, data, catch_trampoline::<F, T>);
+    // SAFETY: this exact public-hidden function is a backend intrinsic. Its unsafe declaration is
+    // the cross-crate opt-in boundary; the backend replaces the aborting placeholder with the CIL
+    // try/catch region before execution.
+    let caught = unsafe {
+        rustc_clr_interop_try_catch(try_trampoline::<F, T>, data, catch_trampoline::<F, T>)
+    };
     if caught != 0 || state.caught {
         Err(ManagedException::new())
     } else {

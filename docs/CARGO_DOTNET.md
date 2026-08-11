@@ -6,7 +6,7 @@ execution. Users should not need to construct `RUSTFLAGS` or configure `build-st
 
 ## Supported configuration
 
-The 0.0.2 SDK supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64. Commands accept
+The 0.0.2 release candidate supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64. Commands accept
 `--dotnet 10` for explicit scripts, but it is optional because 10 is the only public profile.
 Passing 8 or 9 fails immediately with an actionable diagnostic.
 
@@ -18,7 +18,7 @@ development and archaeology, but it is not part of this release contract.
 ```text
 cargo dotnet setup --from-repo PATH
 cargo dotnet profiles [--json]
-cargo dotnet doctor [MESSAGE_OR_LOG] [--workspace PATH] [--json]
+cargo dotnet doctor [MESSAGE_OR_LOG] [--workspace PATH] [--json] [--full-integrity]
 cargo dotnet new PATH --app|--lib|--plugin|--excel|--webapi|--worker|--winui|--maui|--unity
 cargo dotnet attach HOST.csproj --rust-crate PATH [--containers] [--dry-run]
 cargo dotnet build [PATH]
@@ -83,7 +83,7 @@ the generated wrapper can hide an ownership mistake.
 
 ## Installation layout
 
-The release installer places the SDK under `CARGO_DOTNET_HOME`, defaulting to
+Once published, the release installer places the SDK under `CARGO_DOTNET_HOME`, defaulting to
 `$HOME/.cargo-dotnet`, and the command under `CARGO_HOME/bin`, defaulting to `$HOME/.cargo/bin`.
 
 The SDK bundle contains:
@@ -99,7 +99,22 @@ It deliberately does not contain rustup or the .NET SDK.
 
 Bundle installation verifies the adjacent `.sha256`, validates the internal per-file hashes and
 host OS/architecture, restores into a temporary directory, then atomically activates the SDK.
-Installed files are integrity-checked before later builds.
+Installed files are integrity-checked before later builds. Setup and bundle installation share a
+durable activation journal: staged bytes, phase records, and deterministic backups are synced
+before destructive renames. The next invocation rolls an interrupted activation back, or finishes
+cleanup when validation had already been durably committed.
+
+`setup --from-repo` records the captured commit, source-tree digest, and any exact local Git tag,
+but a local tag is descriptive metadata only: development setup writes `release_tag = untagged`
+(or `untagged-dirty`). Only the release workflow may write a `rust-dotnet-v*` release tag after its
+separate annotated-tag and signature verification gate.
+
+The 0.0.2 release candidate uses the versioned schema-2 `SdkManifest` inventory as the single layout contract for
+bundle creation and verification, setup activation, installed-path resolution, `doctor`, helper
+discovery, and the package file inventory. The manifest names the exact backend, linker, CLI,
+target specification, PAL/overlay roots, MSBuild integration, SDK crates, and managed-helper
+sources for its host. Readers retain narrowly scoped schema-1 compatibility for immutable 0.0.1
+bundles; new schema-1 manifests and unknown schemas are rejected.
 
 ## Scaffolds
 
@@ -263,6 +278,30 @@ cargo dotnet build ./crate --offline --frozen
 Restore writes a checksummed receipt covering dependency manifests, lock/configuration files,
 private sysroot inputs, and package caches. Source-only edits do not invalidate it; dependency or
 cache changes produce a re-restore command before compilation begins.
+
+Expensive immutable inputs live under the cargo-dotnet cache as content-addressed snapshots. A
+private sysroot key includes the exact rustc/toolchain and host identity, target specification,
+complete published ambient sysroot, PAL sources, and injection implementation. The Mycorrhiza helper key
+likewise covers the .NET compiler, TFM, host, Rust toolchain, and complete helper source tree;
+`cargo dotnet restore` prebuilds it so the later offline build is a cache hit. NuGet restore keys
+cover package/version, RID, TFM, an isolated explicit source configuration (hashed rather than
+recorded), host, and .NET SDK identity. With no `--source`, that configuration clears ambient
+NuGet settings and selects NuGet.org. Per-key locks prevent duplicate concurrent work, receipts recheck content integrity,
+publication is rollback-capable, and garbage collection is bounded to validated digest
+directories inside the cache root.
+
+The checked-in NuGet dependency record preserves package/version, RID, TFM, and a reproducible
+source identity. Local feeds must live inside the consumer crate and are recorded project-relative,
+so a fresh clone can restore without the original absolute checkout path. URL sources may be
+recorded only without inline credentials, query strings, or fragments; use the .NET credential
+provider for private-feed authentication. Immutable cache objects contain only the selected asset
+closure and hashed source configuration, never the restore work tree or source URL.
+
+`cargo dotnet doctor --full-integrity` deliberately rehashes every cached private sysroot. Ambient
+sysroots are discovered through `rustc --print sysroot` and `rustup toolchain list`; only cache
+receipts whose recorded roots exactly match those trusted results are audited. Typed index receipts
+are checked under cache leases. Receipts for moved or uninstalled toolchains are counted separately,
+and their absolute paths are not followed as authority.
 
 ## Diagnostics
 

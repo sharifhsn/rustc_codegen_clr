@@ -33,6 +33,10 @@ pub fn write_bytes<'tcx>(
     if ctx.layout_of(tpe).is_zst() {
         return ctx.alloc_root(CILRoot::Nop);
     }
+    assert!(
+        !crate::managed_storage::is_bitwise_managed_unsafe(tpe, ctx),
+        "managed-storage preflight missed write_bytes of {tpe:?}"
+    );
     let tpe = ctx.type_from_cache(tpe);
     let dst = handle_operand(&args[0].node, ctx);
     let val = handle_operand(&args[1].node, ctx);
@@ -61,6 +65,10 @@ pub fn copy<'tcx>(
     if ctx.layout_of(tpe).is_zst() {
         return ctx.alloc_root(CILRoot::Nop);
     }
+    assert!(
+        !crate::managed_storage::is_bitwise_managed_unsafe(tpe, ctx),
+        "managed-storage preflight missed copy of {tpe:?}"
+    );
     let tpe = ctx.type_from_cache(tpe);
     let src = handle_operand(&args[0].node, ctx);
     let dst = handle_operand(&args[1].node, ctx);
@@ -82,6 +90,10 @@ pub fn raw_eq<'tcx>(
         call_instance.args[0]
             .as_type()
             .expect("raw_eq works only on types!"),
+    );
+    assert!(
+        !crate::managed_storage::is_bitwise_managed_unsafe(tpe, ctx),
+        "managed-storage preflight missed raw_eq of {tpe:?}"
     );
     // Raw eq always true for zsts.
     if ctx.layout_of(tpe).is_zst() {

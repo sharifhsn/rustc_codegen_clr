@@ -32,8 +32,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::context::Context as Ctx;
-
 /// Where a `CfgArm` is inserted. Anchors are STRONGLY preferred; the single
 /// `Ordinal` use is documented at its call site (exit.rs).
 #[derive(Debug, Clone)]
@@ -71,6 +69,13 @@ pub enum Injection {
     Replace {
         find: String,
         with: String,
+        marker: String,
+    },
+    /// Literal replacement accepting one of several historical source shapes. Exactly one shape
+    /// must match when the final marker is absent; this keeps migrations fail-closed without
+    /// duplicating attributes or declarations in already-warmed PAL trees.
+    ReplaceOneOf {
+        alternatives: Vec<(String, String)>,
         marker: String,
     },
 }
@@ -123,6 +128,19 @@ pub fn apply_one_str(text: &str, inj: &Injection) -> Result<(String, Applied)> {
         } => splice_method(text, impl_anchor, marker)?,
         Injection::LineInsert { before, lines, .. } => splice_line_insert(text, before, lines)?,
         Injection::Replace { find, with, .. } => splice_replace(text, find, with)?,
+        Injection::ReplaceOneOf { alternatives, .. } => {
+            let matching = alternatives
+                .iter()
+                .filter(|(find, _)| text.contains(find))
+                .collect::<Vec<_>>();
+            if matching.len() != 1 {
+                bail!(
+                    "expected exactly one historical replacement shape, found {}",
+                    matching.len()
+                );
+            }
+            splice_replace(text, &matching[0].0, &matching[0].1)?
+        }
     };
     Ok((out, Applied::Inserted))
 }
@@ -132,7 +150,8 @@ fn injection_marker(inj: &Injection) -> &str {
         Injection::CfgArm { marker, .. }
         | Injection::Method { marker, .. }
         | Injection::LineInsert { marker, .. }
-        | Injection::Replace { marker, .. } => marker,
+        | Injection::Replace { marker, .. }
+        | Injection::ReplaceOneOf { marker, .. } => marker,
     }
 }
 
@@ -494,12 +513,16 @@ fn std_targets() -> Vec<Target> {
                 Injection::LineInsert {
                     before: "pub(crate) struct ThreadInit {".to_string(),
                     lines: r#"#[cfg(target_os = "dotnet")]
+#[doc = "__rustc_codegen_clr_std_thread_intrinsic_v1"]
+#[rustc_diagnostic_item = "rustc_codegen_clr_std_thread_managed_box_new"]
 #[inline(never)]
-fn rustc_clr_interop_managed_box_new<T>(_value: T) -> *mut u8 {
+unsafe fn rustc_clr_interop_managed_box_new<T>(_value: T) -> *mut u8 {
     core::intrinsics::abort()
 }
 
 #[cfg(target_os = "dotnet")]
+#[doc = "__rustc_codegen_clr_std_thread_intrinsic_v1"]
+#[rustc_diagnostic_item = "rustc_codegen_clr_std_thread_managed_box_take"]
 #[inline(never)]
 unsafe fn rustc_clr_interop_managed_box_take<T>(_handle: *mut u8) -> T {
     core::intrinsics::abort()
@@ -516,7 +539,7 @@ fn dotnet_managed_thread_init<F: FnOnce() + Send>(handle: Thread, rust_start: F)
     }
     Box::new(ThreadInit {
         handle,
-        rust_start_handle: rustc_clr_interop_managed_box_new(rust_start),
+        rust_start_handle: unsafe { rustc_clr_interop_managed_box_new(rust_start) },
         rust_start_fn: run::<F>,
         rust_start_drop: drop_token::<F>,
     })
@@ -530,19 +553,39 @@ fn dotnet_managed_thread_init<F: FnOnce() + Send>(handle: Thread, rust_start: F)
                 // Migration for a PAL tree warmed by the first managed-box injection. Magic
                 // stubs must never be MIR-inlined, or optimized builds can inline the abort body
                 // before the codegen backend sees and substitutes the call.
-                Injection::Replace {
-                    find: "#[cfg(target_os = \"dotnet\")]\nfn rustc_clr_interop_managed_box_new<T>"
-                        .to_string(),
-                    with: "#[cfg(target_os = \"dotnet\")]\n#[inline(never)]\nfn rustc_clr_interop_managed_box_new<T>"
-                        .to_string(),
-                    marker: "#[inline(never)]\nfn rustc_clr_interop_managed_box_new<T>".to_string(),
+                Injection::ReplaceOneOf {
+                    alternatives: vec![
+                        (
+                            "#[cfg(target_os = \"dotnet\")]\nfn rustc_clr_interop_managed_box_new<T>".to_string(),
+                            "#[cfg(target_os = \"dotnet\")]\n#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_new\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_new<T>".to_string(),
+                        ),
+                        (
+                            "#[cfg(target_os = \"dotnet\")]\n#[inline(never)]\nfn rustc_clr_interop_managed_box_new<T>".to_string(),
+                            "#[cfg(target_os = \"dotnet\")]\n#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_new\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_new<T>".to_string(),
+                        ),
+                        (
+                            "#[cfg(target_os = \"dotnet\")]\n#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_new<T>".to_string(),
+                            "#[cfg(target_os = \"dotnet\")]\n#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_new\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_new<T>".to_string(),
+                        ),
+                    ],
+                    marker: "#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_new\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_new<T>".to_string(),
                 },
-                Injection::Replace {
-                    find: "#[cfg(target_os = \"dotnet\")]\nunsafe fn rustc_clr_interop_managed_box_take<T>"
-                        .to_string(),
-                    with: "#[cfg(target_os = \"dotnet\")]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>"
-                        .to_string(),
-                    marker: "#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>"
+                Injection::ReplaceOneOf {
+                    alternatives: vec![
+                        (
+                            "#[cfg(target_os = \"dotnet\")]\nunsafe fn rustc_clr_interop_managed_box_take<T>".to_string(),
+                            "#[cfg(target_os = \"dotnet\")]\n#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_take\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>".to_string(),
+                        ),
+                        (
+                            "#[cfg(target_os = \"dotnet\")]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>".to_string(),
+                            "#[cfg(target_os = \"dotnet\")]\n#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_take\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>".to_string(),
+                        ),
+                        (
+                            "#[cfg(target_os = \"dotnet\")]\n#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>".to_string(),
+                            "#[cfg(target_os = \"dotnet\")]\n#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_take\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>".to_string(),
+                        ),
+                    ],
+                    marker: "#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_take\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>"
                         .to_string(),
                 },
                 Injection::Replace {
@@ -1026,12 +1069,13 @@ fn find_libc_rec(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 // THE DRIVER — mirror PAL trees, drive the manifest, patch rust-src vendor libc.
 // ===========================================================================
 
-/// Run PAL injection against an explicitly provisioned rust-src library root.
-pub fn inject_all_at(ctx: &Ctx, lib: &Path) -> Result<()> {
+/// Apply injection from an immutable PAL source snapshot. Cache builders use this entry point so
+/// the bytes fingerprinted for a content key are exactly the bytes consumed by the build.
+pub fn inject_all_from(pal_root: &Path, verbose: bool, lib: &Path) -> Result<()> {
     let sys_dst = lib.join("std/src/sys");
     let std_dst = lib.join("std/src");
 
-    if ctx.flags.verbose {
+    if verbose {
         eprintln!(
             "==> injecting dotnet PAL into rust-src ({})",
             sys_dst.display()
@@ -1039,27 +1083,27 @@ pub fn inject_all_at(ctx: &Ctx, lib: &Path) -> Result<()> {
     }
 
     // 1) mirror the PAL trees (clean base each run).
-    let pal_sys = ctx.paths.pal_root.join("sys");
+    let pal_sys = pal_root.join("sys");
     if !pal_sys.is_dir() {
         bail!("no PAL sys tree at {}", pal_sys.display());
     }
     let n = mirror_tree(&pal_sys, &sys_dst)?;
-    if ctx.flags.verbose {
+    if verbose {
         eprintln!("==> mirrored {n} dotnet_pal/sys files");
     }
 
     // os/dotnet platform tree -> std/src/os/dotnet.
-    let pal_os_dotnet = ctx.paths.pal_root.join("os/dotnet");
+    let pal_os_dotnet = pal_root.join("os/dotnet");
     if pal_os_dotnet.is_dir() {
         let dst = std_dst.join("os/dotnet");
         let m = mirror_tree(&pal_os_dotnet, &dst)?;
-        if ctx.flags.verbose {
+        if verbose {
             eprintln!("==> mirrored {m} dotnet_pal/os/dotnet files");
         }
     }
 
     // panic_unwind/unwind doc-only markers.
-    let pu_marker = ctx.paths.pal_root.join("panic_unwind/dotnet.rs");
+    let pu_marker = pal_root.join("panic_unwind/dotnet.rs");
     if pu_marker.is_file() {
         let dst = root_dir(&lib, Root::PanicUnwind).join("dotnet.rs");
         let _ = fs::copy(&pu_marker, &dst);
@@ -1097,7 +1141,7 @@ pub fn inject_all_at(ctx: &Ctx, lib: &Path) -> Result<()> {
 
     // 4) patch the rust-src VENDOR libc copies (the registry pass is in buildstd).
     for d in find_libc_dirs(lib) {
-        if patch_libc(&d)? && ctx.flags.verbose {
+        if patch_libc(&d)? && verbose {
             eprintln!("==> patched libc: {}", d.display());
         }
     }
@@ -1271,6 +1315,25 @@ pub mod aix;
     }
 
     #[test]
+    fn replace_one_of_migrates_each_historical_shape_and_rejects_ambiguity() {
+        let inj = Injection::ReplaceOneOf {
+            alternatives: vec![
+                ("old-v1".to_string(), "current".to_string()),
+                ("old-v2".to_string(), "current".to_string()),
+            ],
+            marker: "current".to_string(),
+        };
+        for historical in ["old-v1", "old-v2"] {
+            let (out, applied) = apply_one_str(historical, &inj).unwrap();
+            assert_eq!(applied, Applied::Inserted);
+            assert_eq!(out, "current");
+            assert_eq!(apply_one_str(&out, &inj).unwrap(), (out, Applied::Skipped));
+        }
+        assert!(apply_one_str("old-v1 old-v2", &inj).is_err());
+        assert!(apply_one_str("unknown", &inj).is_err());
+    }
+
+    #[test]
     fn thread_lifecycle_managed_box_rewrite_is_complete_and_idempotent() {
         let mut lifecycle = r#"fn spawn_unchecked() {
     let rust_start = unsafe {
@@ -1315,11 +1378,17 @@ impl ThreadInit {
             }
             lifecycle = rewritten;
         }
-        assert!(lifecycle.contains("rustc_clr_interop_managed_box_new(rust_start)"));
+        assert!(lifecycle.contains("unsafe { rustc_clr_interop_managed_box_new(rust_start) }"));
         assert!(lifecycle.contains("rustc_clr_interop_managed_box_take::<F>(token)"));
-        assert!(lifecycle.contains("#[inline(never)]\nfn rustc_clr_interop_managed_box_new<T>"));
         assert!(
-            lifecycle.contains("#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>")
+            lifecycle.contains(
+                "#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_new\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_new<T>"
+            )
+        );
+        assert!(
+            lifecycle.contains(
+                "#[doc = \"__rustc_codegen_clr_std_thread_intrinsic_v1\"]\n#[rustc_diagnostic_item = \"rustc_codegen_clr_std_thread_managed_box_take\"]\n#[inline(never)]\nunsafe fn rustc_clr_interop_managed_box_take<T>"
+            )
         );
         assert!(lifecycle.contains("pub fn init_dotnet(mut self: Box<Self>)"));
         assert!(lifecycle.contains("impl Drop for ThreadInit"));

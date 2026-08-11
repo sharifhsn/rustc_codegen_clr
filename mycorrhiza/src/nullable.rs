@@ -19,14 +19,13 @@ const NULLABLE: &str = "System.Nullable";
 /// to a `ClassRef` and the CLR knows the real size — so one fixed size works for every `T`.
 pub type Nullable<T> = RustcCLRInteropManagedGenericStruct<CORELIB, NULLABLE, 16, (T,)>;
 
-/// `default(Nullable<T>)` — an *absent* nullable (`HasValue == false`). A real `System.Nullable<T>`'s
-/// all-zero-bytes representation IS its default/no-value state (the CLR itself relies on this — e.g.
-/// zero-initialized array elements), so a zeroed buffer is exact, not an approximation.
+/// `default(Nullable<T>)` — an *absent* nullable (`HasValue == false`). The backend emits CLR
+/// `initobj` directly into the managed destination; the value never passes through Rust
+/// `MaybeUninit`/byte storage.
 pub fn none<T>() -> Nullable<T> {
-    // SAFETY: `Nullable<T>`'s only field is `size_hint: [u8; 16]` (see the struct's own doc) — an
-    // all-zero byte buffer is a valid value for any `T`, and the CLR's own `default(Nullable<T>)` is
-    // exactly this same all-zero representation.
-    unsafe { core::mem::zeroed() }
+    // SAFETY: this is the exact concrete `System.Nullable<T>` destination type; CLR default is the
+    // specified `HasValue == false` representation for every valid value-type argument `T`.
+    unsafe { crate::intrinsics::rustc_clr_interop_managed_default::<Nullable<T>>() }
 }
 
 /// `new Nullable<T>(value)` — a *present* nullable wrapping `value`.
@@ -77,7 +76,7 @@ pub trait NullableExt<T> {
     /// `Some(value)` if the nullable has a value, else `None`.
     fn to_option(&self) -> Option<T>;
 }
-impl<T> NullableExt<T> for Nullable<T> {
+impl<T: crate::NativeStorageSafe> NullableExt<T> for Nullable<T> {
     fn to_option(&self) -> Option<T> {
         if has_value::<T>(self) {
             Some(get_value::<T>(self))
@@ -93,7 +92,7 @@ impl<T> NullableExt<T> for Nullable<T> {
 /// see `docs/RUST_PARITY_ROADMAP.md`'s WF-8 writeup), so an exported fn computing an `Option<T>`
 /// internally converts at the boundary: `.into()` (or `Nullable::from(opt)`), then returns the
 /// `Nullable<T>` — which `#[dotnet_export]` DOES marshal, straight through to a real C# `T?`.
-impl<T> From<Option<T>> for Nullable<T> {
+impl<T: crate::NativeStorageSafe> From<Option<T>> for Nullable<T> {
     fn from(opt: Option<T>) -> Nullable<T> {
         match opt {
             Some(v) => some(v),

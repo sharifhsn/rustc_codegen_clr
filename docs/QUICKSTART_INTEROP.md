@@ -14,13 +14,17 @@ there is no P/Invoke, no marshalling attributes, and no `unsafe` unless you ask 
 ## 0. One-time setup
 
 ```bash
-curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.sh | sh
+git clone https://github.com/sharifhsn/rustc_codegen_clr
+cd rustc_codegen_clr
+cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- setup --from-repo "$PWD"
 cargo dotnet doctor
 ```
 
-On Windows, use the PowerShell installer from the main quickstart. You need the .NET 10 SDK and
-rustup; the SDK records the exact toolchain without changing your global rustup default. Build or
-run a crate with `cargo dotnet build` / `cargo dotnet run` instead of plain `cargo`.
+The 0.0.2 tag is not published yet; use this source-candidate path on Linux x64 or macOS Apple
+Silicon. You need the .NET 10 SDK and rustup; setup records the exact toolchain without changing
+your global rustup default. Windows checkout setup still delegates to a POSIX shell script, so use
+the signed Windows bundle once it is published. Build or run a crate with `cargo dotnet build` /
+`cargo dotnet run` instead of plain `cargo`.
 
 ---
 

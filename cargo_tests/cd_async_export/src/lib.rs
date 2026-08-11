@@ -7,10 +7,10 @@ use mycorrhiza::collections::{MutableDictionary, MutableList};
 use mycorrhiza::dispatch::UiDispatcher;
 use mycorrhiza::enumerate::ManagedEnumerable;
 use mycorrhiza::enumerate_async::{AsyncEnumerable, AsyncStreamWriter};
-use mycorrhiza::memory::{Memory, ReadOnlyMemory};
 use mycorrhiza::managed_option::ManagedOption;
+use mycorrhiza::memory::{Memory, ReadOnlyMemory};
 use mycorrhiza::progress::{Progress, ProgressReporter};
-use mycorrhiza::system::MString;
+use mycorrhiza::system::{DotNetString, MString};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
@@ -74,6 +74,13 @@ pub async fn compute_score_async(base: i32) -> i32 {
 /// Unit-returning async exports become ordinary non-generic Task values.
 #[dotnet_export(name = "WarmUpAsync")]
 pub async fn warm_up_async() {}
+
+/// A transparent Rust wrapper around `System.String` is converted and rooted inside the generated
+/// panic boundary; it must never become a `Result<DotNetString, _>` payload.
+#[dotnet_export(name = "ManagedGreeting")]
+pub fn managed_greeting() -> DotNetString {
+    DotNetString::from("rooted managed return")
+}
 
 /// Synchronous exports accept framework-native cancellation and progress contracts directly.
 #[dotnet_export(name = "ReportAndObserve")]
@@ -218,8 +225,7 @@ pub fn start_ui_dispatch(dispatcher: UiDispatcher, marker: i32, panic_after_run:
         .spawn(move || {
             let _ = dispatcher.try_dispatch(move || {
                 let _active = active;
-                let thread =
-                    mycorrhiza::bindings::System::Threading::Thread::get_current_thread();
+                let thread = mycorrhiza::bindings::System::Threading::Thread::get_current_thread();
                 UI_DISPATCH_THREAD.store(thread.get_managed_thread_id(), Ordering::SeqCst);
                 UI_DISPATCH_MARKER.store(marker, Ordering::SeqCst);
                 if panic_after_run {

@@ -15,6 +15,14 @@ if [[ ! -x "$driver" ]]; then
 fi
 mkdir -p "$log_dir"
 
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
 # Identical source/package inputs must produce byte-identical NuGet packages.
 for side in a b; do
     CARGO_DOTNET_BACKEND=native "$driver" pack "$repo/cargo_tests/cd_interop/rustlib" \
@@ -128,10 +136,13 @@ cp "$repo/cargo_tests/cd_interop/rustlib/target/x86_64-unknown-dotnet/release/cd
     "$assets/owned/rid-fixture/$runtime_path"
 printf 'native RID fixture\n' > "$assets/owned/rid-fixture/$native_path"
 printf 'resource RID fixture\n' > "$assets/owned/rid-fixture/$resource_path"
-printf '{\n  "version": 1,\n  "roots": {\n    "Rcl.Rid.Fixture": {\n      "assets": [\n        {"owner":"Rcl.Rid.Fixture/1.0.0","kind":"runtime","logical_path":"%s","rid":"%s","fallback":false,"staged_path":"owned/rid-fixture/%s"},\n        {"owner":"Rcl.Rid.Fixture/1.0.0","kind":"native","logical_path":"%s","rid":"%s","fallback":false,"staged_path":"owned/rid-fixture/%s"},\n        {"owner":"Rcl.Rid.Fixture/1.0.0","kind":"resource","logical_path":"%s","rid":"%s","fallback":false,"staged_path":"owned/rid-fixture/%s"}\n      ]\n    }\n  }\n}\n' \
-    "$runtime_path" "$rid" "$runtime_path" \
-    "$native_path" "$rid" "$native_path" \
-    "$resource_path" "$rid" "$resource_path" \
+runtime_sha256="$(sha256_file "$assets/owned/rid-fixture/$runtime_path")"
+native_sha256="$(sha256_file "$assets/owned/rid-fixture/$native_path")"
+resource_sha256="$(sha256_file "$assets/owned/rid-fixture/$resource_path")"
+printf '{\n  "version": 1,\n  "roots": {\n    "Rcl.Rid.Fixture": {\n      "assets": [\n        {"owner":"Rcl.Rid.Fixture/1.0.0","kind":"runtime","logical_path":"%s","rid":"%s","fallback":false,"staged_path":"owned/rid-fixture/%s","sha256":"%s"},\n        {"owner":"Rcl.Rid.Fixture/1.0.0","kind":"native","logical_path":"%s","rid":"%s","fallback":false,"staged_path":"owned/rid-fixture/%s","sha256":"%s"},\n        {"owner":"Rcl.Rid.Fixture/1.0.0","kind":"resource","logical_path":"%s","rid":"%s","fallback":false,"staged_path":"owned/rid-fixture/%s","sha256":"%s"}\n      ]\n    }\n  }\n}\n' \
+    "$runtime_path" "$rid" "$runtime_path" "$runtime_sha256" \
+    "$native_path" "$rid" "$native_path" "$native_sha256" \
+    "$resource_path" "$rid" "$resource_path" "$resource_sha256" \
     > "$assets/manifest.json"
 CARGO_DOTNET_BACKEND=native "$driver" pack "$rid_crate" \
     --id Rcl.Rid.Assets.Probe --version 1.0.0 --out "$work/rid-pack" \

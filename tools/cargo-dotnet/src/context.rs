@@ -10,6 +10,7 @@
 //! (`buildstd.rs`), never as a thread-through-Rust contract.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -93,11 +94,11 @@ impl Paths {
                 if !home.is_dir() {
                     bail!(missing_install_home_message(home));
                 }
-                crate::bundle::verify_installed_if_locked(home)?;
-                let backend_name = facts.backend_dylib_name();
-                let backend_dylib = home.join("bin").join(backend_name);
-                let linker = home.join(format!("bin/linker{}", facts.exe_ext));
-                let target_spec = home.join("target/x86_64-unknown-dotnet.json");
+                let _integrity = crate::bundle::verify_installed_if_locked(home)?;
+                let layout = crate::bundle::installed_layout(home)?;
+                let backend_dylib = home.join(&layout.backend);
+                let linker = home.join(&layout.linker);
+                let target_spec = home.join(&layout.target_spec);
                 if !backend_dylib.is_file() {
                     bail!(
                         "installed backend dylib missing: {} — run `cargo dotnet setup`",
@@ -119,10 +120,10 @@ impl Paths {
                     target_spec,
                     registry_src,
                     cargo_home: cargo_home.clone(),
-                    pal_root: home.join("dotnet_pal"),
-                    overlays_root: home.join("dotnet_overlays"),
-                    interop_helpers_root: home.join("mycorrhiza_interop_helpers"),
-                    sdk_crates_root: home.join("crates"),
+                    pal_root: home.join(&layout.pal_root),
+                    overlays_root: home.join(&layout.overlays_root),
+                    interop_helpers_root: home.join(&layout.interop_helpers_root),
+                    sdk_crates_root: home.join(&layout.crates_root),
                     lastbuild_log: cargo_home.join("logs/lastbuild.log"),
                 })
             }
@@ -164,7 +165,7 @@ impl Paths {
     }
 }
 
-fn missing_install_home_message(home: &Path) -> String {
+pub(crate) fn missing_install_home_message(home: &Path) -> String {
     format!(
         "the cargo-dotnet command is installed, but its SDK home does not exist: {}\n\
 A bare `cargo install` installs only the command. Complete either supported installation path:\n  \
@@ -225,9 +226,12 @@ impl Context {
     /// Fold mode detection, backend resolution, the path layout, and the host preflight
     /// into ONE typed value. `is_run` selects the run-the-apphost behaviour.
     pub fn resolve(args: &BuildArgs, is_run: bool) -> Result<Self> {
-        let mode = mode::detect()?;
+        Self::resolve_with_mode(args, is_run, mode::detect()?)
+    }
+
+    pub(crate) fn resolve_with_mode(args: &BuildArgs, is_run: bool, mode: Mode) -> Result<Self> {
         let host = HostFacts::detect();
-        let crate_dir = host::resolve_crate_dir(&args.path)?;
+        let initial_crate_dir = host::resolve_crate_dir(&args.path)?;
 
         // host preflight (rustc/cargo present; dotnet reachable).
         host::ensure_rust_toolchain()?;
@@ -239,13 +243,6 @@ impl Context {
             DotnetVersion::UnityNetStandard21 => None,
         };
         host::ensure_dotnet(&dotnet_heal)?;
-        let paths = Paths::resolve(&mode, &host, &crate_dir)?;
-        let package = cargo_package(&crate_dir)?;
-        let managed_project = resolve_managed_project(&package)?;
-        let source_link_url = validate_source_link_url(args.source_link_url.as_deref())?;
-        if managed_project.is_some() {
-            validate_managed_identity_build(args, &package)?;
-        }
 
         let toolchain = match &mode {
             Mode::Installed { home } => Some(
@@ -262,26 +259,34 @@ impl Context {
             ),
         };
 
-        let profile = if args.is_release() {
-            Profile::Release
-        } else {
-            Profile::Debug
-        };
-
-        // `host::inner_cargo()` prefers `$CARGO` (the Book §External Tools convention,
-        // right when we want to reinvoke whichever cargo drove `cargo dotnet`). But
-        // `$CARGO` is a cargo subcommand's own outer cargo, resolved to a SPECIFIC
-        // toolchain's binary (e.g. `~/.rustup/toolchains/stable-.../bin/cargo`) — not
-        // the rustup shim. When we're about to pin a different toolchain via
-        // `RUSTUP_TOOLCHAIN` (installed mode), that env var only takes effect through
-        // the shim; a hardcoded toolchain binary ignores it outright, so `-Z` flags
-        // fail with "only accepted on the nightly channel" if `$CARGO` happens to be
-        // stable. Use a bare `cargo` (PATH-resolved, i.e. the shim) whenever we are
-        // pinning a toolchain; keep the `$CARGO` preference only when we are not.
+        // `$CARGO` inside a cargo subcommand may name a specific stable toolchain binary. A bare
+        // shim is required for the explicitly-pinned nightly used by the backend.
         let cargo = if toolchain.is_some() {
             "cargo".to_string()
         } else {
             host::inner_cargo()
+        };
+        let extra_cargo = passthrough::assemble_cargo_flags(args);
+        let selection_cargo_home = cargo_home_for_crate(&initial_crate_dir)?;
+        let (crate_dir, extra_cargo) = crate::interop_helpers::resolve_single_selected_crate(
+            &initial_crate_dir,
+            &extra_cargo,
+            &cargo,
+            Some(&selection_cargo_home),
+            toolchain.as_deref(),
+        )?;
+        let paths = Paths::resolve(&mode, &host, &crate_dir)?;
+        let package = cargo_package(&crate_dir)?;
+        let managed_project = resolve_managed_project(&package)?;
+        let source_link_url = validate_source_link_url(args.source_link_url.as_deref())?;
+        if managed_project.is_some() {
+            validate_managed_identity_build(args, &package)?;
+        }
+
+        let profile = if args.is_release() {
+            Profile::Release
+        } else {
+            Profile::Debug
         };
 
         Ok(Context {
@@ -291,7 +296,7 @@ impl Context {
                 clean: args.clean,
                 verbose: args.verbose,
                 run: is_run,
-                extra_cargo: passthrough::assemble_cargo_flags(args),
+                extra_cargo,
             },
             crate_dir,
             paths,
@@ -484,26 +489,9 @@ pub fn print_managed_assembly_name(path: Option<&Path>) -> Result<i32> {
 /// channel yet, so a release identity may describe exactly one `cdylib`, never a workspace-wide
 /// or mixed bin/library invocation.
 fn validate_managed_identity_build(
-    args: &BuildArgs,
+    _args: &BuildArgs,
     package: &cargo_metadata::Package,
 ) -> Result<()> {
-    let has_package_selection = !args.workspace.package.is_empty()
-        || args.workspace.workspace
-        || !args.workspace.exclude.is_empty()
-        || args.extra.iter().any(|flag| {
-            matches!(
-                flag.as_str(),
-                "--workspace" | "--exclude" | "-p" | "--package"
-            ) || flag.starts_with("--package=")
-                || flag.starts_with("--exclude=")
-        });
-    if has_package_selection {
-        bail!(
-            "managed identity builds support exactly one selected package; remove --workspace, \
-             --exclude, and -p/--package (identity is currently process-wide at final link)"
-        );
-    }
-
     let final_targets: Vec<_> = package
         .targets
         .iter()
@@ -779,13 +767,7 @@ pub(crate) fn cargo_dotnet_cache_home() -> Result<PathBuf> {
     }
     if let Some(sdk_home) = std::env::var_os("CARGO_DOTNET_HOME").filter(|value| !value.is_empty())
     {
-        let sdk_home = PathBuf::from(sdk_home);
-        let parent = sdk_home.parent().unwrap_or_else(|| Path::new("."));
-        let name = sdk_home
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("cargo-dotnet");
-        return Ok(parent.join(format!("{name}-cache")));
+        return Ok(cache_home_for_sdk_home(&PathBuf::from(sdk_home)));
     }
     let home = crate::host::home_dir()
         .context("neither HOME nor USERPROFILE is set (needed for cargo-dotnet cache)")?;
@@ -799,10 +781,50 @@ pub(crate) fn crate_cache_key(crate_dir: &Path) -> Result<String> {
     let canonical = crate_dir
         .canonicalize()
         .with_context(|| format!("canonicalize consumer crate {}", crate_dir.display()))?;
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(canonical.as_os_str().to_string_lossy().as_bytes())
-    ))
+    Ok(crate_cache_key_from_canonical(&canonical))
+}
+
+fn crate_cache_key_from_canonical(canonical: &Path) -> String {
+    raw_os_str_sha256(canonical.as_os_str())
+}
+
+pub(crate) fn cache_home_for_sdk_home(sdk_home: &Path) -> PathBuf {
+    let parent = sdk_home.parent().unwrap_or_else(|| Path::new("."));
+    let digest = raw_os_str_sha256(sdk_home.as_os_str());
+    parent.join(format!(".cargo-dotnet-cache-{}", &digest[..24]))
+}
+
+/// Hash the operating system's exact path-string identity using an explicit, portable wire
+/// encoding. Unix bytes and Windows WTF-16 code units are length-delimited and domain-separated;
+/// invalid Unicode can therefore never collapse through replacement-character rendering.
+fn raw_os_str_sha256(value: &OsStr) -> String {
+    let mut hash = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let bytes = value.as_bytes();
+        hash.update(b"cargo-dotnet-osstr-v1\0unix-bytes\0");
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let units = value.encode_wide().collect::<Vec<_>>();
+        hash.update(b"cargo-dotnet-osstr-v1\0windows-wtf16le\0");
+        hash.update((units.len() as u64).to_le_bytes());
+        for unit in units {
+            hash.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let bytes = value.as_encoded_bytes();
+        hash.update(b"cargo-dotnet-osstr-v1\0platform-encoded\0");
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    format!("{:x}", hash.finalize())
 }
 
 pub(crate) fn cargo_home_for_crate(crate_dir: &Path) -> Result<PathBuf> {
@@ -810,4 +832,40 @@ pub(crate) fn cargo_home_for_crate(crate_dir: &Path) -> Result<PathBuf> {
         .join("crates")
         .join(crate_cache_key(crate_dir)?)
         .join("cargo-home"))
+}
+
+#[cfg(test)]
+mod cache_identity_tests {
+    use super::*;
+
+    #[test]
+    fn raw_os_string_hash_is_stable_and_domain_separated() {
+        let first = raw_os_str_sha256(OsStr::new("crate-a"));
+        assert_eq!(first, raw_os_str_sha256(OsStr::new("crate-a")));
+        assert_ne!(first, raw_os_str_sha256(OsStr::new("crate-b")));
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_paths_cannot_collide_in_crate_or_sdk_cache_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let first_name = OsString::from_vec(b"consumer-\x80".to_vec());
+        let second_name = OsString::from_vec(b"consumer-\x81".to_vec());
+        assert_eq!(first_name.to_string_lossy(), second_name.to_string_lossy());
+        let first = PathBuf::from(first_name);
+        let second = PathBuf::from(second_name);
+
+        assert_ne!(
+            crate_cache_key_from_canonical(&first),
+            crate_cache_key_from_canonical(&second)
+        );
+        assert_ne!(
+            cache_home_for_sdk_home(&first),
+            cache_home_for_sdk_home(&second)
+        );
+    }
 }

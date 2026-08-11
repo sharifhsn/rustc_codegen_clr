@@ -5,32 +5,38 @@
 
 An experimental rustc codegen backend that compiles Rust to managed .NET assemblies.
 
+This fork preserves the lineage of [FractalFir's original research
+backend](https://github.com/FractalFir/rustc_codegen_clr) and develops an independently tested,
+fail-closed .NET SDK path around it. It is not presented as FractalFir's current roadmap or as an
+official continuation maintained by him.
+
 > [!WARNING]
 > This is compiler research, not a production toolchain. Crashes, unsupported APIs, and
 > miscompilations are possible. Validate important behavior against native Rust.
 
-## Install the 0.0.2 preview
+## Try the 0.0.2 release candidate
 
 Prerequisites: [rustup](https://rustup.rs/) and the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 
-Linux x64 or macOS Apple Silicon:
+The 0.0.2 release tag has not been published yet. On Linux x64 or macOS Apple Silicon, provision
+the current candidate from this checkout:
 
 ```bash
-curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.sh | sh
+git clone https://github.com/sharifhsn/rustc_codegen_clr
+cd rustc_codegen_clr
+cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- setup --from-repo "$PWD"
+cargo dotnet doctor
 ```
 
-Windows x64 PowerShell:
+This installs the captured source snapshot under `~/.cargo-dotnet` and `cargo-dotnet` under Cargo's
+bin directory. Setup may install the pinned rustup toolchain and its required components, but it
+does not replace the default toolchain. Once an immutable, signed 0.0.2 tag and its host bundles
+exist, the release page will provide the shorter installer path. The historical 0.0.1 tag and
+assets remain unchanged.
 
-```powershell
-irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.ps1 | iex
-```
-
-The installer downloads the matching host SDK bundle, verifies its checksum and host identity,
-installs it under `~/.cargo-dotnet`, and installs `cargo-dotnet` under Cargo's bin directory. It does
-not modify your system Rust installation.
-
-The commands above install the immutable 0.0.2 tag. The historical 0.0.1 tag and its assets remain
-unchanged; releases are versioned instead of silently replacing an existing SDK.
+Windows x64 is covered by the release-candidate build and runtime gates, but the checkout setup
+still delegates to a POSIX shell script. Windows users should wait for the signed host bundle rather
+than treating the source command above as a supported installer.
 
 ## Run Rust on .NET
 
@@ -82,7 +88,7 @@ result with ordinary Rust code.
 - Evidence-gated host contracts visible through `cargo dotnet profiles`, with honest preview and
   unsupported Office/Unity/MAUI combinations
 
-The public 0.0.2 SDK supports one deliberately narrow configuration:
+The 0.0.2 release candidate supports one deliberately narrow configuration:
 
 | Component | Supported |
 |---|---|
@@ -97,7 +103,7 @@ macOS Apple Silicon, managed `netstandard2.1`; native staging is currently macOS
 Linux, Android, iOS, Web, and consoles are not claimed.
 
 The compiler retains some older-runtime compatibility code, but .NET 8 and 9 are not supported by
-the 0.0.2 SDK. A single public runtime profile keeps generated target frameworks, linker metadata,
+the 0.0.2 candidate. A single release runtime profile keeps generated target frameworks, linker metadata,
 CoreCLR tools, examples, and diagnostics consistent.
 
 ## Documentation
@@ -113,6 +119,7 @@ CoreCLR tools, examples, and diagnostics consistent.
   SQLite package and call it from Rust through P/Invoke
 - [`docs/TRANSLATION_STATUS.md`](docs/TRANSLATION_STATUS.md) — compiler coverage and semantic limits
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — compiler pipeline and design
+- [`docs/REVIEW_GUIDE.md`](docs/REVIEW_GUIDE.md) — bounded compiler, interop, and semantic review paths
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contributor setup and test selection
 
 Questions and project ideas are welcome in [GitHub Discussions](https://github.com/sharifhsn/rustc_codegen_clr/discussions).
@@ -120,6 +127,8 @@ Please report compiler bugs, installation failures, and miscompilations through
 [GitHub Issues](https://github.com/sharifhsn/rustc_codegen_clr/issues).
 
 ## Build from source
+
+The setup command below is currently supported on Linux x64 and macOS Apple Silicon:
 
 ```bash
 git clone https://github.com/sharifhsn/rustc_codegen_clr

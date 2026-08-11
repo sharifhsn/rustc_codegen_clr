@@ -8,7 +8,7 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before changing compiler cod
 experimental rustc codegen backend that emits managed .NET assemblies or, in an alternate mode, C
 source. It is loaded by rustc through `-Z codegen-backend`; it is not a standalone compiler.
 
-The public 0.0.2 SDK supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64. Internal
+The 0.0.2 release candidate supports .NET 10 on Linux x64, macOS Apple Silicon, and Windows x64. Internal
 older-runtime branches are not a public compatibility promise.
 
 ## Toolchain
@@ -24,8 +24,13 @@ cargo check --workspace
 cargo test -p cilly
 cargo test --manifest-path tools/cargo-dotnet/Cargo.toml
 cargo build --release --workspace
-cargo test ::stable
+cargo check -p rustc_codegen_clr --all-targets
+cargo test -p rustc_codegen_clr --lib managed_references_are_rejected_from_rust_byte_storage -- --nocapture
 ```
+
+The package-wide compiler test command also runs a historical direct-host-sysroot fixture corpus;
+it is not a substitute for the build-std/product-shaped gates above. Keep its failures visible and
+do not weaken the fatal verifier to make legacy fixtures emit partial artifacts.
 
 Use `cargo dotnet` for product-shaped runs:
 

@@ -11,5 +11,8 @@
     <Reference Include="cd_typed_dto">
       <HintPath>../rustlib/target/x86_64-unknown-dotnet/$(RustProfile)/cd_typed_dto.dll</HintPath>
     </Reference>
+    <Reference Include="Mycorrhiza.Interop.Helpers">
+      <HintPath>../rustlib/target/x86_64-unknown-dotnet/$(RustProfile)/Mycorrhiza.Interop.Helpers.dll</HintPath>
+    </Reference>
   </ItemGroup>
 </Project>

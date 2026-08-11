@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -62,6 +63,8 @@ struct AssetsFile {
     package_folders: serde_json::Map<String, serde_json::Value>,
 }
 
+pub const DEFAULT_NUGET_SOURCE: &str = "https://api.nuget.org/v3/index.json";
+
 pub fn restore(
     id: &str,
     version: &str,
@@ -70,16 +73,64 @@ pub fn restore(
     tfm: &str,
     sources: &[String],
 ) -> Result<ResolvedAssets> {
-    let restore_dir = cache_root.join("restore");
-    let packages_dir = cache_root.join("packages");
-    fs::create_dir_all(&restore_dir)?;
-    fs::create_dir_all(&packages_dir)?;
-    let project = restore_dir.join("cargo-dotnet-restore.csproj");
-    fs::write(
-        &project,
+    fs::create_dir_all(cache_root)?;
+    restore_with_config_bytes(
+        id,
+        version,
+        cache_root,
+        rid,
+        tfm,
+        &isolated_source_config(sources),
+    )
+}
+
+pub fn restore_with_config(
+    id: &str,
+    version: &str,
+    cache_root: &Path,
+    rid: Option<&str>,
+    tfm: &str,
+    source_config: &Path,
+) -> Result<ResolvedAssets> {
+    let source_config = rust_dotnet_sdk_core::safe_fs::read_regular_nofollow(source_config)
+        .context("snapshotting NuGet source configuration")?;
+    restore_with_config_bytes(id, version, cache_root, rid, tfm, &source_config)
+}
+
+fn restore_with_config_bytes(
+    id: &str,
+    version: &str,
+    cache_root: &Path,
+    rid: Option<&str>,
+    tfm: &str,
+    source_config: &[u8],
+) -> Result<ResolvedAssets> {
+    fs::create_dir_all(cache_root)?;
+    let cache_root = fs::canonicalize(cache_root)?;
+    let restore_lock = restore_lock(&cache_root)?;
+    FileExt::lock_exclusive(&restore_lock)?;
+    let restore_dir = ensure_fixed_directory(&cache_root, "restore")?;
+    let packages_dir = ensure_fixed_directory(&cache_root, "packages")?;
+    let mut config = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-NuGet-")
+        .suffix(".Config")
+        .tempfile_in(&cache_root)?;
+    config.write_all(source_config)?;
+    config.as_file().sync_all()?;
+    let restore_work = tempfile::Builder::new()
+        .prefix(".cargo-dotnet-restore-")
+        .tempdir_in(&restore_dir)?;
+    let project_path = restore_work.path().join("restore.csproj");
+    let mut project = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&project_path)?;
+    project.write_all(
         format!(
             "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>{}</TargetFramework>\
-             <RestorePackagesPath>{}</RestorePackagesPath>{}</PropertyGroup><ItemGroup>\
+             <RestorePackagesPath>{}</RestorePackagesPath>\
+             <BaseIntermediateOutputPath>obj/</BaseIntermediateOutputPath>\
+             <MSBuildProjectExtensionsPath>obj/</MSBuildProjectExtensionsPath>{}</PropertyGroup><ItemGroup>\
              <PackageReference Include=\"{}\" Version=\"{}\" /></ItemGroup></Project>",
             xml_escape(tfm),
             xml_escape(&packages_dir.to_string_lossy()),
@@ -87,67 +138,120 @@ pub fn restore(
                 .unwrap_or_default(),
             xml_escape(id),
             xml_escape(version),
-        ),
+        )
+        .as_bytes(),
     )?;
+    project.sync_all()?;
     eprintln!("== rust-dotnet assets: restoring {id} {version} with the .NET SDK ==");
-    let mut command = dotnet_command(tfm);
-    command.args(["restore", "--nologo", "--verbosity", "quiet"]);
-    for source in sources {
-        command.args(["--source", source]);
-    }
-    let status = command.arg(&project).status().with_context(|| {
+    let dotnet = rust_dotnet_sdk_core::dotnet::DotnetTool::resolve(Some(tfm));
+    let dotnet_identity = dotnet.identity()?;
+    let mut command = dotnet.command();
+    command
+        .args([
+            "restore",
+            "--nologo",
+            "--verbosity",
+            "quiet",
+            "--configfile",
+        ])
+        .arg(config.path());
+    let status = command.arg(&project_path).status().with_context(|| {
         format!("asset restore: failed to spawn `dotnet restore` (is the {tfm} SDK installed?)")
     })?;
     if !status.success() {
         bail!("asset restore: `dotnet restore` failed for {id} {version}");
     }
-    parse(&restore_dir.join("obj/project.assets.json"), id, rid)
+    if dotnet.identity()? != dotnet_identity {
+        bail!("asset restore: selected .NET host changed during restore");
+    }
+    parse(
+        &restore_work.path().join("obj/project.assets.json"),
+        id,
+        rid,
+    )
 }
 
-fn dotnet_command(tfm: &str) -> Command {
-    if let Some(host) = std::env::var_os("DOTNET_HOST_PATH").filter(|value| !value.is_empty()) {
-        return Command::new(host);
+fn ensure_fixed_directory(root: &Path, name: &str) -> Result<PathBuf> {
+    let path = root.join(name);
+    match fs::create_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
     }
-    let requested_major = tfm
-        .strip_prefix("net")
-        .and_then(|version| version.split('.').next());
-    if let (Some(home), Some(major)) = (
-        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
-        requested_major,
-    ) {
-        let root = PathBuf::from(home).join(".dotnet");
-        let host = root.join(if cfg!(windows) {
-            "dotnet.exe"
-        } else {
-            "dotnet"
-        });
-        let shared = root.join("shared/Microsoft.NETCore.App");
-        let has_runtime = std::fs::read_dir(shared).is_ok_and(|entries| {
-            entries.flatten().any(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|version| version.starts_with(&format!("{major}.")))
-            })
-        });
-        if host.is_file() && has_runtime {
-            return Command::new(host);
-        }
+    let metadata = fs::symlink_metadata(&path)?;
+    if rust_dotnet_sdk_core::safe_fs::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        bail!("asset cache {name} path is not a regular directory");
     }
-    Command::new("dotnet")
+    let canonical = fs::canonicalize(&path)?;
+    if canonical.parent() != Some(root) || canonical != path {
+        bail!("asset cache {name} directory escapes its root");
+    }
+    Ok(canonical)
+}
+
+fn restore_lock(cache_root: &Path) -> Result<std::fs::File> {
+    rust_dotnet_sdk_core::safe_fs::create_or_open_regular_nofollow(
+        &cache_root.join(".restore.lock"),
+    )
+}
+
+pub fn isolated_source_config(sources: &[String]) -> Vec<u8> {
+    let sources = if sources.is_empty() {
+        vec![DEFAULT_NUGET_SOURCE]
+    } else {
+        sources.iter().map(String::as_str).collect()
+    };
+    let mut config = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear />\n",
+    );
+    for (index, source) in sources.into_iter().enumerate() {
+        config.push_str(&format!(
+            "    <add key=\"cargo-dotnet-{index}\" value=\"{}\" />\n",
+            xml_escape(source)
+        ));
+    }
+    config.push_str("  </packageSources>\n</configuration>\n");
+    config.into_bytes()
+}
+
+/// Exact SDK resolver identity used by [`restore`], suitable for cache fingerprints.
+pub fn dotnet_version(tfm: &str) -> Result<String> {
+    rust_dotnet_sdk_core::dotnet::DotnetTool::resolve(Some(tfm)).identity()
 }
 
 fn parse(path: &Path, root_id: &str, requested_rid: Option<&str>) -> Result<ResolvedAssets> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = rust_dotnet_sdk_core::safe_fs::read_regular_nofollow(path)
+        .with_context(|| format!("reading {}", path.display()))?;
     let assets: AssetsFile =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    let (target_name, target) = assets
-        .targets
-        .iter()
-        .find(|(name, _)| requested_rid.is_some_and(|rid| name.ends_with(&format!("/{rid}"))))
-        .or_else(|| assets.targets.iter().find(|(name, _)| !name.contains('/')))
-        .or_else(|| assets.targets.iter().next())
-        .context("asset restore produced no target graph")?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let selected = if let Some(requested_rid) = requested_rid {
+        assets.targets.iter().find(|(name, _)| {
+            name.rsplit_once('/')
+                .is_some_and(|(_, target_rid)| target_rid == requested_rid)
+        })
+        .with_context(|| {
+            let available = assets
+                .targets
+                .keys()
+                .filter_map(|name| name.rsplit_once('/').map(|(_, rid)| rid))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "asset restore produced no exact target graph for requested RID {requested_rid:?} (available RID targets: {})",
+                if available.is_empty() { "none" } else { &available }
+            )
+        })?
+    } else {
+        assets
+            .targets
+            .iter()
+            .find(|(name, _)| !name.contains('/'))
+            .or_else(|| assets.targets.iter().next())
+            .context("asset restore produced no target graph")?
+    };
+    let (target_name, target) = selected;
     let target = target
         .as_object()
         .context("asset restore target graph is not an object")?;
@@ -444,8 +548,9 @@ pub fn stage_assets(crate_dir: &Path, root_id: &str, assets: &[ResolvedAsset]) -
         bail!("asset staging: unsafe logical asset collision for {root_id}: {details}");
     }
 
-    let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
-    fs::create_dir_all(&assets_dir)?;
+    let assets_dir = assets_directory(crate_dir)?;
+    let manifest_lock = manifest_lock(&assets_dir)?;
+    FileExt::lock_exclusive(&manifest_lock)?;
     let manifest_path = assets_dir.join(STAGING_MANIFEST);
     let mut manifest = read_manifest(&manifest_path)?;
     let root_token = root_token(root_id);
@@ -469,11 +574,38 @@ pub fn stage_assets(crate_dir: &Path, root_id: &str, assets: &[ResolvedAsset]) -
                     .parent()
                     .context("asset staging: asset has no parent")?,
             )?;
-            let contents = fs::read(&asset.source).with_context(|| {
-                format!("asset staging: reading source {}", asset.source.display())
-            })?;
-            fs::write(&destination, &contents)
-                .with_context(|| format!("asset staging: writing {}", destination.display()))?;
+            let contents = rust_dotnet_sdk_core::safe_fs::read_regular_nofollow(&asset.source)
+                .with_context(|| {
+                    format!("asset staging: reading source {}", asset.source.display())
+                })?;
+            let output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&destination);
+            match output {
+                Ok(mut output) => {
+                    output.write_all(&contents)?;
+                    output.sync_all()?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // NuGet commonly lists the same physical DLL as both a compile and runtime
+                    // asset. Preserve both semantic records while sharing one immutable staged
+                    // leaf, but never let a same-owner path hide differing bytes.
+                    if rust_dotnet_sdk_core::safe_fs::read_regular_nofollow(&destination)?
+                        != contents
+                    {
+                        bail!(
+                            "asset staging: same-owner asset bytes collide at {}",
+                            logical_path
+                        );
+                    }
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("asset staging: creating {}", destination.display())
+                    });
+                }
+            }
             records.push(OwnedAssetRecord {
                 owner: asset.owner.clone(),
                 kind: asset.kind.clone(),
@@ -533,8 +665,10 @@ pub fn stage_assets(crate_dir: &Path, root_id: &str, assets: &[ResolvedAsset]) -
 /// runtime-facing layout (`runtime`, `native`, and culture resources); compile references remain
 /// provenance in the manifest rather than being copied beside an executable.
 pub fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<Option<Vec<PathBuf>>> {
-    let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
+    let assets_dir = assets_directory(crate_dir)?;
     let manifest_path = assets_dir.join(STAGING_MANIFEST);
+    let manifest_lock = manifest_lock(&assets_dir)?;
+    FileExt::lock_shared(&manifest_lock)?;
     if !manifest_path.is_file() {
         return Ok(None);
     }
@@ -567,18 +701,21 @@ pub fn copy_staged_assets(crate_dir: &Path, out_dir: &Path) -> Result<Option<Vec
             }
         }
     }
+    fs::create_dir_all(out_dir)?;
+    let output = rust_dotnet_sdk_core::safe_fs::DirectoryCapability::open(out_dir)?;
     let mut copied = Vec::with_capacity(destinations.len());
     for (deployment, asset) in destinations {
         let (source, contents) = staged_snapshot(&assets_dir, asset, "cargo-dotnet")?;
-        let destination = out_dir.join(deployment);
-        fs::create_dir_all(
-            destination
-                .parent()
-                .context("cargo-dotnet: output asset has no parent")?,
-        )?;
-        fs::write(&destination, &contents).with_context(|| {
-            format!("copying {} -> {}", source.display(), destination.display())
-        })?;
+        let destination_display = out_dir.join(&deployment);
+        let destination = output
+            .publish_bytes(&deployment, &contents)
+            .with_context(|| {
+                format!(
+                    "copying {} -> {}",
+                    source.display(),
+                    destination_display.display()
+                )
+            })?;
         copied.push(destination);
     }
     Ok(Some(copied))
@@ -600,8 +737,10 @@ pub fn missing_recorded_roots(
     crate_dir: &Path,
     recorded: &[(String, String)],
 ) -> Result<Vec<String>> {
-    let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
+    let assets_dir = assets_directory(crate_dir)?;
     let manifest_path = assets_dir.join(STAGING_MANIFEST);
+    let manifest_lock = manifest_lock(&assets_dir)?;
+    FileExt::lock_shared(&manifest_lock)?;
     if !manifest_path.is_file() {
         return Ok(recorded.iter().map(|(id, _)| id.clone()).collect());
     }
@@ -621,9 +760,10 @@ pub fn missing_recorded_roots(
                     staged_files_exist = false;
                     continue;
                 }
-                let source = staged_source(&assets_dir, &asset.staged_path, "cargo-dotnet")?;
+                let (_, contents) =
+                    staged_source_snapshot(&assets_dir, &asset.staged_path, "cargo-dotnet")?;
                 if !valid_sha256(&asset.sha256)
-                    || format!("{:x}", Sha256::digest(fs::read(source)?)) != asset.sha256
+                    || format!("{:x}", Sha256::digest(contents)) != asset.sha256
                 {
                     staged_files_exist = false;
                 }
@@ -678,9 +818,10 @@ fn read_manifest(path: &Path) -> Result<OwnedAssetsManifest> {
             ..OwnedAssetsManifest::default()
         });
     }
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = rust_dotnet_sdk_core::safe_fs::read_regular_nofollow(path)
+        .with_context(|| format!("reading {}", path.display()))?;
     let manifest: OwnedAssetsManifest =
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
     if manifest.version != manifest_version() {
         bail!(
             "unsupported asset staging manifest version {}",
@@ -690,26 +831,48 @@ fn read_manifest(path: &Path) -> Result<OwnedAssetsManifest> {
     Ok(manifest)
 }
 
-/// Resolve a manifest-owned path without permitting it to select data outside the private
-/// staging tree. Canonicalizing both sides also rejects symlink escapes inside that tree.
-fn staged_source(assets_dir: &Path, staged_path: &str, context: &str) -> Result<PathBuf> {
-    let relative = staged_relative_path(staged_path, context)?;
-    let canonical_root = fs::canonicalize(assets_dir)
-        .with_context(|| format!("{context}: canonicalizing {}", assets_dir.display()))?;
-    let candidate = assets_dir.join(relative);
-    let canonical_source = fs::canonicalize(&candidate).with_context(|| {
-        format!(
-            "{context}: staged asset is missing: {}",
-            candidate.display()
-        )
-    })?;
-    if !canonical_source.starts_with(&canonical_root) || !canonical_source.is_file() {
+fn manifest_lock(assets_dir: &Path) -> Result<std::fs::File> {
+    rust_dotnet_sdk_core::safe_fs::create_or_open_regular_nofollow(
+        &assets_dir.join(".manifest.lock"),
+    )
+}
+
+fn assets_directory(crate_dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(crate_dir)
+        .with_context(|| format!("creating crate directory {}", crate_dir.display()))?;
+    let crate_root = fs::canonicalize(crate_dir)
+        .with_context(|| format!("resolving crate directory {}", crate_dir.display()))?;
+    let assets_dir = crate_root.join(".cargo-dotnet-nuget-assets");
+    fs::create_dir_all(&assets_dir)?;
+    let metadata = fs::symlink_metadata(&assets_dir)?;
+    if rust_dotnet_sdk_core::safe_fs::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
         bail!(
-            "{context}: staged asset escapes the asset root or is not a regular file: {}",
-            candidate.display()
+            "asset staging root is not a regular directory: {}",
+            assets_dir.display()
         );
     }
-    Ok(canonical_source)
+    let canonical = fs::canonicalize(&assets_dir)?;
+    if canonical.parent() != Some(crate_root.as_path()) || canonical != assets_dir {
+        bail!("asset staging root escapes its crate directory");
+    }
+    Ok(canonical)
+}
+
+/// Snapshot a manifest-owned path without permitting it to select data outside the private
+/// staging tree. The SDK-core helper retains an opened leaf handle and rechecks root/path identity
+/// after reading, so swapping an ancestor after canonicalization cannot redirect the snapshot.
+fn staged_source_snapshot(
+    assets_dir: &Path,
+    staged_path: &str,
+    context: &str,
+) -> Result<(PathBuf, Vec<u8>)> {
+    let relative = staged_relative_path(staged_path, context)?;
+    rust_dotnet_sdk_core::safe_fs::snapshot_regular_within(assets_dir, relative).map_err(|error| {
+        anyhow::anyhow!(
+            "{context}: staged asset escapes the asset root, changed during snapshot, or is not a regular file: {}: {error:#}",
+            assets_dir.join(relative).display()
+        )
+    })
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -727,9 +890,7 @@ fn staged_snapshot(
             asset.staged_path
         );
     }
-    let source = staged_source(assets_dir, &asset.staged_path, context)?;
-    let contents = fs::read(&source)
-        .with_context(|| format!("{context}: reading staged asset {}", source.display()))?;
+    let (source, contents) = staged_source_snapshot(assets_dir, &asset.staged_path, context)?;
     let actual = format!("{:x}", Sha256::digest(&contents));
     if actual != asset.sha256 {
         bail!(
@@ -755,11 +916,21 @@ fn staged_relative_path<'a>(staged_path: &'a str, context: &str) -> Result<&'a P
 }
 
 fn write_manifest_atomic(path: &Path, manifest: &OwnedAssetsManifest) -> Result<()> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temporary, serde_json::to_vec_pretty(manifest)?)
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .with_context(|| format!("promoting {} -> {}", temporary.display(), path.display()))
+    let parent = path.parent().context("asset manifest has no parent")?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".manifest-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    temporary.write_all(&serde_json::to_vec_pretty(manifest)?)?;
+    temporary.as_file().sync_all()?;
+    let temporary_path = temporary.into_temp_path();
+    rust_dotnet_sdk_core::safe_fs::atomic_replace_file(&temporary_path, path).with_context(|| {
+        format!(
+            "promoting {} -> {}",
+            temporary_path.display(),
+            path.display()
+        )
+    })
 }
 
 fn root_token(root_id: &str) -> String {
@@ -777,8 +948,10 @@ fn root_token(root_id: &str) -> String {
 /// The runtime build path flattens files because the CLR probes next to an executable; NuGet
 /// packages must *not* do that.  NuGet's RID and resource selection relies on these exact paths.
 pub fn package_assets(crate_dir: &Path) -> Result<Vec<StagedPackageAsset>> {
-    let assets_dir = crate_dir.join(".cargo-dotnet-nuget-assets");
+    let assets_dir = assets_directory(crate_dir)?;
     let manifest_path = assets_dir.join(STAGING_MANIFEST);
+    let manifest_lock = manifest_lock(&assets_dir)?;
+    FileExt::lock_shared(&manifest_lock)?;
     if !manifest_path.is_file() {
         return Ok(Vec::new());
     }
@@ -922,6 +1095,29 @@ mod tests {
                 .any(|p| p.ends_with("Dependency.dll"))
         );
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn requested_rid_requires_an_exact_target_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let assets = temp.path().join("project.assets.json");
+        fs::write(
+            &assets,
+            br#"{
+                "targets": {"net10.0/win-x64": {}},
+                "libraries": {},
+                "packageFolders": {}
+            }"#,
+        )
+        .unwrap();
+
+        let error = parse(&assets, "Example.Root", Some("linux-x64")).unwrap_err();
+        assert!(
+            error.to_string().contains("no exact target graph")
+                && error.to_string().contains("linux-x64")
+                && error.to_string().contains("win-x64"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1279,6 +1475,277 @@ mod tests {
 
         assert_eq!(&*snapshot.contents, b"owned-original");
         assert!(package_assets(&crate_dir).is_err());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_symlinked_config_and_fixed_cache_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside_config = temp.path().join("outside.Config");
+        fs::write(&outside_config, isolated_source_config(&[])).unwrap();
+        let linked_config = temp.path().join("linked.Config");
+        symlink(&outside_config, &linked_config).unwrap();
+        let cache = temp.path().join("cache-config");
+        let error = restore_with_config(
+            "Example",
+            "1.0.0",
+            &cache,
+            Some("linux-x64"),
+            "net10.0",
+            &linked_config,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("non-symlink"), "{error:#}");
+
+        let cache = temp.path().join("cache-directory");
+        let outside = temp.path().join("outside-packages");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"keep").unwrap();
+        symlink(&outside, cache.join("packages")).unwrap();
+        let regular_config = temp.path().join("regular.Config");
+        fs::write(&regular_config, isolated_source_config(&[])).unwrap();
+        let error = restore_with_config(
+            "Example",
+            "1.0.0",
+            &cache,
+            Some("linux-x64"),
+            "net10.0",
+            &regular_config,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("packages"), "{error:#}");
+        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn restore_root_lock_serializes_shared_obj_and_packages_writers() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = restore_lock(temp.path()).unwrap();
+        FileExt::lock_exclusive(&first).unwrap();
+        let second = restore_lock(temp.path()).unwrap();
+        assert!(FileExt::try_lock_exclusive(&second).is_err());
+        FileExt::unlock(&first).unwrap();
+        FileExt::lock_exclusive(&second).unwrap();
+        FileExt::unlock(&second).unwrap();
+    }
+
+    #[test]
+    fn concurrent_staging_preserves_every_manifest_root() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let crate_dir = temp.path().join("consumer");
+        fs::create_dir_all(&crate_dir).unwrap();
+        let participants = 12;
+        let barrier = Arc::new(Barrier::new(participants));
+        let mut threads = Vec::new();
+        for index in 0..participants {
+            let crate_dir = crate_dir.clone();
+            let barrier = barrier.clone();
+            let source = temp.path().join(format!("source-{index}.dll"));
+            fs::write(&source, format!("assembly-{index}")).unwrap();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                stage_assets(
+                    &crate_dir,
+                    &format!("Example.{index}"),
+                    &[ResolvedAsset {
+                        owner: format!("Example.{index}/1.0.0"),
+                        kind: AssetKind::Runtime,
+                        logical_path: format!("lib/net10.0/Example.{index}.dll"),
+                        source,
+                        rid: None,
+                        fallback: false,
+                    }],
+                )
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let manifest = read_manifest(
+            &crate_dir
+                .join(".cargo-dotnet-nuget-assets")
+                .join(STAGING_MANIFEST),
+        )
+        .unwrap();
+        assert_eq!(manifest.roots.len(), participants);
+    }
+
+    #[test]
+    fn first_publication_readers_wait_for_the_manifest_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let crate_dir = temp.path().join("consumer");
+        fs::create_dir(&crate_dir).unwrap();
+        let assets_dir = assets_directory(&crate_dir).unwrap();
+        let writer_lock = manifest_lock(&assets_dir).unwrap();
+        FileExt::lock_exclusive(&writer_lock).unwrap();
+
+        let (send, receive) = mpsc::channel();
+        let reader_crate = crate_dir.clone();
+        let reader = std::thread::spawn(move || {
+            send.send(package_assets(&reader_crate)).unwrap();
+        });
+        assert!(receive.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let staged = assets_dir.join("owned/root/Example.dll");
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, b"managed").unwrap();
+        let manifest = OwnedAssetsManifest {
+            version: manifest_version(),
+            roots: BTreeMap::from([(
+                "Example".into(),
+                OwnedRootAssets {
+                    assets: vec![OwnedAssetRecord {
+                        owner: "Example/1.0.0".into(),
+                        kind: AssetKind::Runtime,
+                        logical_path: "lib/net10.0/Example.dll".into(),
+                        rid: None,
+                        fallback: false,
+                        staged_path: "owned/root/Example.dll".into(),
+                        sha256: format!("{:x}", Sha256::digest(b"managed")),
+                    }],
+                },
+            )]),
+        };
+        write_manifest_atomic(&assets_dir.join(STAGING_MANIFEST), &manifest).unwrap();
+        FileExt::unlock(&writer_lock).unwrap();
+
+        let assets = receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        reader.join().unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(&*assets[0].contents, b"managed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_publication_never_follows_leaf_or_ancestor_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let crate_dir = temp.path().join("consumer");
+        let source_dir = temp.path().join("source");
+        let output = temp.path().join("output");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&crate_dir).unwrap();
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&output).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let runtime = source_dir.join("Example.dll");
+        let resource = source_dir.join("Example.resources.dll");
+        fs::write(&runtime, b"runtime").unwrap();
+        fs::write(&resource, b"resource").unwrap();
+        stage_assets(
+            &crate_dir,
+            "Example",
+            &[
+                asset(
+                    "Example/1.0.0",
+                    AssetKind::Runtime,
+                    "lib/net10.0/Example.dll",
+                    runtime,
+                    None,
+                ),
+                asset(
+                    "Example/1.0.0",
+                    AssetKind::Resource,
+                    "lib/net10.0/fr/Example.resources.dll",
+                    resource,
+                    None,
+                ),
+            ],
+        )
+        .unwrap();
+
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        symlink(&sentinel, output.join("Example.dll")).unwrap();
+        symlink(&outside, output.join("fr")).unwrap();
+        let error = copy_staged_assets(&crate_dir, &output).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("output directory"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        assert_eq!(fs::read(output.join("Example.dll")).unwrap(), b"runtime");
+        assert!(!outside.join("Example.resources.dll").exists());
+    }
+
+    #[test]
+    fn compile_and_runtime_records_may_share_one_identical_staged_leaf() {
+        let temp = unique_temp("shared-compile-runtime-leaf");
+        let crate_dir = temp.join("consumer");
+        let source = temp.join("Example.dll");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(&source, b"managed-assembly").unwrap();
+        let compile = asset(
+            "Example/1.0.0",
+            AssetKind::Compile,
+            "lib/net10.0/Example.dll",
+            source.clone(),
+            None,
+        );
+        let runtime = asset(
+            "Example/1.0.0",
+            AssetKind::Runtime,
+            "lib/net10.0/Example.dll",
+            source,
+            None,
+        );
+
+        stage_assets(&crate_dir, "Example", &[compile, runtime]).unwrap();
+        let manifest = read_manifest(
+            &crate_dir
+                .join(".cargo-dotnet-nuget-assets")
+                .join(STAGING_MANIFEST),
+        )
+        .unwrap();
+        assert_eq!(manifest.roots["Example"].assets.len(), 2);
+        let output = temp.join("output");
+        copy_staged_assets(&crate_dir, &output).unwrap();
+        assert_eq!(
+            fs::read(output.join("Example.dll")).unwrap(),
+            b"managed-assembly"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn same_owner_logical_path_rejects_differing_staged_bytes() {
+        let temp = unique_temp("same-owner-byte-collision");
+        let crate_dir = temp.join("consumer");
+        let first = temp.join("first.dll");
+        let second = temp.join("second.dll");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let first = asset(
+            "Example/1.0.0",
+            AssetKind::Compile,
+            "lib/net10.0/Example.dll",
+            first,
+            None,
+        );
+        let second = asset(
+            "Example/1.0.0",
+            AssetKind::Runtime,
+            "lib/net10.0/Example.dll",
+            second,
+            None,
+        );
+
+        let error = stage_assets(&crate_dir, "Example", &[first, second]).unwrap_err();
+        assert!(error.to_string().contains("bytes collide"), "{error:#}");
         fs::remove_dir_all(temp).unwrap();
     }
 

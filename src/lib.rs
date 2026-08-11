@@ -54,7 +54,7 @@
 //!
 //! This way, it is far less likely that a piece of code will be miscompiled. It also helps with debuging, and allows us to achieve a very high-level translation of MIR.
 //!
-//! This intermediate, inefficient CIL is converted to cilly's interned V2 IR and optimized by
+//! This intermediate, inefficient CIL is interned into cilly's single IR and optimized by
 //! [`cilly::ir::opt`]. Those optimizations may reorder statements and remove or add locals.
 //! So, when debuging issues, it is recomeded the additional optimzations be turned off by seting the enviroment varaible `OPTIMIZE_CIL` to 0.
 //!
@@ -93,15 +93,18 @@ extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_hir;
 extern crate rustc_index;
+extern crate rustc_infer;
 extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
+extern crate rustc_trait_selection;
 extern crate rustc_ty_utils;
 
 // Modules
+mod abi;
 /// Code handling the creation of aggreate values (Arrays, enums,structs,tuples,etc.)
 mod aggregate;
 /// Representation of a .NET assembly
@@ -111,7 +114,6 @@ mod assembly_transaction;
 pub mod basic_block;
 /// Code handling binary operations
 mod binop;
-mod call_info;
 /// Code hansling rust `as` casts.
 mod casts;
 /// Runtime errors and utlity functions/macros related to them
@@ -124,10 +126,9 @@ pub mod compile_test;
 mod comptime;
 /// Method compilation context
 mod fn_ctx;
-/// Signature of a function (inputs)->output
-pub mod function_sig;
 /// Interop type handling.
 mod interop;
+mod managed_storage;
 pub mod native_pastrough;
 /// Handles a MIR operand.
 mod operand;
@@ -135,8 +136,10 @@ mod operand;
 mod place;
 /// Converts righthandside of a MIR statement into CIL ops.
 mod rvalue;
+mod stable_identity;
 /// Code dealing with truning an individual MIR statement into CIL ops.
 pub mod statement;
+mod target_layout;
 /// Converts a terminator of a basic block into CIL ops.
 mod terminator;
 /// Code related to types.
@@ -151,14 +154,16 @@ pub mod config;
 mod unsize;
 // rustc functions used here.
 use crate::{
+    abi::AbiPlan,
     assembly_transaction::{assembly_transaction, build_assembly_shard, commit_assembly_shard},
     codegen_error::panic_payload_msg,
-    fn_ctx::MethodCompileCtx,
+    fn_ctx::{MethodCompileCtx, fn_name_for_instance},
 };
 use cilly::{
     Assembly, AssemblyArtifact, NativeImport, PInvokeCallConv,
     {MethodRef, cilnode::MethodKind},
 };
+use rustc_abi::HasDataLayout;
 use rustc_codegen_ssa::{
     CompiledModule, CompiledModules, CrateInfo, ModuleKind,
     back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder},
@@ -433,16 +438,22 @@ fn add_item_transactionally<'tcx>(
 
     if abort_on_error {
         // Deliberately catch neither phase in correctness mode. A build panic drops the isolated
-        // shard; a commit panic must stop codegen because `Assembly::link` consumes the old parent.
-        let ((), shard) = build_assembly_shard(|shard| assembly::add_item(shard, item, tcx))
-            .unwrap_or_else(|error| panic!("Could not add item `{item_name}`: {error:?}"));
+        // shard. Commit performs staged preflight and preserves the parent if it rejects the shard,
+        // but that rejection must still stop codegen: continuing would silently omit a required
+        // MonoItem and claim success for a different program.
+        let ((), shard) = match build_assembly_shard(|shard| assembly::add_item(shard, item, tcx)) {
+            Ok(built) => built,
+            Err(error) => fatal_item_codegen_error(tcx, item, &item_name, error),
+        };
         commit_assembly_shard(parent, shard);
         return;
     }
 
     // Exploratory mode may recover from a panic while constructing an isolated item shard. Commit
-    // is intentionally outside this catch: catching a consuming-link panic would continue with an
-    // empty parent and silently erase all items previously committed in the current CGU.
+    // is intentionally outside this catch: a preflight/link conflict is a cross-shard invariant
+    // failure, not an unsupported single item that can be replaced or discarded. Staging preserves
+    // the parent, while fail-stop behavior prevents an incomplete assembly from being reported as
+    // successful.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         build_assembly_shard(|shard| assembly::add_item(shard, item, tcx))
     }));
@@ -452,7 +463,7 @@ fn add_item_transactionally<'tcx>(
             // A function can be replaced by an explicit throwing stub in exploratory mode. A
             // discarded crate-level assembly item has no observable substitute, so continuing
             // would falsely claim a successful compilation of a different program.
-            panic!("Could not add item `{item_name}`: {error:?}");
+            fatal_item_codegen_error(tcx, item, &item_name, error);
         }
         Ok(Err(error)) => {
             eprintln!(
@@ -478,6 +489,24 @@ fn add_item_transactionally<'tcx>(
     commit_assembly_shard(parent, shard);
 }
 
+/// Turn an expected lowering rejection into an ordinary fatal rustc diagnostic, not a backend
+/// panic/ICE. The item shard has not been committed, so reporting here preserves transactional
+/// lowering while still stopping correctness-mode compilation.
+fn fatal_item_codegen_error<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    item: rustc_middle::mono::MonoItem<'tcx>,
+    item_name: &str,
+    error: codegen_error::CodegenError,
+) -> ! {
+    let message = match error {
+        codegen_error::CodegenError::UnsupportedFeature { feature, detail } => {
+            format!("UnsupportedFeature({feature}) while compiling `{item_name}`: {detail}")
+        }
+        error => format!("code generation failed for `{item_name}`: {error:?}"),
+    };
+    tcx.dcx().span_fatal(tcx.def_span(item.def_id()), message)
+}
+
 impl CodegenBackend for MyBackend {
     fn name(&self) -> &'static str {
         "cg_clr"
@@ -487,6 +516,12 @@ impl CodegenBackend for MyBackend {
     }
     /// Compiles a crate, and returns its in-memory representaion as a .NET assembly.
     fn codegen_crate<'a>(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
+        crate::target_layout::TargetLayout::from_data_layout(tcx.data_layout()).unwrap_or_else(
+            |error| {
+                tcx.dcx()
+                    .fatal(format!("UnsupportedFeature(target_layout): {error}"))
+            },
+        );
         let cgus = tcx.collect_and_partition_mono_items(());
 
         let mut asm = Assembly::default();
@@ -522,10 +557,10 @@ impl CodegenBackend for MyBackend {
             .expect("Could not resolve entrypoint!")
             .expect("Could not resolve entrypoint!");
             let mut ctx = MethodCompileCtx::new(tcx, None, entrypoint, &mut asm);
-            let sig = function_sig::sig_from_instance_(entrypoint, &mut ctx)
-                .expect("Could not get the signature of the entrypoint.");
-            let symbol = tcx.symbol_name(entrypoint);
-            let symbol = format!("{symbol:?}");
+            let sig = AbiPlan::from_instance(entrypoint, &mut ctx)
+                .signature()
+                .clone();
+            let symbol = fn_name_for_instance(tcx, entrypoint);
             // A `fn main() -> T where T: Termination` (`-> Result<_,_>` / `-> ExitCode`) has a
             // non-`Void` return and no args; `entrypoint::wrapper` only handles `() -> ()` and the
             // C-main ABI, so it would `panic!` (ICE). Mirror rustc's `create_entry_fn`: route through
@@ -573,10 +608,11 @@ impl CodegenBackend for MyBackend {
                 );
                 let start_sig = {
                     let mut sctx = MethodCompileCtx::new(tcx, None, start_inst, &mut asm);
-                    function_sig::sig_from_instance_(start_inst, &mut sctx)
-                        .expect("Could not get the signature of lang_start.")
+                    AbiPlan::from_instance(start_inst, &mut sctx)
+                        .signature()
+                        .clone()
                 };
-                let start_symbol = format!("{:?}", tcx.symbol_name(start_inst));
+                let start_symbol = fn_name_for_instance(tcx, start_inst);
                 let lang_start = MethodRef::new(
                     *asm.main_module(),
                     asm.alloc_string(start_symbol),

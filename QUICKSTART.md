@@ -1,7 +1,7 @@
 # Quickstart: run Rust on .NET
 
-`rustc_codegen_clr` is experimental compiler infrastructure. The 0.0.2 preview intentionally has
-one supported runtime profile: .NET 10.
+`rustc_codegen_clr` is experimental compiler infrastructure. The unpublished 0.0.2 release
+candidate intentionally has one supported runtime profile: .NET 10.
 
 ## Prerequisites
 
@@ -9,23 +9,20 @@ one supported runtime profile: .NET 10.
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - Linux x64, macOS Apple Silicon, or Windows x64
 
-## Install
-
-Linux or macOS:
+## Provision from source (Linux/macOS)
 
 ```bash
-curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.sh | sh
+git clone https://github.com/sharifhsn/rustc_codegen_clr
+cd rustc_codegen_clr
+cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- setup --from-repo "$PWD"
+cargo dotnet doctor
 ```
 
-Windows PowerShell:
-
-```powershell
-irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.ps1 | iex
-```
-
-For an inspectable install, download the script first, read it, and run it locally. The installer
-downloads a host-specific ZIP and checksum, then uses the standalone `cargo-dotnet` executable to
-verify and install the bundle.
+There is no `rust-dotnet-v0.0.2` release tag yet, so release-asset installer URLs are intentionally
+not advertised. A published release will provide host-specific bundles and checksums; until then,
+the command above captures and installs an inspectable source snapshot on Linux x64 or macOS Apple
+Silicon. Windows x64 is exercised by the release-candidate gates, but checkout setup still delegates
+to a POSIX shell script; use the signed Windows bundle once it is published.
 
 If `cargo dotnet` is not found afterward, open a new terminal or add Cargo's bin directory to PATH:
 
@@ -84,8 +81,8 @@ is required.
 
 ## Build from a checkout
 
-Release bundles are the normal user path. Compiler contributors can provision directly from a
-checkout:
+After a release is published, bundles are the normal user path. On Linux x64 or macOS Apple
+Silicon, a checkout can be provisioned directly:
 
 ```bash
 cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- setup --from-repo "$PWD"

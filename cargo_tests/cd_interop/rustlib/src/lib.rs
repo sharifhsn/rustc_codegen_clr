@@ -17,7 +17,8 @@
 
 // ---- primitives (callable directly from C#) ----
 
-/// Integer add. Proves primitive signatures: C# sees `int MainModule.rust_add(int, int)`.
+/// Integer add. Proves primitive signatures: C# sees
+/// `int Rcl.Interop.MainModule.rust_add(int, int)`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_add(a: i32, b: i32) -> i32 {
     a + b

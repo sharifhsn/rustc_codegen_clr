@@ -132,6 +132,53 @@ fn main() -> std::process::ExitCode {
         chk!(combined, 20); // len("xy") == 2, + 7 + 11 == 20
     }
 
+    // ---------- 5. rooted handles remain live after Rust-container moves and forced full GC. ----
+    {
+        let mut roots: Vec<SB> = Vec::new();
+        for _ in 0..32 {
+            let root = SB::ctor0();
+            let naked: System::Text::StringBuilder = unsafe { root.get_naked_ref() };
+            naked.append(MString::from("rooted"));
+            roots.push(root);
+        }
+        let boxed = Box::new(SB::ctor0());
+        let boxed_naked: System::Text::StringBuilder = unsafe { boxed.get_naked_ref() };
+        boxed_naked.append(MString::from("box"));
+        let array = [SB::ctor0(), SB::ctor0()];
+
+        let generation = System::GC::get_max_generation();
+        System::GC::collect(generation);
+        System::GC::wait_for_pending_finalizers();
+        System::GC::collect(generation);
+
+        let all_vec_roots_live = roots.iter().all(|root| {
+            let naked: System::Text::StringBuilder = unsafe { root.get_naked_ref() };
+            naked.get_length() == 6
+        });
+        let boxed_live = {
+            let naked: System::Text::StringBuilder = unsafe { boxed.get_naked_ref() };
+            naked.get_length() == 3
+        };
+        let array_live = array.iter().all(|root| {
+            let naked: System::Text::StringBuilder = unsafe { root.get_naked_ref() };
+            naked.get_length() == 0
+        });
+        chk!(all_vec_roots_live && boxed_live && array_live, true);
+    }
+
+    // ---------- 6. audited CLR value types remain legal inline Rust storage. ------------------
+    // These wrappers opt into NativeStorageSafe: unlike object references, TimeSpan and Decimal
+    // have stable blittable value layouts and can participate in Vec moves/copies.
+    {
+        let spans = vec![
+            DotNetTimeSpan::from_seconds(1.0),
+            DotNetTimeSpan::from_seconds(2.0),
+        ];
+        let decimals = vec![DotNetDecimal::from_i32(3), DotNetDecimal::from_i32(5)];
+        chk!(spans.len() == 2 && spans[1].seconds() == 2, true);
+        chk!(decimals.len() == 2 && decimals[0] < decimals[1], true);
+    }
+
     println!("== cd_persisted_async done ==");
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);

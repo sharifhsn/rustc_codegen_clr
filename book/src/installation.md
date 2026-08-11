@@ -7,29 +7,25 @@ Install:
 - [rustup](https://rustup.rs/); and
 - the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 
-The release installer downloads the matching SDK bundle, verifies it, and installs the
-`cargo dotnet` command without changing the system Rust installation.
+The 0.0.2 release tag has not been published yet. On Linux x64 or macOS Apple Silicon, provision the
+current candidate from a checkout; this installs `cargo dotnet` and may add the pinned rustup
+toolchain and required components, but does not replace the default toolchain.
 
 ```bash
-curl -fsSL https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.sh | sh
-```
-
-On Windows x64, run this in PowerShell:
-
-```powershell
-irm https://github.com/sharifhsn/rustc_codegen_clr/releases/download/rust-dotnet-v0.0.2/install.ps1 | iex
-```
-
-Then verify the installation:
-
-```bash
+git clone https://github.com/sharifhsn/rustc_codegen_clr
+cd rustc_codegen_clr
+cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- setup --from-repo "$PWD"
 cargo dotnet doctor
 ```
+
+Once a signed 0.0.2 tag and matching bundles are published, the release page will provide verified
+one-line installers for each supported host. Windows checkout setup still delegates to a POSIX
+shell script, so Windows users should wait for that signed bundle.
 
 `doctor` reports missing SDK components and common project-wiring errors. The backend is selected
 per build; it does not permanently replace rustc's native backend.
 
-The public SDK targets .NET 10 only and emits managed PE files directly.
+The 0.0.2 release candidate targets .NET 10 only and emits managed PE files directly.
 
 ## Build from a checkout
 

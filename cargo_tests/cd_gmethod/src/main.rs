@@ -39,7 +39,7 @@ fn enum_get_name(dow: DayOfWeek) -> DotNetString {
 
 // The ergonomic bridge: a Rust mirror of `System.DayOfWeek` with boundary conversions.
 mycorrhiza::dotnet_enum! {
-    pub enum Dow = ["System.Private.CoreLib"] "System.DayOfWeek" (i32, 4) {
+    unsafe pub enum Dow = ["System.Private.CoreLib"] "System.DayOfWeek" (i32, 4) {
         Sunday = 0, Monday = 1, Tuesday = 2, Wednesday = 3, Thursday = 4, Friday = 5, Saturday = 6,
     }
 }

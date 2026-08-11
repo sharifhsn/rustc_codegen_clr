@@ -14,6 +14,14 @@ hash_file() {
     fi
 }
 
+hash_git_tree() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        git archive --format=tar HEAD | sha256sum | awk '{print $1}'
+    else
+        git archive --format=tar HEAD | shasum -a 256 | awk '{print $1}'
+    fi
+}
+
 if [[ "${RUNNER_OS:-}" == Windows ]] && command -v cygpath >/dev/null 2>&1; then
     work="$(cygpath -u "$work")"
 fi
@@ -50,6 +58,17 @@ case "$host" in
 esac
 
 cd "$repo"
+[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || {
+    echo "release bundle refuses a dirty source tree" >&2
+    exit 2
+}
+head_revision="$(git rev-parse --verify HEAD)"
+source_tree_sha256="$(hash_git_tree)"
+driver_build_id="source-sha256:$source_tree_sha256"
+# Build the packaged driver here with the identity this script is about to record. Relying on a
+# prior workflow step would let a stale/default-ID target artifact be mislabeled by VERSION.
+CARGO_DOTNET_BUILD_ID="$driver_build_id" \
+    cargo +stable build --release --frozen --manifest-path tools/cargo-dotnet/Cargo.toml
 for required in "$backend" "$linker" "$driver"; do
     [[ -f "$required" ]] || {
         echo "release artifact is missing: $required" >&2
@@ -62,30 +81,26 @@ home="$work/sdk-home"
 out="$work/release-assets"
 install_home="$work/install-home"
 cargo_home="$work/cargo-home"
+setup_cargo_home="$work/setup-cargo-home"
 rm -rf "$work"
-mkdir -p "$home/bin" "$home/target" "$home/crates" "$out"
+mkdir -p "$out"
+CARGO_HOME="$setup_cargo_home" CARGO_DOTNET_HOME="$home" \
+    "$driver" setup --from-repo "$repo" --home "$home" \
+    --skip-toolchain --skip-dotnet --force
+home_driver="$home/bin/cargo-dotnet"
+[[ "$host" == windows-x64 ]] && home_driver="$home/bin/cargo-dotnet.exe"
+[[ -f "$home_driver" ]] || {
+    echo "sealed SDK home driver is missing: $home_driver" >&2
+    exit 2
+}
 
-cp "$backend" "$home/bin/$backend_name"
-cp "$linker" "$home/bin/$(basename "$linker")"
-cp x86_64-unknown-dotnet.json "$home/target/x86_64-unknown-dotnet.json"
-cp feasibility/_cargo_dotnet_core.sh "$home/core.sh"
-cp feasibility/cargo-dotnet "$home/cargo-dotnet"
-cp -R dotnet_pal dotnet_overlays msbuild "$home/"
-cp -R mycorrhiza dotnet_macros "$home/crates/"
-cp -R crates/rust-dotnet-pinvoke "$home/crates/"
-cp -R crates/rust-dotnet-native-contract-macros "$home/crates/"
-cp -R mycorrhiza_interop_helpers "$home/"
-rm -rf "$home/mycorrhiza_interop_helpers/bin" "$home/mycorrhiza_interop_helpers/obj"
-printf 'schema = 1\ngit_rev = %s\nrelease_tag = rust-dotnet-v%s\ncargo_dotnet_version = %s\nhost_rid = %s\ntoolchain = nightly-2026-06-17\n' \
-    "$(git rev-parse HEAD)" "$version" "$version" "$runtime_rid" > "$home/VERSION"
-
-cp "$driver" "$out/$asset_driver"
+cp "$home_driver" "$out/$asset_driver"
 chmod +x "$out/$asset_driver" 2>/dev/null || true
 printf '%s  %s\n' "$(hash_file "$out/$asset_driver")" "$asset_driver" \
     > "$out/$asset_driver.sha256"
 bundle="$out/cargo-dotnet-sdk-$host-$version.zip"
-"$driver" bundle create --home "$home" --out "$bundle"
-"$driver" bundle verify "$bundle"
+"$home_driver" bundle create --home "$home" --out "$bundle"
+"$home_driver" bundle verify "$bundle"
 
 CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
     "$driver" bundle install "$bundle"

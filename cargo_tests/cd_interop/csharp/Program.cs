@@ -11,6 +11,7 @@
 // inbound slice. Every assertion checks the C#-observed result against what Rust computes.
 
 using System;
+using RustExports = Rcl.Interop.MainModule;
 using System.Text;
 using Rcl.Interop;
 
@@ -21,7 +22,7 @@ public static class Program
         int pass = 0, total = 0;
 
         // ---- primitives (direct typed managed call) ----
-        Check("rust_add(2,3)", MainModule.rust_add(2, 3), 5, ref pass, ref total);
+        Check("rust_add(2,3)", RustExports.rust_add(2, 3), 5, ref pass, ref total);
 
         // ---- string marshalling (UTF-8 ptr+len, out-buffer round-trip) ----
         byte[] utf8 = Encoding.UTF8.GetBytes("World");
@@ -31,7 +32,7 @@ public static class Program
             fixed (byte* op = outbuf)
             {
                 // C# string -> Rust &str (inbound), Rust String -> C# string (outbound).
-                nuint n = MainModule.greet(np, (nuint)utf8.Length, op, (nuint)outbuf.Length);
+                nuint n = RustExports.greet(np, (nuint)utf8.Length, op, (nuint)outbuf.Length);
                 string greeting = Encoding.UTF8.GetString(outbuf, 0, (int)n);
                 Check("greet(\"World\")", greeting, "Hello, World, from Rust!", ref pass, ref total);
             }
@@ -41,8 +42,8 @@ public static class Program
         // The Rust struct is referenced directly by its clean name; the backend-synthesized public
         // constructor + per-field getters make it constructible and readable from C#.
         cd_interop.Point p = new cd_interop.Point(2, 3);              // inbound: C# value-type -> Rust
-        Check("point_sum(new Point(2,3))", MainModule.point_sum(p), 5, ref pass, ref total);
-        cd_interop.Point q = MainModule.make_point(4, 5);            // outbound: Rust -> C# value-type
+        Check("point_sum(new Point(2,3))", RustExports.point_sum(p), 5, ref pass, ref total);
+        cd_interop.Point q = RustExports.make_point(4, 5);            // outbound: Rust -> C# value-type
         Check("make_point(4,5).get_x()", q.get_x(), 4, ref pass, ref total);
         Check("make_point(4,5).get_y()", q.get_y(), 5, ref pass, ref total);
 
@@ -50,7 +51,7 @@ public static class Program
         int[] nums = { 1, 2, 3, 4 };
         fixed (int* sp = nums)                                       // inbound: C# int[] -> Rust &[i32]
         {
-            Check("sum_slice([1,2,3,4])", MainModule.sum_slice(sp, (nuint)nums.Length), 10, ref pass, ref total);
+            Check("sum_slice([1,2,3,4])", RustExports.sum_slice(sp, (nuint)nums.Length), 10, ref pass, ref total);
         }
 
         Console.WriteLine(pass == total ? "PASS" : $"FAIL ({pass}/{total})");

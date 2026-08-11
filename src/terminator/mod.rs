@@ -1,3 +1,4 @@
+use crate::abi::AbiPlan;
 use crate::assembly::MethodCompileCtx;
 use cilly::{
     Access, BasicBlock as CILBasicBlock, BinOp, BranchCond, CILNode, CILRoot, ClassRef, Const,
@@ -8,7 +9,7 @@ use cilly::{
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
-use crate::fn_ctx::fn_name;
+use crate::fn_ctx::fn_name_for_instance;
 use crate::place::{place_address, place_set};
 use crate::r#type::GetTypeExt;
 use rustc_middle::mir::AssertKind;
@@ -111,12 +112,13 @@ pub(crate) fn get_caller_location<'tcx>(
     // rustc appends exactly one implicit `&Location` to the `FnAbi` of every track_caller fn, so it
     // is the last CIL argument. MIR arg locals `_1..=arg_count` map to `LdArg(0..arg_count-1)` (see
     // `crate::place::get::local_get`), so the implicit trailing arg is at `LdArg(arg_count)`.
-    let own_caller_location = if ctx.instance().def.requires_caller_location(tcx) {
-        let idx = u32::try_from(ctx.body().arg_count).expect("arg_count exceeds u32");
-        Some(ctx.alloc_node(CILNode::LdArg(idx)))
-    } else {
-        None
-    };
+    let own_caller_location = crate::abi::AbiPlan::from_instance(ctx.instance(), ctx)
+        .caller_location_slot()
+        .map(|slot| {
+            ctx.alloc_node(CILNode::LdArg(
+                u32::try_from(slot).expect("caller-location ABI slot exceeds u32"),
+            ))
+        });
     // `body()` returns a `'tcx` reference, so it does not borrow `ctx` — the `from_span` closure is
     // free to take `&mut ctx` to materialize the constant.
     let body = ctx.body();
@@ -150,20 +152,13 @@ fn call_panic_lang_item<'tcx>(
         rustc_middle::ty::List::empty(),
         span,
     );
-    let call_info = crate::call_info::CallInfo::sig_from_instance_(instance, ctx);
-    let signature = call_info.sig().clone();
-    let name = fn_name(ctx.tcx().symbol_name(instance));
+    let abi = crate::abi::AbiPlan::from_instance(instance, ctx);
+    let signature = abi.signature().clone();
+    let name = fn_name_for_instance(ctx.tcx(), instance);
     let mut call_args: Vec<Interned<CILNode>> = args.to_vec();
     // Ask the resolved instance rather than treating any arity mismatch as track_caller: another
     // ABI adjustment must fail loudly instead of receiving a caller-location value by accident.
-    if instance.def.requires_caller_location(ctx.tcx()) {
-        assert_eq!(
-            call_args.len() + 1,
-            signature.inputs().len(),
-            "a track_caller panic lang item must add exactly one implicit caller-location slot"
-        );
-        call_args.push(get_caller_location(ctx, source_info));
-    }
+    abi.append_caller_location(&mut call_args, source_info, ctx);
     assert_eq!(
         call_args.len(),
         signature.inputs().len(),
@@ -1227,8 +1222,7 @@ fn emit_call_into<'tycxt>(
 ) -> Vec<Root> {
     let mut trees = Vec::new();
 
-    let func_ty = func.ty(ctx.body(), ctx.tcx());
-    let fn_ty = ctx.monomorphize(func_ty);
+    let func_ty = ctx.monomorphize(func.ty(ctx.body(), ctx.tcx()));
     // Get the pointed type, if byref;
     let func_ty = match func_ty.builtin_deref(true) {
         None => func_ty,
@@ -1237,23 +1231,22 @@ fn emit_call_into<'tycxt>(
     match func_ty.kind() {
         TyKind::FnDef(_, _) => {
             assert!(
-                fn_ty.is_fn(),
-                "fn_ty{fn_ty:?} in call is not a function type!"
+                func_ty.is_fn(),
+                "fn_ty{func_ty:?} in call is not a function type!"
             );
-            let fn_ty = ctx.monomorphize(fn_ty);
-            let call_ops = call::call(fn_ty, ctx, args, destination, terminator.source_info);
+            let call_ops = call::call(func_ty, ctx, args, destination, terminator.source_info);
             //eprintln!("\nCalling FnDef:{fn_ty:?}. call_ops:{call_ops:?}");
             trees.extend(call_ops);
         }
-        TyKind::FnPtr(sig, _) => {
+        TyKind::FnPtr(sig, header) => {
             //eprintln!("Calling FnPtr:{func_ty:?}");
-
-            let sig = ctx.tcx().instantiate_bound_regions_with_erased(*sig);
-            let sig = crate::function_sig::from_poly_sig(ctx, sig);
-            let mut arg_operands = Vec::new();
-            for arg in args {
-                arg_operands.push(handle_operand(&arg.node, ctx));
-            }
+            let abi = crate::abi::AbiPlan::from_indirect_call(
+                sig.with(*header),
+                terminator.source_info.span,
+                ctx,
+            );
+            let sig = abi.signature().clone();
+            let arg_operands = abi.lower_call_args(args, terminator.source_info, ctx);
             let callee = handle_operand(func, ctx);
             let sig_idx = ctx.alloc_sig(sig.clone());
             if *sig.output() == cilly::Type::Void {
@@ -1528,9 +1521,10 @@ pub fn handle_terminator<'tcx>(
                     }
 
                     _ => {
-                        let sig =
-                            crate::function_sig::sig_from_instance_(drop_instance, ctx).unwrap();
-                        let function_name = fn_name(ctx.tcx().symbol_name(drop_instance));
+                        let sig = AbiPlan::from_instance(drop_instance, ctx)
+                            .signature()
+                            .clone();
+                        let function_name = fn_name_for_instance(ctx.tcx(), drop_instance);
                         let mref = MethodRef::new(
                             *ctx.main_module(),
                             ctx.alloc_string(function_name),
@@ -1551,8 +1545,8 @@ pub fn handle_terminator<'tcx>(
             }
         }
         TerminatorKind::Unreachable => {
-            let loc = terminator.source_info.span;
-            let msg = ctx.alloc_string(format!("Unreachable reached at {loc:?}!"));
+            let loc = crate::assembly::source_info_diagnostic_location(ctx, terminator.source_info);
+            let msg = ctx.alloc_string(format!("Unreachable reached at {loc}!"));
 
             vec![
                 rustc_middle::ty::print::with_no_trimmed_paths! {ctx.alloc_root(cilly::CILRoot::Unreachable(msg))},
@@ -1639,7 +1633,9 @@ fn handle_switch<'tcx>(
     // TRACE_VAL=<substr>: print the runtime `SwitchInt` discriminant (the value the branch actually
     // sees — a niche/enum tag) for any function whose (mangled) name contains <substr>. This is the
     // direct answer to "what value does the miscompiled branch read?" that the static `.il` can't give.
-    // Pairs with TRACE_FN (block trace). Greppable via ">>V". See feasibility/rcc-debug.
+    // Pairs with TRACE_FN (block trace). Greppable via ">>V". See feasibility/rcc-debug. This is
+    // deliberately rustc's raw diagnostic spelling so existing user filters keep matching; it is
+    // never written into emitted method/static identity.
     if let Some(filter) = crate::config::current().trace_val() {
         let sym = ctx.tcx().symbol_name(ctx.instance()).name.to_string();
         if sym.contains(filter) {

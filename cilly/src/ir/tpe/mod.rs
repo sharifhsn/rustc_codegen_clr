@@ -219,6 +219,12 @@ impl Type {
     /// let obj = Type::PlatformObject;
     /// // All non-valuetype classes can be assigned to an object.
     /// assert!(ps.is_assignable_to(obj,&asm));
+    /// let byte = asm.alloc_type(Type::Int(Int::U8));
+    /// let array = Type::PlatformArray {
+    ///     elem: byte,
+    ///     dims: std::num::NonZeroU8::new(1).unwrap(),
+    /// };
+    /// assert!(array.is_assignable_to(obj,&asm));
     /// // Valuetype, so can't be directly assigned to an object(it needs to be boxed first).
     /// assert!(!Type::ClassRef(ClassRef::int_128(&mut asm)).is_assignable_to(obj,&asm));
     /// // But you can't assign an object to a string.
@@ -254,6 +260,7 @@ impl Type {
         }
         match (*self, to) {
             (Type::PlatformString, Type::PlatformObject) => true,
+            (Type::PlatformArray { .. }, Type::PlatformObject) => true,
             (Type::ClassRef(cref), Type::PlatformObject) => {
                 let cref = asm.class_ref(cref);
                 !cref.is_valuetype()

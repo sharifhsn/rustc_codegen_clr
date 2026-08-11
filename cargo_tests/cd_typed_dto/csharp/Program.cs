@@ -6,6 +6,20 @@ static void Check(bool condition, string message)
 }
 
 var type = typeof(InvoiceDto);
+Check(InvoiceFacade.UriIsAbsolute(),
+    "transparent System.Uri wrapper receiver did not remain a managed direct value");
+Check(InvoiceFacade.JsonTryManagedSuccess(),
+    "rooted JSON try/catch state did not survive forced GC and navigation");
+Check(InvoiceFacade.JsonTryManagedError(),
+    "malformed JSON did not return the caught-error result");
+Check(InvoiceFacade.DynamicRawSuccess() == 73,
+    "raw dynamic invocation did not resolve the bundled helper and exact overload");
+Check(InvoiceFacade.DynamicTryManagedSuccess() == 73,
+    "rooted checked dynamic invocation returned the wrong result");
+Check(InvoiceFacade.DynamicTryManagedError(),
+    "invalid checked dynamic invocation did not return an error");
+Check(InvoiceFacade.DynamicTryManagedForceGc(),
+    "checked dynamic call state did not survive an in-call forced collection");
 Check(type.GetConstructor(Type.EmptyTypes) is not null, "DTO has no parameterless constructor");
 Check(type.GetProperty("Amount")?.PropertyType == typeof(decimal), "Amount is not System.Decimal");
 Check(type.GetProperty("Date")?.PropertyType == typeof(DateOnly?),
@@ -32,6 +46,8 @@ Check(blank.Amount == 9.10m && blank.Date is null && blank.Memo == "set-in-cshar
 
 var ratePointType = typeof(RatePoint);
 Check(ratePointType.IsValueType, "#[dotnet_value] did not emit a CLR value type");
+Check(RatePoint.ReopenedValueTypeMarker() == 73,
+    "separate #[dotnet_methods] reopening did not preserve the authoritative value type");
 Check(ratePointType.GetProperties().All(property => property.CanRead && property.CanWrite),
     "value-type properties are not readable/writable");
 var ratePoint = default(RatePoint);
@@ -203,6 +219,40 @@ Check(InvoiceFacade.ObserveCancellation(cancellation.Token),
     "canceled token was not observed in Rust");
 Check(InvoiceFacade.RegisterCanceledCallback(cancellation.Token) == 1,
     "owned Rust cancellation callback did not run exactly once");
+using (var unregisterSource = new CancellationTokenSource())
+{
+    Check(InvoiceFacade.UnregisterCallback(unregisterSource.Token),
+        "fresh cancellation callback did not unregister successfully");
+    GC.Collect();
+    GC.WaitForPendingFinalizers();
+    GC.Collect();
+    unregisterSource.Cancel();
+    Check(InvoiceFacade.CancellationCallbackCount() == 0,
+        "successfully unregistered Rust callback ran after its roots were released");
+}
+using (var dropSource = new CancellationTokenSource())
+{
+    Check(InvoiceFacade.DropCallbackRegistration(dropSource.Token),
+        "fresh cancellation registration was not active before Drop");
+    GC.Collect();
+    GC.WaitForPendingFinalizers();
+    GC.Collect();
+    dropSource.Cancel();
+    Check(InvoiceFacade.CancellationCallbackCount() == 0,
+        "dropped Rust cancellation registration retained a callable closure");
+}
+using (var racingSource = new CancellationTokenSource())
+{
+    var lifecycle = Task.Run(
+        () => InvoiceFacade.ExerciseRunningCancellationCallback(racingSource.Token));
+    while (!InvoiceFacade.CancellationRegistrationReady()) await Task.Yield();
+    GC.Collect();
+    GC.WaitForPendingFinalizers();
+    GC.Collect();
+    racingSource.Cancel();
+    Check(await lifecycle == 1,
+        "running callback did not survive forced GC / failed Unregister / blocking Dispose");
+}
 try
 {
     InvoiceFacade.ThrowIfCanceled(cancellation.Token);

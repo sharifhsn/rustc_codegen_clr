@@ -70,12 +70,18 @@ pub fn cargo_dotnet_home() -> Result<PathBuf> {
 /// the presence of `feasibility/_cargo_dotnet_core.sh` (the bash mode signal) AND
 /// `x86_64-unknown-dotnet.json` (the target spec) at a repo root walked up from the
 /// binary's location.
-fn find_dev_repo() -> Option<PathBuf> {
-    let exe = env::current_exe().ok()?;
+fn find_dev_repo_from(exe: &Path) -> Option<PathBuf> {
     // Walk up from the binary: a `cargo run`/`cargo install --path` build lives under
     // `<repo>/target/<profile>/cargo-dotnet`, so the repo root is a
     // few levels up. Probe every ancestor.
-    let mut cur: Option<&Path> = exe.parent();
+    find_repo_ancestor(exe.parent()?)
+}
+
+/// Find checkout markers in `path` or one of its ancestors. The path need not exist: bundle
+/// installation uses this to reject creating a new installed home below a checkout even when the
+/// currently-running driver is installed elsewhere.
+pub(crate) fn find_repo_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(path);
     while let Some(dir) = cur {
         if is_repo_root(dir) {
             return Some(dir.to_path_buf());
@@ -85,21 +91,82 @@ fn find_dev_repo() -> Option<PathBuf> {
     None
 }
 
+fn installed_home_for_executable(exe: &Path, home: &Path) -> Result<Option<PathBuf>> {
+    let metadata = match std::fs::symlink_metadata(home) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if rust_dotnet_sdk_core::safe_fs::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        anyhow::bail!(
+            "configured cargo-dotnet home is not a regular directory: {}",
+            home.display()
+        );
+    }
+    let canonical_home = std::fs::canonicalize(home)
+        .with_context(|| format!("resolving configured cargo-dotnet home {}", home.display()))?;
+    let canonical_exe = std::fs::canonicalize(exe)
+        .with_context(|| format!("resolving running cargo-dotnet {}", exe.display()))?;
+    let Ok(relative_exe) = canonical_exe.strip_prefix(&canonical_home) else {
+        return Ok(None);
+    };
+    if relative_exe.as_os_str().is_empty() {
+        anyhow::bail!("running executable resolved to the cargo-dotnet home directory");
+    }
+
+    // Retain one home authority while proving both the ownership marker and executable are
+    // ordinary descendants. A home nested below a source checkout is still installed: its own
+    // explicit authority always outranks an incidental repository marker in an ancestor.
+    let home_capability = rust_dotnet_sdk_core::safe_fs::DirectoryCapability::open(home)?;
+    let (_, version) = home_capability
+        .snapshot_regular(Path::new("VERSION"))
+        .with_context(|| {
+            format!(
+                "installed cargo-dotnet home has no safe VERSION: {}",
+                home.display()
+            )
+        })?;
+    let version = std::str::from_utf8(&version).context("installed VERSION is not UTF-8")?;
+    if !version.lines().any(|line| {
+        line.trim().strip_prefix("schema").is_some_and(|value| {
+            value
+                .trim_start()
+                .strip_prefix('=')
+                .is_some_and(|value| value.trim() == "1")
+        })
+    }) {
+        anyhow::bail!("installed cargo-dotnet VERSION has unsupported or missing schema = 1");
+    }
+    let _ = home_capability.open_regular(relative_exe).with_context(
+        || "running cargo-dotnet is not a safe regular file in its configured home",
+    )?;
+    home_capability.ensure_path_still_bound()?;
+    Ok(Some(canonical_home))
+}
+
 fn is_repo_root(dir: &Path) -> bool {
     dir.join("feasibility/_cargo_dotnet_core.sh").is_file()
         && dir.join("x86_64-unknown-dotnet.json").is_file()
 }
 
-/// Detect the run mode. An installed home (a provisioned `CARGO_DOTNET_HOME`) takes
-/// precedence over an in-repo guess only if the user is clearly outside a checkout;
-/// to keep behaviour predictable we mirror the bash: DEV iff a sibling repo core is
-/// found, else INSTALLED.
+/// Detect the run mode. A safely opened executable beneath the configured, provisioned home is
+/// unconditionally installed, even when that home happens to sit below checkout markers. Only an
+/// executable outside the home is eligible for the ancestor-based development probe.
 pub fn detect() -> Result<Mode> {
-    if let Some(repo_root) = find_dev_repo() {
+    let exe = env::current_exe().context("locating running cargo-dotnet")?;
+    let home = cargo_dotnet_home()?;
+    detect_from(&exe, &home)
+}
+
+fn detect_from(exe: &Path, home: &Path) -> Result<Mode> {
+    if let Some(home) = installed_home_for_executable(exe, home)? {
+        return Ok(Mode::Installed { home });
+    }
+    if let Some(repo_root) = find_dev_repo_from(exe) {
         return Ok(Mode::Dev { repo_root });
     }
     Ok(Mode::Installed {
-        home: cargo_dotnet_home()?,
+        home: home.to_path_buf(),
     })
 }
 
@@ -122,4 +189,37 @@ pub fn read_home_toolchain(home: &Path) -> String {
         }
     }
     DEFAULT_TOOLCHAIN.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_installed_home_nested_under_repo_outweighs_dev_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("rustc_codegen_clr");
+        let home = repo.join("nested-sdk");
+        let driver = home
+            .join("bin")
+            .join(format!("cargo-dotnet{}", std::env::consts::EXE_SUFFIX));
+        std::fs::create_dir_all(driver.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(repo.join("feasibility")).unwrap();
+        std::fs::write(repo.join("feasibility/_cargo_dotnet_core.sh"), b"core").unwrap();
+        std::fs::write(repo.join("x86_64-unknown-dotnet.json"), b"{}").unwrap();
+        std::fs::write(home.join("VERSION"), b"schema = 1\n").unwrap();
+        std::fs::write(&driver, b"driver").unwrap();
+
+        let mode = detect_from(&driver, &home).unwrap();
+        match mode {
+            Mode::Installed { home: detected } => {
+                assert_eq!(detected, std::fs::canonicalize(&home).unwrap())
+            }
+            Mode::Dev { repo_root } => panic!(
+                "installed driver beneath repo was misclassified as dev: {}",
+                repo_root.display()
+            ),
+        }
+        assert_eq!(find_repo_ancestor(&home), Some(repo));
+    }
 }

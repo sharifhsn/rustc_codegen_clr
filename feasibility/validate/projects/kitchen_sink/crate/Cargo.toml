@@ -11,8 +11,6 @@ edition = "2024"
 name = "kitchen_sink"
 path = "src/main.rs"
 
-# NOTE: deliberately NOT setting `overflow-checks = true` here. With -Zbuild-std it
-# propagates to `alloc`, and the backend currently emits invalid CIL for checked-
-# arithmetic paths in Rc/Cell/String (FieldOwnerMismatch / CallArgTypeWrong) — a real
-# codegen bug the differential harness surfaced. kitchen_sink uses explicit
-# wrapping_*/checked_*, so it doesn't depend on implicit overflow checks anyway.
+# This fixture intentionally uses explicit wrapping_*/checked_* operations, so its differential
+# oracle does not depend on a profile's implicit overflow policy. The separate
+# cargo_tests/panic_msgs acceptance forces overflow-checks=true through build-std in both profiles.

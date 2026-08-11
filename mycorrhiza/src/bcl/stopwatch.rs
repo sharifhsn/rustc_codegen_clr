@@ -57,6 +57,7 @@ pub type MStopwatch = crate::intrinsics::RustcCLRInteropManagedClass<
 /// then query the elapsed time as it runs or after [`stop`](Stopwatch::stop). The mutating methods
 /// take `&self` because they mutate the *managed* object, not the Rust handle.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Stopwatch(MStopwatch);
 
 impl Stopwatch {

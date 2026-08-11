@@ -36,6 +36,7 @@ use crate::System::Text::StringBuilder as Raw;
 use crate::system::{DotNetString, MString};
 
 /// A managed `System.Text.StringBuilder`. See the [module docs](self).
+#[repr(transparent)]
 pub struct StringBuilder {
     h: Raw,
 }

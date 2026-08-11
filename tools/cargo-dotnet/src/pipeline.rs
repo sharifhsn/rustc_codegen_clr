@@ -9,6 +9,7 @@
 //! The native pipeline maps the bash core's three separable phases onto typed stages:
 //!   PAL inject -> overlays apply -> build-std -> locate artifact -> (run | report).
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -54,6 +55,9 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
     // that would fail at runtime with `FileNotFoundException` anyway. A no-op for crates that
     // never ran `add-nuget`; fails fast with an actionable error under `--offline`/`--frozen`.
     nuget::ensure_staged(ctx)?;
+    // Retain one shared project lease through compilation and output materialization. This keeps
+    // bindings, dependency metadata, and staged assets on the same committed NuGet revision.
+    let nuget_lease = nuget::acquire_project_lease(&ctx.crate_dir)?;
     // 2.5. Refresh managed-API XML-doc scratch only when its source snapshot changed. This keeps
     // removed members correct without forcing every no-op Unity refresh through rustc again.
     xmldoc::prepare(ctx)?;
@@ -72,7 +76,7 @@ fn run_native(ctx: &Context, prog_args: &[String]) -> Result<i32> {
         Artifact::None => None,
     };
     if let Some(out_dir) = out_dir {
-        let mut runtime_assets = nuget::copy_assets(&ctx.crate_dir, out_dir)?;
+        let mut runtime_assets = nuget_lease.copy_assets(out_dir)?;
         // 4.6. Copy the bundled `Mycorrhiza.Interop.Helpers` companion dll (building it first if
         // needed) for any crate that depends on `mycorrhiza` — see `interop_helpers`'s doc comment
         // for why this is unconditional rather than gated on a marker directory like 4.5 above.
@@ -106,6 +110,8 @@ fn write_runtime_asset_manifest(artifact: &Artifact, assets: &[PathBuf]) -> Resu
         .context("managed Rust library has no artifact directory")?;
     let root = fs::canonicalize(root)
         .with_context(|| format!("resolving artifact directory {}", root.display()))?;
+    let output = rust_dotnet_sdk_core::safe_fs::DirectoryCapability::open(&root)
+        .with_context(|| format!("opening artifact directory {}", root.display()))?;
     let mut assets = assets
         .iter()
         .map(|path| {
@@ -131,35 +137,70 @@ fn write_runtime_asset_manifest(artifact: &Artifact, assets: &[PathBuf]) -> Resu
     assets.dedup();
     let mut text = String::new();
     for (source, relative) in assets {
-        let source_value = source.to_string_lossy();
-        let relative_value = relative.to_string_lossy();
-        if source_value.contains(['\r', '\n', '|', ';'])
-            || relative_value.contains(['\r', '\n', '|', ';'])
-        {
-            bail!(
-                "runtime asset path contains a manifest-reserved character: {}",
-                source.display()
-            );
-        }
-        text.push_str(&source_value);
-        text.push('|');
-        text.push_str(&relative_value);
-        text.push('\n');
+        append_runtime_asset_manifest_entry(&mut text, &source, &relative)?;
     }
-    let manifest = runtime_asset_manifest_path(dll);
-    if fs::read_to_string(&manifest).ok().as_deref() != Some(text.as_str()) {
-        fs::write(&manifest, text)
-            .with_context(|| format!("writing runtime asset manifest {}", manifest.display()))?;
+    let manifest = runtime_asset_manifest_relative_path(dll)?;
+    let current = output
+        .snapshot_regular(&manifest)
+        .ok()
+        .map(|(_, bytes)| bytes);
+    if current.as_deref() != Some(text.as_bytes()) {
+        output.publish_bytes(&manifest, text.as_bytes())?;
     }
     Ok(())
 }
 
-fn runtime_asset_manifest_path(dll: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.rustdotnet.runtime-assets", dll.display()))
+fn append_runtime_asset_manifest_entry(
+    text: &mut String,
+    source: &Path,
+    relative: &Path,
+) -> Result<()> {
+    let Some(source_value) = source.to_str() else {
+        bail!(
+            "runtime asset source path is not valid UTF-8 and cannot be represented in the runtime-assets manifest"
+        );
+    };
+    let Some(relative_value) = relative.to_str() else {
+        bail!(
+            "runtime asset relative path is not valid UTF-8 and cannot be represented in the runtime-assets manifest"
+        );
+    };
+    if source_value.contains(['\r', '\n', '|', ';'])
+        || relative_value.contains(['\r', '\n', '|', ';'])
+    {
+        bail!(
+            "runtime asset path contains a manifest-reserved character: {}",
+            source.display()
+        );
+    }
+    text.push_str(source_value);
+    text.push('|');
+    text.push_str(relative_value);
+    text.push('\n');
+    Ok(())
+}
+
+fn runtime_asset_manifest_relative_path(dll: &Path) -> Result<PathBuf> {
+    let mut name = dll
+        .file_name()
+        .context("managed Rust library path has no file name")?
+        .to_os_string();
+    name.push(OsString::from(".rustdotnet.runtime-assets"));
+    Ok(PathBuf::from(name))
+}
+
+#[cfg(test)]
+fn runtime_asset_manifest_path(dll: &Path) -> Result<PathBuf> {
+    let parent = dll
+        .parent()
+        .context("managed Rust library path has no parent")?;
+    Ok(parent.join(runtime_asset_manifest_relative_path(dll)?))
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::append_runtime_asset_manifest_entry;
     use super::{runtime_asset_manifest_path, write_runtime_asset_manifest};
     use crate::artifact::Artifact;
     use std::fs;
@@ -188,7 +229,7 @@ mod tests {
 
         let source = fs::canonicalize(&resource).unwrap();
         assert_eq!(
-            fs::read_to_string(runtime_asset_manifest_path(&dll)).unwrap(),
+            fs::read_to_string(runtime_asset_manifest_path(&dll).unwrap()).unwrap(),
             format!(
                 "{}|{}\n",
                 source.display(),
@@ -196,6 +237,95 @@ mod tests {
             )
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_asset_manifest_replaces_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("output");
+        fs::create_dir(&root).unwrap();
+        let dll = root.join("Backend.dll");
+        let resource = root.join("Backend.resources.dll");
+        fs::write(&dll, b"managed").unwrap();
+        fs::write(&resource, b"resource").unwrap();
+        let artifact = Artifact::Library {
+            so: root.join("libbackend.so"),
+            dll: dll.clone(),
+            stem: "Backend".to_string(),
+        };
+        let outside = temp.path().join("outside-sentinel");
+        fs::write(&outside, b"do not replace").unwrap();
+        let manifest = runtime_asset_manifest_path(&dll).unwrap();
+        symlink(&outside, &manifest).unwrap();
+
+        write_runtime_asset_manifest(&artifact, std::slice::from_ref(&resource)).unwrap();
+
+        assert_eq!(fs::read(&outside).unwrap(), b"do not replace");
+        assert!(
+            !fs::symlink_metadata(&manifest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let source = fs::canonicalize(&resource).unwrap();
+        assert_eq!(
+            fs::read_to_string(&manifest).unwrap(),
+            format!("{}|Backend.resources.dll\n", source.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_asset_manifest_rejects_non_utf_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let source =
+            Path::new("runtime").join(OsString::from_vec(b"Backend-\xff.resources.dll".to_vec()));
+        let mut text = String::new();
+        let error = append_runtime_asset_manifest_entry(
+            &mut text,
+            &source,
+            Path::new("Backend.resources.dll"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(text.is_empty());
+
+        let relative =
+            Path::new("runtime").join(OsString::from_vec(b"Backend-\xff.resources.dll".to_vec()));
+        let error = append_runtime_asset_manifest_entry(
+            &mut text,
+            Path::new("/valid/source/Backend.resources.dll"),
+            &relative,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("relative path is not valid UTF-8"),
+            "{error}"
+        );
+        assert!(text.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_asset_manifest_sidecar_preserves_non_utf_dll_name() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let dll = Path::new("output").join(OsString::from_vec(b"Backend-\xff.dll".to_vec()));
+
+        let manifest = runtime_asset_manifest_path(&dll).unwrap();
+        assert_eq!(
+            manifest.file_name().unwrap().as_bytes(),
+            b"Backend-\xff.dll.rustdotnet.runtime-assets"
+        );
     }
 }
 

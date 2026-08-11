@@ -99,10 +99,10 @@ fn main() -> std::process::ExitCode {
     chk!(a.to_rust_string().as_str(), "Hello");
     chk!(std::string::String::from(a).as_str(), "Hello"); // From<DotNetString>
 
-    // From<&String> / FromStr / Default
+    // From<&String> / Default
     let owned = std::string::String::from("Hello");
     chk!((DotNetString::from(&owned) == a), true);
-    chk!(("Hello".parse::<DotNetString>().unwrap() == a), true);
+    chk!((DotNetString::from("Hello") == a), true);
     chk!(DotNetString::default().is_empty(), true);
     chk!(DotNetString::empty().is_empty(), true);
     chk!(a.is_empty(), false);
@@ -123,14 +123,13 @@ fn main() -> std::process::ExitCode {
         true
     );
 
-    // concatenation via `concat`, `+`, and `+=`
+    // concatenation via `concat` and `+`
     let sp = DotNetString::from(" ");
     let joined = a.concat(sp).concat(c);
     chk!((joined == "Hello World"), true);
     chk!((a + c == "HelloWorld"), true); // `+`
-    let mut acc = DotNetString::from("Hello");
-    acc += c;
-    chk!((acc == "HelloWorld"), true); // `+=`
+    let acc = DotNetString::from("Hello") + c;
+    chk!((acc == "HelloWorld"), true);
 
     // non-ASCII round-trip (multi-byte UTF-8 -> UTF-16 -> back)
     let u = DotNetString::from("héllo");

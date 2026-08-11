@@ -60,6 +60,7 @@ use crate::intrinsics::{
     rustc_clr_interop_managed_checked_cast as checked_cast,
     rustc_clr_interop_managed_new_arr as new_arr, rustc_clr_interop_managed_set_elem as set_elem,
 };
+use crate::managed_option::ManagedRef;
 use crate::system::{MObject, MString};
 
 /// The bundled helper assembly's simple name. Must match `mycorrhiza_interop_helpers`'s
@@ -76,6 +77,7 @@ type Invoker = RustcCLRInteropManagedClass<DYNAMIC_INVOKER_ASSEMBLY, DYNAMIC_INV
 /// [`box_arg`] (value types) or [`ref_arg`] / [`str_arg`] (reference types) and pass it to
 /// `invoke_dynamicN` / `invoke_dynamicN_checked`.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct DynArg(MObject);
 
 /// Box a [`ManagedSafe`] value (a Rust primitive, or a `.NET` value-type struct laid out the way this
@@ -210,13 +212,21 @@ pub unsafe fn invoke_dynamic4(
 
 // ---- checked wrappers -----------------------------------------------------------------------
 //
-// These do NOT return the `MObject` result through `try_managed`'s own `Result` (i.e. NOT
-// `try_managed(|| invoke_dynamicN(..)) `). `Result<MObject, _>` would place a managed reference
-// inside a Rust enum niche, which the CLR layout rejects (a managed ref cannot be overlapped by a
-// discriminant) -- the exact wall `mycorrhiza::bcl::json::Json::parse` already documents and works
-// around. Same fix here: the managed result is written into `out` via the closure's captured
-// `&mut`, the closure itself returns `()` (nothing managed crosses the `try/catch` boundary), and
-// `try_managed`'s `Result<(), ManagedException>` only gates whether `out` is meaningful.
+// A checked result is a `ManagedRef<MObject>`, not a naked `MObject`. Both the closure saved in
+// `TryState` and its `Result` therefore contain only opaque GCHandle tokens. Each dynamic argument
+// is rooted before entering the catch boundary and copied into a direct CLR local only for the
+// immediate managed call. Callers may consume the successful root with `ManagedRef::into_raw` when
+// they are ready to pass the result directly to another managed operation.
+
+#[inline(always)]
+fn root_arg(arg: DynArg) -> ManagedRef<MObject> {
+    ManagedRef::from_raw(arg.0)
+}
+
+#[inline(always)]
+fn copy_arg(arg: &ManagedRef<MObject>) -> DynArg {
+    DynArg(arg.copy_raw())
+}
 
 /// Safe wrapper over [`invoke_dynamic0`]: catches the failure mode `unsafe` warns about as an
 /// [`Err`] containing a [`ManagedException`] instead of letting it abort the process.
@@ -225,10 +235,10 @@ pub fn invoke_dynamic0_checked(
     assembly: &str,
     type_name: &str,
     method_name: &str,
-) -> Result<MObject, ManagedException> {
-    let mut out = MObject::null();
-    try_managed(|| out = unsafe { invoke_dynamic0(assembly, type_name, method_name) })?;
-    Ok(out)
+) -> Result<ManagedRef<MObject>, ManagedException> {
+    try_managed(|| {
+        ManagedRef::from_raw(unsafe { invoke_dynamic0(assembly, type_name, method_name) })
+    })
 }
 
 /// Safe wrapper over [`invoke_dynamic1`]. See [`invoke_dynamic0_checked`].
@@ -238,10 +248,13 @@ pub fn invoke_dynamic1_checked(
     type_name: &str,
     method_name: &str,
     a0: DynArg,
-) -> Result<MObject, ManagedException> {
-    let mut out = MObject::null();
-    try_managed(|| out = unsafe { invoke_dynamic1(assembly, type_name, method_name, a0) })?;
-    Ok(out)
+) -> Result<ManagedRef<MObject>, ManagedException> {
+    let a0 = root_arg(a0);
+    try_managed(|| {
+        ManagedRef::from_raw(unsafe {
+            invoke_dynamic1(assembly, type_name, method_name, copy_arg(&a0))
+        })
+    })
 }
 
 /// Safe wrapper over [`invoke_dynamic2`]. See [`invoke_dynamic0_checked`].
@@ -252,10 +265,20 @@ pub fn invoke_dynamic2_checked(
     method_name: &str,
     a0: DynArg,
     a1: DynArg,
-) -> Result<MObject, ManagedException> {
-    let mut out = MObject::null();
-    try_managed(|| out = unsafe { invoke_dynamic2(assembly, type_name, method_name, a0, a1) })?;
-    Ok(out)
+) -> Result<ManagedRef<MObject>, ManagedException> {
+    let a0 = root_arg(a0);
+    let a1 = root_arg(a1);
+    try_managed(|| {
+        ManagedRef::from_raw(unsafe {
+            invoke_dynamic2(
+                assembly,
+                type_name,
+                method_name,
+                copy_arg(&a0),
+                copy_arg(&a1),
+            )
+        })
+    })
 }
 
 /// Safe wrapper over [`invoke_dynamic3`]. See [`invoke_dynamic0_checked`].
@@ -267,10 +290,22 @@ pub fn invoke_dynamic3_checked(
     a0: DynArg,
     a1: DynArg,
     a2: DynArg,
-) -> Result<MObject, ManagedException> {
-    let mut out = MObject::null();
-    try_managed(|| out = unsafe { invoke_dynamic3(assembly, type_name, method_name, a0, a1, a2) })?;
-    Ok(out)
+) -> Result<ManagedRef<MObject>, ManagedException> {
+    let a0 = root_arg(a0);
+    let a1 = root_arg(a1);
+    let a2 = root_arg(a2);
+    try_managed(|| {
+        ManagedRef::from_raw(unsafe {
+            invoke_dynamic3(
+                assembly,
+                type_name,
+                method_name,
+                copy_arg(&a0),
+                copy_arg(&a1),
+                copy_arg(&a2),
+            )
+        })
+    })
 }
 
 /// Safe wrapper over [`invoke_dynamic4`]. See [`invoke_dynamic0_checked`].
@@ -283,10 +318,22 @@ pub fn invoke_dynamic4_checked(
     a1: DynArg,
     a2: DynArg,
     a3: DynArg,
-) -> Result<MObject, ManagedException> {
-    let mut out = MObject::null();
+) -> Result<ManagedRef<MObject>, ManagedException> {
+    let a0 = root_arg(a0);
+    let a1 = root_arg(a1);
+    let a2 = root_arg(a2);
+    let a3 = root_arg(a3);
     try_managed(|| {
-        out = unsafe { invoke_dynamic4(assembly, type_name, method_name, a0, a1, a2, a3) }
-    })?;
-    Ok(out)
+        ManagedRef::from_raw(unsafe {
+            invoke_dynamic4(
+                assembly,
+                type_name,
+                method_name,
+                copy_arg(&a0),
+                copy_arg(&a1),
+                copy_arg(&a2),
+                copy_arg(&a3),
+            )
+        })
+    })
 }

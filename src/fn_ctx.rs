@@ -1,10 +1,11 @@
 use cilly::{Assembly, CILNode, Const, Interned, IntoAsmIndex, Type};
-use rustc_middle::ty::SymbolName;
+use rustc_abi::HasDataLayout;
 use rustc_middle::ty::layout::HasTypingEnv;
 use rustc_middle::ty::{Instance, PseudoCanonicalInput, TyCtxt};
 use rustc_span::Span;
 pub struct MethodCompileCtx<'tcx, 'asm> {
     tcx: TyCtxt<'tcx>,
+    target_layout: crate::target_layout::TargetLayout,
     method: Option<&'tcx rustc_middle::mir::Body<'tcx>>,
     method_instance: Instance<'tcx>,
     asm: &'asm mut Assembly,
@@ -46,6 +47,7 @@ impl<'tcx, 'asm> MethodCompileCtx<'tcx, 'asm> {
         );
         Self {
             tcx: self.tcx,
+            target_layout: self.target_layout,
             method: Some(body),
             method_instance: self.method_instance,
             asm: self.asm,
@@ -60,8 +62,11 @@ impl<'tcx, 'asm> MethodCompileCtx<'tcx, 'asm> {
         method_instance: Instance<'tcx>,
         asm: &'asm mut Assembly,
     ) -> Self {
+        let target_layout = crate::target_layout::TargetLayout::from_data_layout(tcx.data_layout())
+            .expect("codegen_crate must validate the target layout before lowering methods");
         Self {
             tcx,
+            target_layout,
             method,
             method_instance,
             asm,
@@ -108,10 +113,21 @@ impl<'tcx, 'asm> MethodCompileCtx<'tcx, 'asm> {
     pub fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
+    /// Rust target facts. These deliberately do not come from the host running the backend.
+    #[must_use]
+    pub const fn target_layout(&self) -> crate::target_layout::TargetLayout {
+        self.target_layout
+    }
     /// Returns the MIR body of this method is compiled.
     #[must_use]
     pub fn body(&self) -> &'tcx rustc_middle::mir::Body<'tcx> {
         self.method.unwrap()
+    }
+    /// Returns the MIR body when this context lowers a real function. Synthetic static
+    /// initializers and reification helpers intentionally have no body.
+    #[must_use]
+    pub const fn body_opt(&self) -> Option<&'tcx rustc_middle::mir::Body<'tcx>> {
+        self.method
     }
     #[must_use]
     /// Returns the Instance representing the current method
@@ -197,24 +213,58 @@ impl<'tcx> HasTypingEnv<'tcx> for MethodCompileCtx<'tcx, '_> {
         rustc_middle::ty::TypingEnv::fully_monomorphized()
     }
 }
-/// Escapes the name of a function
-pub fn fn_name(name: SymbolName) -> String {
-    let name: String = name.to_string();
-    if name.len() > 1000 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        // TODO: make hashes consitant! `DefaultHasher::new()` uses fixed keys, so the hash
-        // is deterministic within one rustc/std version, but that's not guaranteed across
-        // toolchain versions — a symbol name truncated+hashed by one compiler could collide
-        // or mismatch one hashed by another, breaking the linker's cross-crate name matching
-        // (see `stable_adt_name`'s "pure function of identity" requirement).
-        fn calculate_hash<T: Hash>(t: &T) -> u64 {
-            let mut s = DefaultHasher::new();
-            t.hash(&mut s);
-            s.finish()
-        }
-        format!("{}_{}", &name[..1000], calculate_hash(&name))
-    } else {
-        name
+/// Returns one program-wide name for a Rust instance, independent of which crate instantiated it.
+///
+/// `TyCtxt::symbol_name` deliberately appends the *instantiating* crate to generic and
+/// `GloballyShared { may_conflict: true }` copies. That is necessary for native object files, where
+/// separate crates may emit private copies without comparing them. This backend links typed IR
+/// shards and compares competing definitions structurally, so carrying that incidental suffix into
+/// method references makes identical upstream instances look different transitively (for example,
+/// through a function pointer embedded in a promoted allocation). Ask rustc's mangler for the same
+/// complete `Instance` as if it were instantiated in its defining crate. Definition identity,
+/// substitutions, shim kind, and explicit `no_mangle`/export names are all still encoded; only the
+/// codegen-owner suffix is canonicalized. Any genuinely different duplicate body remains a hard
+/// linker conflict.
+pub fn fn_name_for_instance<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> String {
+    shorten_symbol(rustc_symbol_mangling::symbol_name_for_instance_in_crate(
+        tcx,
+        instance,
+        instance.def_id().krate,
+    ))
+}
+
+fn shorten_symbol(name: String) -> String {
+    const PREFIX_BYTES: usize = 1000;
+    if name.len() <= PREFIX_BYTES {
+        return name;
+    }
+    let mut prefix_end = PREFIX_BYTES;
+    while !name.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let digest = crate::stable_identity::digest_fields("long-rust-symbol", [name.as_bytes()]);
+    format!("{}_{digest}", &name[..prefix_end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shorten_symbol;
+
+    #[test]
+    fn long_symbol_identity_is_repeatable_and_uses_the_full_symbol() {
+        let common = "a".repeat(1001);
+        let first = shorten_symbol(format!("{common}x"));
+        let repeated = shorten_symbol(format!("{common}x"));
+        let different_tail = shorten_symbol(format!("{common}y"));
+        assert_eq!(first, repeated);
+        assert_ne!(first, different_tail);
+        assert!(first.len() <= 1000 + 1 + 64);
+    }
+
+    #[test]
+    fn truncation_respects_utf8_boundaries() {
+        let symbol = format!("{}é", "a".repeat(999));
+        let shortened = shorten_symbol(symbol);
+        assert!(shortened.is_char_boundary(shortened.len()));
     }
 }

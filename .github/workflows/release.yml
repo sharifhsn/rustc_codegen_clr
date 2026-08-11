@@ -72,8 +72,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            source_tree_sha256="$(git archive --format=tar HEAD | sha256sum | awk '{print $1}')"
+          else
+            source_tree_sha256="$(git archive --format=tar HEAD | shasum -a 256 | awk '{print $1}')"
+          fi
+          export CARGO_DOTNET_BUILD_ID="source-sha256:$source_tree_sha256"
           cargo build --release --workspace --frozen
           cargo +stable build --release --frozen --manifest-path tools/cargo-dotnet/Cargo.toml
+      - name: Test SDK filesystem capabilities on Windows
+        if: matrix.host == 'windows-x64'
+        run: cargo test -p rust-dotnet-sdk-core --frozen
       - name: Run host-native P/Invoke acceptances
         shell: bash
         run: |

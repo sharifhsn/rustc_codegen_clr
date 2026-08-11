@@ -56,7 +56,7 @@ jobs:
       - name: Run strict ::stable gate (isolated flaky retry)
         run: bash .github/scripts/gate.sh
   windows_build:
-    # Windows is a public 0.0.2 SDK host; exercise the compiler, driver, and runtime behavior on
+    # Windows is a 0.0.2 candidate host; exercise the compiler, driver, and runtime behavior on
     # every main-branch push.
     runs-on: windows-latest
     timeout-minutes: 90
@@ -80,6 +80,8 @@ jobs:
           cargo build --release --workspace --locked
       - name: Build and test cargo-dotnet on Windows
         run: cargo test --manifest-path tools/cargo-dotnet/Cargo.toml --locked
+      - name: Test SDK filesystem capabilities on Windows
+        run: cargo test -p rust-dotnet-sdk-core --locked
       - name: Probe Windows CLI on .NET 10
         shell: pwsh
         env:

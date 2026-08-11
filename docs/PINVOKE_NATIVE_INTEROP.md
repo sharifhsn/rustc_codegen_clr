@@ -80,9 +80,9 @@ User-declared imports enable last-error preservation by default so CoreCLR captu
 error slot before managed runtime work can overwrite it. The linker's internal runtime-shim map
 retains its existing per-symbol policy.
 
-Because the serialized shape changed, the assembly artifact ABI is version 6 (`CILLYAR6`). Version
-5 and older envelopes are rejected with a rebuild diagnostic instead of being guessed or decoded
-against the wrong schema.
+The current assembly artifact ABI is schema 11 (`CILLYAR11`). Older and prefixless envelopes are
+rejected with a rebuild diagnostic instead of being guessed or decoded against the wrong positional
+schema.
 
 ## Supported boundary
 

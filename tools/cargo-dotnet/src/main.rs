@@ -18,15 +18,19 @@ mod buildstd;
 mod bundle;
 mod capabilities;
 mod cli;
+mod content_cache;
 mod context;
 mod docker;
 mod doctor;
 mod host;
+mod install_transaction;
+mod installed_bootstrap;
 mod interop_helpers;
 mod metadata_inputs;
 mod mode;
 mod native_bindgen;
 mod nuget;
+mod nuget_cache;
 mod overlays;
 mod pack;
 mod palinject;
@@ -60,6 +64,17 @@ use clap::Parser;
 use cli::{Cmd, DotnetCli};
 
 fn main() -> ExitCode {
+    let _installed_home_lease = match installed_bootstrap::enter() {
+        Ok(installed_bootstrap::Entry::Continue(lease)) => lease,
+        Ok(installed_bootstrap::Entry::Exit(code)) => {
+            return ExitCode::from((code & 0xff) as u8);
+        }
+        Err(error) => {
+            eprintln!("cargo dotnet: installed driver bootstrap failed: {error:#}");
+            return ExitCode::from(1);
+        }
+    };
+
     // Cargo invokes RUSTC_WRAPPER as `<wrapper> <rustc> <args...>`. Re-exec rustc with
     // the private sysroot forced even for Cargo's discovery probes (`--print sysroot`),
     // not merely crate compilations that happen to inherit RUSTFLAGS.
@@ -79,6 +94,14 @@ fn main() -> ExitCode {
                 }
             };
         }
+    }
+
+    if let Ok(cache_home) = context::cargo_dotnet_cache_home()
+        && std::fs::create_dir_all(&cache_home).is_ok()
+    {
+        // Cache-schema cleanup is deliberately best-effort: active older processes retain their
+        // leased objects, while a malformed/symlinked legacy root must not block normal commands.
+        let _ = content_cache::prune_legacy_caches(&cache_home);
     }
 
     // DUAL INVOCATION (both forms exist in the tree — see cli.rs):

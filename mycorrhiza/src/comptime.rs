@@ -527,9 +527,10 @@ pub fn rustc_codegen_clr_add_generic_abstract_method_def<
 /// [`rustc_codegen_clr_add_abstract_method_def`]'s signature-only carrier, `target` here IS
 /// aliased and codegen'd (exactly like [`rustc_codegen_clr_add_method_def`]'s target): it is the
 /// lifted default body `#[dotnet_interface]` generates from a trait method's default block, and
-/// its first parameter is the interface's own handle (the implicit `this` receiver). Because the
-/// target has a real body, it needs a `#[used]` KEEP anchor to survive the mono-collector — the
-/// macro emits one.
+/// its first parameter is the interface's own handle (the implicit `this` receiver). The backend
+/// treats this declaration as an explicit reachability edge: it compiles the target's complete
+/// monomorphized dependency closure before installing the retained `AliasFor` member. A separate
+/// typed function-pointer anchor is neither needed nor sound for stack-only managed seam types.
 ///
 /// Substring-dispatch safety (see `src/comptime.rs`'s `contains()` chain):
 /// `add_default_method_def` neither contains nor is contained by `add_method_def`,

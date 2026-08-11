@@ -32,6 +32,7 @@
 //! This is a thin, honest mapping: every method delegates straight to the corresponding managed
 //! member, with no added behaviour.
 
+use crate::NativeStorageSafe;
 use crate::intrinsics::RustcCLRInteropManagedStruct;
 use crate::system::MString;
 
@@ -46,6 +47,8 @@ const TIMESPAN_SIZE: usize = core::mem::size_of::<i64>();
 
 /// The raw managed-value-type handle for `System.TimeSpan`.
 type Handle = RustcCLRInteropManagedStruct<{ CORELIB }, { TIMESPAN }, TIMESPAN_SIZE>;
+// SAFETY: `System.TimeSpan` is exactly one signed 64-bit tick count and contains no GC references.
+unsafe impl NativeStorageSafe for Handle {}
 
 /// A managed `System.TimeSpan` — a time interval, stored inline as a value type (`Copy`, no GC).
 ///

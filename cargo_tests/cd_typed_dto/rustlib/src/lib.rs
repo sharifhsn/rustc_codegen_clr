@@ -3,24 +3,35 @@
 
 use dotnet_macros::{dotnet_class, dotnet_dto, dotnet_methods, dotnet_record, dotnet_value};
 use mycorrhiza::bcl::dateonly::DateOnly;
-use mycorrhiza::bcl::decimal::Decimal;
 use mycorrhiza::bcl::datetime::DateTime;
 use mycorrhiza::bcl::datetimeoffset::DateTimeOffset;
+use mycorrhiza::bcl::decimal::Decimal;
 use mycorrhiza::bcl::guid::Guid;
+use mycorrhiza::bcl::json::Json;
+use mycorrhiza::bcl::uri::Uri;
 use mycorrhiza::cancellation::CancellationToken;
 use mycorrhiza::collections::{List, MutableDictionary, MutableList, ReadOnlyList};
+use mycorrhiza::dynamic::{box_arg, invoke_dynamic1, invoke_dynamic1_checked};
 use mycorrhiza::enumerate::ManagedEnumerable;
-use mycorrhiza::intrinsics::ManagedArray;
-use mycorrhiza::memory::{Memory, ReadOnlyMemory};
+use mycorrhiza::intrinsics::{
+    ManagedArray, RustcCLRInteropManagedClass, rustc_clr_interop_managed_is_null,
+};
 use mycorrhiza::managed_option::ManagedOption;
+use mycorrhiza::memory::{Memory, ReadOnlyMemory};
 use mycorrhiza::nullable::{self, Nullable};
 use mycorrhiza::progress::Progress;
 use mycorrhiza::system::MString;
 use mycorrhiza::task::{Task, ValueTask, await_unit, future_to_value_task_unit};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static CANCELLATION_CALLBACKS: AtomicI32 = AtomicI32::new(0);
+static CANCELLATION_REGISTRATION_READY: AtomicBool = AtomicBool::new(false);
+static CANCELLATION_CALLBACK_STARTED: AtomicBool = AtomicBool::new(false);
+static CANCELLATION_CALLBACK_RELEASE: AtomicBool = AtomicBool::new(false);
 static DISPOSED_RESOURCES: AtomicI32 = AtomicI32::new(0);
+
+type Convert = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.Convert">;
+type GC = RustcCLRInteropManagedClass<"System.Private.CoreLib", "System.GC">;
 
 struct NativeResourceState;
 
@@ -55,6 +66,16 @@ pub struct RiskScenario {
 pub struct RatePoint {
     tenor_days: i32,
     rate: f64,
+}
+
+/// Reopen the value type through a separate comptime entrypoint. The methods shard initially has
+/// only the non-authoritative reference-type placeholder, while `#[dotnet_value]` above owns the
+/// authoritative CLR value-kind declaration.
+#[dotnet_methods]
+impl RatePoint {
+    pub fn reopened_value_type_marker() -> i32 {
+        73
+    }
 }
 
 /// A managed `IDisposable` whose opaque token owns real Rust heap state. The generated lifecycle
@@ -112,6 +133,80 @@ pub struct InvoiceFacade {}
 
 #[dotnet_methods]
 impl InvoiceFacade {
+    /// Exercise a shared receiver on a transparent one-field managed-handle wrapper. This is a
+    /// direct CLR local/byref operation, not Rust-owned aggregate storage.
+    pub fn uri_is_absolute() -> bool {
+        Uri::new("https://example.com/rust-dotnet").is_absolute()
+    }
+
+    /// Exercise rooted JSON try/catch state, then force collection before reading the DOM.
+    pub fn json_try_managed_success() -> bool {
+        let Some(doc) = Json::parse(r#"{"value":73,"label":"rooted"}"#) else {
+            return false;
+        };
+        GC::static1::<"Collect", i32, ()>(2);
+        GC::static0::<"WaitForPendingFinalizers", ()>();
+        GC::static1::<"Collect", i32, ()>(2);
+        doc.get("value").and_then(|value| value.as_i64()) == Some(73)
+            && doc.get("label").and_then(|value| value.as_str()).as_deref() == Some("rooted")
+    }
+
+    pub fn json_try_managed_error() -> bool {
+        Json::parse("{ malformed").is_none()
+    }
+
+    /// The unchecked reflection path proves helper resolution and overload selection independently
+    /// of the checked `try_managed`/`ManagedRef` bridge exercised below.
+    pub fn dynamic_raw_success() -> i32 {
+        let result = unsafe {
+            invoke_dynamic1(
+                "System.Private.CoreLib",
+                "System.Math",
+                "Abs",
+                box_arg(-73i32),
+            )
+        };
+        Convert::static1::<"ToInt32", _, i32>(result)
+    }
+
+    /// A checked reflection result stays rooted until it is consumed as an immediate managed-call
+    /// argument, while a resolution failure remains an ordinary Rust `Err` with no naked handle.
+    pub fn dynamic_try_managed_success() -> i32 {
+        let Ok(result) = invoke_dynamic1_checked(
+            "System.Private.CoreLib",
+            "System.Math",
+            "Abs",
+            box_arg(-73i32),
+        ) else {
+            return -1;
+        };
+        Convert::static1::<"ToInt32", _, i32>(result.into_raw())
+    }
+
+    pub fn dynamic_try_managed_error() -> bool {
+        invoke_dynamic1_checked(
+            "System.Private.CoreLib",
+            "System.Math",
+            "MissingRootedMethod",
+            box_arg(1i32),
+        )
+        .is_err()
+    }
+
+    /// Force a collection from inside the reflected call while its boxed argument is held through
+    /// the checked wrapper's ManagedRef token. `MethodInfo.Invoke` returns managed null for void.
+    pub fn dynamic_try_managed_force_gc() -> bool {
+        let Ok(result) = invoke_dynamic1_checked(
+            "System.Private.CoreLib",
+            "System.GC",
+            "Collect",
+            box_arg(2i32),
+        ) else {
+            return false;
+        };
+        rustc_clr_interop_managed_is_null(result.into_raw())
+    }
+
     /// Sum a genuine managed array of generated CLR value types without copying it into Rust heap
     /// storage or routing through JSON.
     pub fn sum_rate_points(points: ManagedArray<RatePointHandle>) -> f64 {
@@ -123,7 +218,9 @@ impl InvoiceFacade {
     }
 
     /// Return the same managed value-type array, preserving its CLR identity and allocation.
-    pub fn echo_rate_points(points: ManagedArray<RatePointHandle>) -> ManagedArray<RatePointHandle> {
+    pub fn echo_rate_points(
+        points: ManagedArray<RatePointHandle>,
+    ) -> ManagedArray<RatePointHandle> {
         points
     }
 
@@ -238,6 +335,68 @@ impl InvoiceFacade {
         let registration = token.register(|| {
             CANCELLATION_CALLBACKS.fetch_add(1, Ordering::SeqCst);
         });
+        registration.dispose();
+        CANCELLATION_CALLBACKS.load(Ordering::SeqCst)
+    }
+
+    /// A fresh registration can be removed without waiting; cancellation afterwards must not call
+    /// the released Rust closure.
+    pub fn unregister_callback(token: CancellationToken) -> bool {
+        CANCELLATION_CALLBACKS.store(0, Ordering::SeqCst);
+        let registration = token.register(|| {
+            CANCELLATION_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        });
+        registration.is_active() && registration.try_unregister().is_ok()
+    }
+
+    /// Exercise `Drop`'s synchronous unregistration path separately from explicit `dispose`.
+    pub fn drop_callback_registration(token: CancellationToken) -> bool {
+        CANCELLATION_CALLBACKS.store(0, Ordering::SeqCst);
+        let registration = token.register(|| {
+            CANCELLATION_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        });
+        let was_active = registration.is_active();
+        drop(registration);
+        was_active
+    }
+
+    pub fn cancellation_callback_count() -> i32 {
+        CANCELLATION_CALLBACKS.load(Ordering::SeqCst)
+    }
+
+    pub fn cancellation_registration_ready() -> bool {
+        CANCELLATION_REGISTRATION_READY.load(Ordering::SeqCst)
+    }
+
+    /// Coordinate with a C# cancellation thread so `Unregister` runs while the callback is active.
+    /// It must return `false` immediately; `dispose` then waits until the callback is released.
+    pub fn exercise_running_cancellation_callback(token: CancellationToken) -> i32 {
+        CANCELLATION_CALLBACKS.store(0, Ordering::SeqCst);
+        CANCELLATION_CALLBACK_STARTED.store(false, Ordering::SeqCst);
+        CANCELLATION_CALLBACK_RELEASE.store(false, Ordering::SeqCst);
+        CANCELLATION_REGISTRATION_READY.store(false, Ordering::SeqCst);
+        let registration = token.register(|| {
+            CANCELLATION_CALLBACK_STARTED.store(true, Ordering::SeqCst);
+            while !CANCELLATION_CALLBACK_RELEASE.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            CANCELLATION_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        });
+        if !registration.is_active() {
+            return -2;
+        }
+        CANCELLATION_REGISTRATION_READY.store(true, Ordering::SeqCst);
+        while !CANCELLATION_CALLBACK_STARTED.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        let registration = match registration.try_unregister() {
+            Ok(()) => {
+                CANCELLATION_CALLBACK_RELEASE.store(true, Ordering::SeqCst);
+                return -1;
+            }
+            Err(registration) => registration,
+        };
+        CANCELLATION_CALLBACK_RELEASE.store(true, Ordering::SeqCst);
         registration.dispose();
         CANCELLATION_CALLBACKS.load(Ordering::SeqCst)
     }

@@ -756,9 +756,12 @@ name = "rust-dotnet-assets"
 version = "0.0.2"
 dependencies = [
  "anyhow",
+ "fs2",
+ "rust-dotnet-sdk-core",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -791,7 +794,10 @@ name = "rust-dotnet-sdk-core"
 version = "0.0.2"
 dependencies = [
  "anyhow",
+ "rustix",
  "serde",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -818,6 +824,7 @@ dependencies = [
  "postcard",
  "rustc-demangle",
  "serde",
+ "sha2",
 ]
 
 [[package]]

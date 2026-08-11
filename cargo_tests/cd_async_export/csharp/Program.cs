@@ -5,6 +5,7 @@ using Mycorrhiza.Interop.Helpers;
 Task<int> scoreTask = MainModule.ComputeScoreAsync(21);
 int score = await scoreTask;
 await MainModule.WarmUpAsync();
+string managedGreeting = MainModule.ManagedGreeting();
 var reported = 0;
 var progress = new ImmediateProgress<int>(value => reported = value);
 using var cancellation = new CancellationTokenSource();
@@ -174,7 +175,8 @@ finally
 }
 
 Console.WriteLine($"async export score={score}, task={scoreTask.GetType().FullName}");
-if (score != 42 || uncanceledScore != 18 || canceled || asyncCanceled || reported != 100 || retainedSum != 11
+if (score != 42 || managedGreeting != "rooted managed return"
+    || uncanceledScore != 18 || canceled || asyncCanceled || reported != 100 || retainedSum != 11
     || filledLength != 2 || !mutableValues.SequenceEqual(new[] { 10, 99, 99, 40 })
     || collectionCount != 3 || asyncList[^1] != 8 || asyncDictionary[8] != 3
     || sequenceSum != 18 || !hasText || hasNullText

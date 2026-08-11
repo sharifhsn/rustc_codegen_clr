@@ -23,6 +23,7 @@
 
 use crate::System::String as NetString;
 use crate::System::Text::RegularExpressions as bcl;
+use crate::managed_option::ManagedRef;
 use crate::system::{DotNetString, MString};
 
 /// Marshal a Rust `&str` into the managed `System.String` handle the bindings expect.
@@ -45,8 +46,9 @@ fn rust(s: MString) -> std::string::String {
 /// A move-only handle to a managed `Regex`; the .NET GC owns the object (no `Drop`). Construct with
 /// [`Regex::new`], then query with [`is_match`](Regex::is_match) / [`find`](Regex::find) /
 /// [`find_all`](Regex::find_all) / [`replace_all`](Regex::replace_all).
+#[repr(transparent)]
 pub struct Regex {
-    h: bcl::Regex,
+    h: ManagedRef<bcl::Regex>,
 }
 
 impl Regex {
@@ -54,7 +56,7 @@ impl Regex {
     /// `RegexParseException` on the .NET side at construction time.
     pub fn new(pattern: &str) -> Self {
         Self {
-            h: bcl::Regex::new(net(pattern)),
+            h: ManagedRef::from_raw(bcl::Regex::new(net(pattern))),
         }
     }
 
@@ -65,20 +67,23 @@ impl Regex {
     pub fn is_match(&self, input: &str) -> bool {
         // The generated bindings only expose the *static* `IsMatch(input, pattern)`. Feed it this
         // instance's own pattern text so the result matches the compiled `Regex`.
-        bcl::Regex::is_match(net(input), self.h.to_string())
+        bcl::Regex::is_match(net(input), self.h.copy_raw().to_string())
     }
 
     /// The first match in `input`, or `None` if there is none (`Regex.Match`).
     pub fn find(&self, input: &str) -> Option<Match> {
-        let m = bcl::Regex::r#match(net(input), self.h.to_string());
-        let m = Match { h: m };
+        let m = bcl::Regex::r#match(net(input), self.h.copy_raw().to_string());
+        let m = Match::from_raw(m);
         if m.success() { Some(m) } else { None }
     }
 
     /// All matches in `input`, in order (`Regex.Matches`). Iterate with [`Matches::iter`] / indexing.
     pub fn find_all(&self, input: &str) -> Matches {
         Matches {
-            h: bcl::Regex::matches(net(input), self.h.to_string()),
+            h: ManagedRef::from_raw(bcl::Regex::matches(
+                net(input),
+                self.h.copy_raw().to_string(),
+            )),
         }
     }
 
@@ -86,37 +91,37 @@ impl Regex {
     /// (`Regex.Replace` — .NET replaces all occurrences by default). `replacement` may use the .NET
     /// substitution syntax (`$1`, `$&`, `${name}`, …).
     pub fn replace_all(&self, input: &str, replacement: &str) -> std::string::String {
-        rust(self.h.replace(net(input), net(replacement)))
+        rust(self.h.copy_raw().replace(net(input), net(replacement)))
     }
 
     /// The number of matches in `input` (`Regex.Count`).
     pub fn count(&self, input: &str) -> i32 {
-        self.h.count(net(input))
+        self.h.copy_raw().count(net(input))
     }
 
     /// Whether this regex matches right-to-left (`Regex.RightToLeft`).
     pub fn right_to_left(&self) -> bool {
-        self.h.get_right_to_left()
+        self.h.copy_raw().get_right_to_left()
     }
 
     /// The group number for a named group, or `-1` if absent (`Regex.GroupNumberFromName`).
     pub fn group_number_from_name(&self, name: &str) -> i32 {
-        self.h.group_number_from_name(net(name))
+        self.h.copy_raw().group_number_from_name(net(name))
     }
 
     /// The group name for a group number (`Regex.GroupNameFromNumber`).
     pub fn group_name_from_number(&self, number: i32) -> std::string::String {
-        rust(self.h.group_name_from_number(number))
+        rust(self.h.copy_raw().group_name_from_number(number))
     }
 
     /// The pattern text this regex was constructed from (`Regex.ToString`).
     pub fn pattern(&self) -> std::string::String {
-        rust(self.h.to_string())
+        rust(self.h.copy_raw().to_string())
     }
 
     /// The raw managed [`Regex`](bcl::Regex) handle, for lower-level BCL calls.
     pub fn handle(&self) -> bcl::Regex {
-        self.h
+        self.h.copy_raw()
     }
 
     // --- statics (no instance needed) ---------------------------------------------------------
@@ -148,16 +153,24 @@ impl core::fmt::Display for Regex {
 ///
 /// A `Match` is-a `Group` is-a `Capture` in .NET, so it carries the capture's `value`/`index`/
 /// `length` directly (via the binding's upcast) plus match-specific members (`groups`, `next_match`).
+#[repr(transparent)]
 pub struct Match {
-    h: bcl::Match,
+    h: ManagedRef<bcl::Match>,
 }
 
 impl Match {
+    #[inline(always)]
+    fn from_raw(h: bcl::Match) -> Self {
+        Self {
+            h: ManagedRef::from_raw(h),
+        }
+    }
+
     /// Whether this match succeeded (`Match.Success`). A `Match` obtained from [`Regex::find`] is
     /// always successful; this is meaningful for the tail of a [`next_match`](Match::next_match) chain.
     pub fn success(&self) -> bool {
         // `Success` is defined on the `Group` base; upcast the `Match` handle to reach it.
-        bcl::Group::from(self.h).get_success()
+        bcl::Group::from(self.h.copy_raw()).get_success()
     }
 
     /// The matched substring (`Capture.Value`).
@@ -178,27 +191,25 @@ impl Match {
     /// The captured groups of this match (`Match.Groups`); index `0` is the whole match.
     pub fn groups(&self) -> Groups {
         Groups {
-            h: self.h.get_groups(),
+            h: ManagedRef::from_raw(self.h.copy_raw().get_groups()),
         }
     }
 
     /// The next match after this one in the same input (`Match.NextMatch`), or `None` at the end.
     pub fn next_match(&self) -> Option<Match> {
-        let m = Match {
-            h: self.h.next_match(),
-        };
+        let m = Match::from_raw(self.h.copy_raw().next_match());
         if m.success() { Some(m) } else { None }
     }
 
     /// The raw managed [`Match`](bcl::Match) handle, for lower-level BCL calls.
     pub fn handle(&self) -> bcl::Match {
-        self.h
+        self.h.copy_raw()
     }
 
     /// Upcast the `Match` handle to its `Capture` base to read `Value`/`Index`/`Length`.
     #[inline(always)]
     fn as_capture(&self) -> bcl::Capture {
-        bcl::Capture::from(bcl::Group::from(self.h))
+        bcl::Capture::from(bcl::Group::from(self.h.copy_raw()))
     }
 }
 
@@ -210,14 +221,15 @@ impl core::fmt::Display for Match {
 }
 
 /// The collection of matches returned by [`Regex::find_all`] (`MatchCollection`).
+#[repr(transparent)]
 pub struct Matches {
-    h: bcl::MatchCollection,
+    h: ManagedRef<bcl::MatchCollection>,
 }
 
 impl Matches {
     /// Number of matches (`MatchCollection.Count`).
     pub fn len(&self) -> i32 {
-        self.h.get_count()
+        self.h.copy_raw().get_count()
     }
 
     /// `true` if there were no matches.
@@ -228,9 +240,7 @@ impl Matches {
     /// The match at `idx`, or `None` if out of range (`MatchCollection[idx]`, bounds-checked).
     pub fn get(&self, idx: i32) -> Option<Match> {
         if idx >= 0 && idx < self.len() {
-            Some(Match {
-                h: self.h.get_item(idx),
-            })
+            Some(Match::from_raw(self.h.copy_raw().get_item(idx)))
         } else {
             None
         }
@@ -247,7 +257,7 @@ impl Matches {
 
     /// The raw managed [`MatchCollection`](bcl::MatchCollection) handle.
     pub fn handle(&self) -> bcl::MatchCollection {
-        self.h
+        self.h.copy_raw()
     }
 }
 
@@ -276,14 +286,15 @@ impl<'a> Iterator for MatchesIter<'a> {
 }
 
 /// The captured groups of a [`Match`] (`GroupCollection`); index `0` is the whole match.
+#[repr(transparent)]
 pub struct Groups {
-    h: bcl::GroupCollection,
+    h: ManagedRef<bcl::GroupCollection>,
 }
 
 impl Groups {
     /// Number of groups, including group `0` (`GroupCollection.Count`).
     pub fn len(&self) -> i32 {
-        self.h.get_count()
+        self.h.copy_raw().get_count()
     }
 
     /// `true` if there are no groups (never true for a successful match — group `0` always exists).
@@ -294,9 +305,7 @@ impl Groups {
     /// The group at `idx`, or `None` if out of range (`GroupCollection[idx]`, bounds-checked).
     pub fn get(&self, idx: i32) -> Option<Group> {
         if idx >= 0 && idx < self.len() {
-            Some(Group {
-                h: self.h.get_item(idx),
-            })
+            Some(Group::from_raw(self.h.copy_raw().get_item(idx)))
         } else {
             None
         }
@@ -304,51 +313,59 @@ impl Groups {
 
     /// Whether a group named `name` exists in the pattern (`GroupCollection.ContainsKey`).
     pub fn contains_name(&self, name: &str) -> bool {
-        self.h.contains_key(net(name))
+        self.h.copy_raw().contains_key(net(name))
     }
 
     /// The raw managed [`GroupCollection`](bcl::GroupCollection) handle.
     pub fn handle(&self) -> bcl::GroupCollection {
-        self.h
+        self.h.copy_raw()
     }
 }
 
 /// A single captured group (`System.Text.RegularExpressions.Group`).
 ///
 /// A `Group` is-a `Capture`, so it carries `value`/`index`/`length` plus the group's `success`/`name`.
+#[repr(transparent)]
 pub struct Group {
-    h: bcl::Group,
+    h: ManagedRef<bcl::Group>,
 }
 
 impl Group {
+    #[inline(always)]
+    fn from_raw(h: bcl::Group) -> Self {
+        Self {
+            h: ManagedRef::from_raw(h),
+        }
+    }
+
     /// Whether this group participated in the match (`Group.Success`).
     pub fn success(&self) -> bool {
-        self.h.get_success()
+        self.h.copy_raw().get_success()
     }
 
     /// The group's name (`Group.Name`) — the number as text for unnamed groups.
     pub fn name(&self) -> std::string::String {
-        rust(self.h.get_name())
+        rust(self.h.copy_raw().get_name())
     }
 
     /// The captured substring (`Capture.Value`); empty when the group did not participate.
     pub fn value(&self) -> std::string::String {
-        rust(bcl::Capture::from(self.h).get_value())
+        rust(bcl::Capture::from(self.h.copy_raw()).get_value())
     }
 
     /// The zero-based position of the capture (`Capture.Index`).
     pub fn index(&self) -> i32 {
-        bcl::Capture::from(self.h).get_index()
+        bcl::Capture::from(self.h.copy_raw()).get_index()
     }
 
     /// The length of the capture, in UTF-16 code units (`Capture.Length`).
     pub fn length(&self) -> i32 {
-        bcl::Capture::from(self.h).get_length()
+        bcl::Capture::from(self.h.copy_raw()).get_length()
     }
 
     /// The raw managed [`Group`](bcl::Group) handle, for lower-level BCL calls.
     pub fn handle(&self) -> bcl::Group {
-        self.h
+        self.h.copy_raw()
     }
 }
 

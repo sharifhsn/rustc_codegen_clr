@@ -495,6 +495,9 @@ fn main() {
     cilly::builtins::unwind::get_cfa(&mut final_assembly, &mut overrides);
     cilly::builtins::unwind::get_ip(&mut final_assembly, &mut overrides);
     cilly::builtins::unwind::backtrace_end_of_stack(&mut final_assembly, &mut overrides);
+    // `std_detect` may retain LLVM's native XCR0 reader in debug builds. Managed code cannot
+    // execute `xgetbv`; report no extended state so feature detection remains conservative.
+    cilly::builtins::x86::xgetbv_unavailable(&mut final_assembly, &mut overrides);
 
     overrides.insert(
         final_assembly.alloc_string("_Unwind_DeleteException"),

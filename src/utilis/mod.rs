@@ -1,9 +1,11 @@
 use crate::r#type::escape_field_name;
-use rustc_abi::VariantIdx;
+use rustc_abi::{ExternAbi, VariantIdx};
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{
     ConstKind, GenericArg, Instance, List, PseudoCanonicalInput, Ty, TyCtxt, TyKind,
 };
+use rustc_span::Symbol;
 
 pub mod adt;
 /// The common prefix of `rustc_clr_interop_managed_ctor{0,1,2,3}_` — still needed (unlike every other
@@ -22,6 +24,25 @@ pub const MANAGED_CALL_VIRT_FN_NAME: &str = "rustc_clr_interop_managed_call_virt
 /// it identifies the `mycorrhiza::intrinsics` magic functions. An explicit generated marker avoids
 /// interpreting an unrelated user function merely because its symbol contains a magic substring.
 pub const COMPTIME_ENTRYPOINT_MARKER: &str = "__rustc_codegen_clr_comptime_entrypoint_v1";
+/// Exact marker emitted on a schema-derived DTO constructor bridge.
+///
+/// These helpers are generated in the consuming crate because their arity follows the DTO schema,
+/// so they cannot use mycorrhiza crate provenance. [`is_generated_ctor`] additionally requires an
+/// unsafe Rust function whose exact identifier encodes a decimal arity; a safe or merely same-named
+/// local function remains ordinary Rust code.
+pub const GENERATED_CTOR_MARKER: &str = "__rustc_codegen_clr_generated_ctor_v1";
+/// Diagnostic-item identities carried by the two managed-box declarations injected into pinned
+/// `std` thread lifecycle code. Rustc does not preserve private doc attributes in downstream crate
+/// metadata, while diagnostic items are explicitly encoded for exact cross-crate lookup.
+pub const STD_THREAD_BOX_NEW_DIAGNOSTIC_ITEM: &str = "rustc_codegen_clr_std_thread_managed_box_new";
+pub const STD_THREAD_BOX_TAKE_DIAGNOSTIC_ITEM: &str =
+    "rustc_codegen_clr_std_thread_managed_box_take";
+/// Exact marker emitted on a `#[dotnet_export]` generated managed-ABI seam.
+///
+/// A marker alone is not authority: [`is_managed_export`] additionally requires an unsafe
+/// `extern "C-unwind"` function. That explicit unsafe boundary prevents an ordinary safe native
+/// export from opting into CLR-reference ABI merely by copying this inert documentation string.
+pub const MANAGED_EXPORT_MARKER: &str = "__rustc_codegen_clr_managed_export_v1";
 /// Exact private marker carried by every backend-recognized mycorrhiza declaration.
 pub const MYCORRHIZA_INTRINSIC_MARKER: &str = "__rustc_codegen_clr_intrinsic_v1";
 
@@ -39,7 +60,7 @@ pub fn is_mycorrhiza_intrinsic(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     let _item = segments.next();
     if !matches!(
         segments.next(),
-        Some("intrinsics" | "memory" | "cancellation" | "managed_option" | "error")
+        Some("intrinsics" | "memory" | "cancellation" | "managed_option" | "error" | "enums")
     ) {
         return false;
     }
@@ -63,6 +84,76 @@ pub fn is_comptime_entrypoint(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
         .iter()
         .filter_map(|attr| attr.doc_str())
         .any(|doc| doc.as_str() == COMPTIME_ENTRYPOINT_MARKER)
+}
+
+/// Whether this exact definition is a generated, unsafe managed-constructor bridge.
+pub fn is_generated_ctor(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if tcx.def_kind(def_id) != DefKind::Fn {
+        return false;
+    }
+    let signature = tcx.fn_sig(def_id).skip_binder();
+    if !signature.safety().is_unsafe() || signature.abi() != ExternAbi::Rust {
+        return false;
+    }
+    let path = tcx.def_path_str(def_id);
+    let name = path.rsplit("::").next().unwrap_or(path.as_str());
+    if !name
+        .strip_prefix(CTOR_FN_NAME)
+        .and_then(|suffix| suffix.strip_suffix('_'))
+        .is_some_and(|arity| !arity.is_empty() && arity.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    #[allow(deprecated)]
+    tcx.get_all_attrs(def_id)
+        .iter()
+        .filter_map(|attr| attr.doc_str())
+        .any(|doc| doc.as_str() == GENERATED_CTOR_MARKER)
+}
+
+/// Whether this is one of the exact unsafe managed-box declarations injected into pinned `std`.
+pub fn is_std_thread_intrinsic(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    let path = tcx.def_path_str(def_id);
+    let diagnostic_item = match path.as_str() {
+        "thread::lifecycle::rustc_clr_interop_managed_box_new"
+        | "std::thread::lifecycle::rustc_clr_interop_managed_box_new" => {
+            STD_THREAD_BOX_NEW_DIAGNOSTIC_ITEM
+        }
+        "thread::lifecycle::rustc_clr_interop_managed_box_take"
+        | "std::thread::lifecycle::rustc_clr_interop_managed_box_take" => {
+            STD_THREAD_BOX_TAKE_DIAGNOSTIC_ITEM
+        }
+        _ => return false,
+    };
+    if tcx.crate_name(def_id.krate).as_str() != "std"
+        || tcx.def_kind(def_id) != DefKind::Fn
+        || !tcx.fn_sig(def_id).skip_binder().safety().is_unsafe()
+    {
+        return false;
+    }
+    tcx.get_diagnostic_item(Symbol::intern(diagnostic_item)) == Some(def_id)
+}
+
+/// Whether this exact definition is an unsafe CLR-managed export generated by `dotnet_macros`.
+///
+/// Rust still describes the shim with `extern "C-unwind"` so managed exceptions can leave it, but
+/// its arguments and result are CLR values rather than a native C ABI. Managed-storage validation
+/// may therefore permit direct managed values at this one marked definition boundary while keeping
+/// unmarked `extern "C"`/`extern "C-unwind"` exports fail-closed.
+pub fn is_managed_export(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    if tcx.def_kind(def_id) != DefKind::Fn {
+        return false;
+    }
+    let signature = tcx.fn_sig(def_id).skip_binder();
+    if !signature.safety().is_unsafe() || !matches!(signature.abi(), ExternAbi::C { unwind: true })
+    {
+        return false;
+    }
+    #[allow(deprecated)]
+    tcx.get_all_attrs(def_id)
+        .iter()
+        .filter_map(|attr| attr.doc_str())
+        .any(|doc| doc.as_str() == MANAGED_EXPORT_MARKER)
 }
 
 /// The canonical, exhaustive classification of every "magic" interop fn the backend recognizes and
@@ -102,8 +193,14 @@ pub enum MagicFn {
     Box,
     /// `rustc_clr_interop_managed_box_new` → CLR-box + GCHandle root, returned as an opaque token.
     ManagedBoxNew,
+    /// `rustc_clr_interop_managed_box_get` → copy a rooted value without freeing its GCHandle.
+    ManagedBoxGet,
     /// `rustc_clr_interop_managed_box_take` → recover/unbox the rooted value and free its GCHandle.
     ManagedBoxTake,
+    /// `rustc_clr_interop_managed_box_free` → release a GCHandle without materializing its target.
+    ManagedBoxFree,
+    /// `rustc_clr_interop_managed_default` → initialize the managed destination with CLR default.
+    ManagedDefault,
     /// `rustc_clr_interop_try_catch` → a CIL try/catch region catching any .NET exception.
     TryCatch,
     /// `rustc_clr_interop_generic_call{0..=4}` (WF-9) — a method on a generic .NET instantiation.
@@ -115,6 +212,8 @@ pub enum MagicFn {
     /// `rustc_clr_interop_throw` → `throw` (a managed exception a .NET caller can `catch`, distinct
     /// from a Rust `panic!`).
     Throw,
+    /// Stack-only integer ↔ CLR-enum representation conversion.
+    EnumReprTransmute,
     /// `rustc_clr_interop_delegate` — wraps a capture-less fn pointer into a managed delegate.
     Delegate,
     /// `rustc_clr_interop_delegate_closure` — wraps a **capturing** closure into a managed delegate.
@@ -141,11 +240,37 @@ pub enum MagicFn {
 /// match doesn't need at all; (2) an ordinary user function can never be accidentally misclassified as
 /// magic just because its mangled name happens to contain one of these strings as a substring.
 pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
+    if is_generated_ctor(tcx, def_id) {
+        return Some(MagicFn::Ctor);
+    }
+    if is_std_thread_intrinsic(tcx, def_id) {
+        let path = tcx.def_path_str(def_id);
+        return match path.rsplit("::").next() {
+            Some("rustc_clr_interop_managed_box_new") => Some(MagicFn::ManagedBoxNew),
+            Some("rustc_clr_interop_managed_box_take") => Some(MagicFn::ManagedBoxTake),
+            _ => unreachable!("std thread intrinsic identity was validated above"),
+        };
+    }
     if !is_mycorrhiza_intrinsic(tcx, def_id) {
         return None;
     }
     let path = tcx.def_path_str(def_id);
     let name = path.rsplit("::").next().unwrap_or(path.as_str());
+    if matches!(
+        name,
+        "rustc_clr_interop_enum_from_repr"
+            | "rustc_clr_interop_enum_to_repr"
+            | "rustc_clr_interop_managed_box_new"
+            | "rustc_clr_interop_managed_box_get"
+            | "rustc_clr_interop_managed_box_take"
+            | "rustc_clr_interop_managed_box_free"
+            | "rustc_clr_interop_managed_default"
+            | "rustc_clr_interop_try_catch"
+    ) && (tcx.def_kind(def_id) != DefKind::Fn
+        || !tcx.fn_sig(def_id).skip_binder().safety().is_unsafe())
+    {
+        return None;
+    }
     // DTO primary constructors are schema-arity generated and may legitimately exceed the small
     // hand-written ctor0..ctor3 convenience ladder. Keep the exact identifier boundary while
     // accepting any decimal arity the call decoder can validate against generics/arguments.
@@ -178,9 +303,15 @@ pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
         "rustc_clr_interop_managed_get_field" => MagicFn::ManagedGetField,
         "rustc_clr_interop_box" => MagicFn::Box,
         "rustc_clr_interop_managed_box_new" => MagicFn::ManagedBoxNew,
+        "rustc_clr_interop_managed_box_get" => MagicFn::ManagedBoxGet,
         "rustc_clr_interop_managed_box_take" => MagicFn::ManagedBoxTake,
+        "rustc_clr_interop_managed_box_free" => MagicFn::ManagedBoxFree,
+        "rustc_clr_interop_managed_default" => MagicFn::ManagedDefault,
         "rustc_clr_interop_try_catch" => MagicFn::TryCatch,
         "rustc_clr_interop_throw" => MagicFn::Throw,
+        "rustc_clr_interop_enum_from_repr" | "rustc_clr_interop_enum_to_repr" => {
+            MagicFn::EnumReprTransmute
+        }
         "rustc_clr_interop_generic_call0"
         | "rustc_clr_interop_generic_call1"
         | "rustc_clr_interop_generic_call2"

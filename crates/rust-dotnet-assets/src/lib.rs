@@ -28,6 +28,7 @@ pub struct StagedPackageAsset {
 mod assets;
 
 pub use assets::{
-    AssetCollision, AssetKind, ResolvedAsset, ResolvedAssets, copy_staged_assets,
-    missing_recorded_roots, package_assets, restore, stage_assets,
+    AssetCollision, AssetKind, DEFAULT_NUGET_SOURCE, ResolvedAsset, ResolvedAssets,
+    copy_staged_assets, dotnet_version, isolated_source_config, missing_recorded_roots,
+    package_assets, restore, restore_with_config, stage_assets,
 };

@@ -19,10 +19,12 @@ pub extern "C" fn linq_combinator_smoke() -> i32 {
     // Real concrete type (System.Int32, not System.Object) — the body compares the parameter's
     // value directly, no property access, matching cd_linq_expr's proven pattern.
     let p1 = Param::new("System.Int32", "x");
-    let pred_a: TypedPredicate<Dummy> = TypedPredicate::new(p1, p1.expr().ge(Expr::const_i32(18)));
+    let expr_a = p1.expr().ge(Expr::const_i32(18));
+    let pred_a: TypedPredicate<Dummy> = TypedPredicate::new(p1, expr_a);
 
     let p2 = Param::new("System.Int32", "y");
-    let pred_b: TypedPredicate<Dummy> = TypedPredicate::new(p2, p2.expr().lt(Expr::const_i32(65)));
+    let expr_b = p2.expr().lt(Expr::const_i32(65));
+    let pred_b: TypedPredicate<Dummy> = TypedPredicate::new(p2, expr_b);
 
     let combined = pred_a & pred_b; // forces rebind_param -> ParameterRebinder.
     let s = combined.text();

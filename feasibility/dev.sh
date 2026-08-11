@@ -8,8 +8,8 @@
 #   * `cd` in a host shell changes $PWD and breaks `docker run -v "$PWD":/work`. -> the repo root is
 #     resolved from THIS script's location, never from the caller's cwd.
 #   * Disassembling one (mangled) method from a build-std .dll is fiddly. -> `il`.
-#   * Re-running the ::stable gate and eyeballing 22 failures is error-prone. -> `gate` diffs the
-#     known baseline and reports only NEW failures.
+#   * A stale direct-host test baseline can hide verifier failures. -> `gate` runs the current
+#     workspace, CIL, and managed-storage invariants without suppressing historical failures.
 #
 # Runs INSIDE the existing `rcc-dev` image (built once; this script never rebuilds it).
 #
@@ -21,8 +21,7 @@
 #   dev.sh buildstd [--clean]    Shorthand for `run build_std`.
 #   dev.sh il <crate> <symbol>   Disassemble method(s) whose (mangled) name contains <symbol> from
 #                                the crate's built .dll (ikdasm). e.g. `il build_std rust_alloc`.
-#   dev.sh gate                  Force-rebuild, run ::stable (CI skips), diff vs baseline (425/13),
-#                                report PASS/FAIL + any NEW failures (outside the known-22 set).
+#   dev.sh gate                  Force-rebuild, then run workspace, CIL, and managed-storage gates.
 #   dev.sh pal-build             Inject the in-repo dotnet PAL (dotnet_pal/sys/**) into the
 #                                container's rust-src (mirror files + insert the target_os="dotnet"
 #                                cascade arms), then build-std cargo_tests/pal_hello for os=dotnet.
@@ -137,29 +136,11 @@ rm -rf target/release/.fingerprint/cilly-* \
        target/release/.fingerprint/rustc_codegen_clr-* target/release/.fingerprint/linker-* 2>/dev/null || true
 ( cd cilly && cargo build --release ) >/dev/null
 cargo build --release -p rustc_codegen_clr >/dev/null
-set +e
-echo "==> cargo test ::stable (CI skip set)"
-out="$(cargo test --release ::stable -- --skip f128 --skip num_test --skip simd --skip fuzz87 2>&1)"
-echo "$out" | grep -E 'test result:' || echo "(no result line — build error?)"
-# Known-22 baseline groups (see rcc-dev-harness-gotchas memory). Report only NEW failures, and
-# re-run each once — `failN`/env tests are flaky, so only a failure that reproduces is a regression.
-known=' any atomics catch f16 fastrand_test futex_test hello_world once_lock_test std_hello_world type_id uninit_fill '
-new_tests=()
-while read -r t; do
-  tn="$(echo "$t" | sed -E 's/^ *//')"; [ -z "$tn" ] && continue
-  g="$(echo "$tn" | sed -E 's/compile_test::([a-z0-9_]+)::.*/\1/')"
-  case "$known" in *" $g "*) : ;; *) new_tests+=("$tn") ;; esac
-done < <(echo "$out" | awk '/^failures:/{f=1} f' | grep -E '^    compile_test' | sort -u)
-if [ ${#new_tests[@]} -eq 0 ]; then echo "OK: only known-22 baseline failures (no regressions)"; exit 0; fi
-echo "==> ${#new_tests[@]} failure(s) outside baseline; re-running each to filter flakiness"
-real=""; flaky=""
-for tn in "${new_tests[@]}"; do
-  if cargo test --release "$tn" -- --exact 2>&1 | grep -q 'test result: ok'; then
-    flaky="$flaky  $tn"$'\n'; else real="$real  $tn"$'\n'; fi
-done
-[ -n "$flaky" ] && { echo "~~ flaky (passed on retry, ignore):"; printf '%s' "$flaky"; }
-if [ -n "$real" ]; then echo "!! REAL REGRESSIONS (failed twice):"; printf '%s' "$real"; exit 1; else
-  echo "OK: no real regressions (out-of-baseline failures were all flaky)"; fi
+echo "==> workspace/compiler/linker invariant gates"
+cargo check --workspace --all-targets --locked
+cargo test -p cilly --locked
+cargo test -p rustc_codegen_clr --lib \
+  managed_references_are_rejected_from_rust_byte_storage -- --nocapture
 C
   ;;
 

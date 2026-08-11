@@ -1,23 +1,101 @@
 use crate::assembly::MethodCompileCtx;
 
 use crate::operand::constant::get_vtable;
-use crate::operand::{handle_operand, operand_address};
+use crate::operand::handle_operand;
 use crate::place::place_address_raw;
 use crate::r#type::GetTypeExt;
-use crate::r#type::fat_ptr_to;
-use crate::r#type::utilis::is_fat_ptr;
 use cilly::cilnode::ExtendKind;
 use cilly::{BinOp, Const, IntoAsmIndex, Type};
 use cilly::{FieldDesc, Int, Interned};
-use rustc_abi::FIRST_VARIANT;
-use rustc_abi::FieldIdx;
+use rustc_abi::{BackendRepr, FieldIdx};
+use rustc_hir::LangItem;
 use rustc_middle::{
     mir::{Operand, Place},
-    ty::{Ty, TyKind, UintTy, layout::TyAndLayout},
+    traits::{self, ImplSource},
+    ty::{self, Ty, TyKind, TypingEnv, adjustment::CustomCoerceUnsized, layout::TyAndLayout},
 };
 
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
+
+#[derive(Clone, Copy, Debug)]
+struct FieldCopy<'tcx> {
+    source_offset: u64,
+    destination_offset: u64,
+    ty: Ty<'tcx>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PointerCoercion<'tcx> {
+    source_offset: u64,
+    destination_offset: u64,
+    source_ty: Ty<'tcx>,
+    destination_ty: Ty<'tcx>,
+}
+
+/// A fully layout-derived coercion recipe. `CoerceUnsized` guarantees exactly one recursively
+/// coerced field; every other physical field is copied at its own source/destination offset.
+/// Keeping this as data lets all rustc queries and structural validation finish before we allocate
+/// any CIL nodes.
+#[derive(Debug)]
+struct UnsizePlan<'tcx> {
+    copies: Vec<FieldCopy<'tcx>>,
+    pointer: PointerCoercion<'tcx>,
+}
+
+impl<'tcx> UnsizePlan<'tcx> {
+    fn new(ctx: &mut MethodCompileCtx<'tcx, '_>, source: Ty<'tcx>, destination: Ty<'tcx>) -> Self {
+        let mut copies = Vec::new();
+        let mut pointer = None;
+        build_unsize_plan(
+            ctx,
+            ctx.layout_of(source),
+            ctx.layout_of(destination),
+            0,
+            0,
+            &mut copies,
+            &mut pointer,
+        );
+        Self {
+            copies,
+            pointer: pointer.expect("valid CoerceUnsized cast had no pointer leaf"),
+        }
+    }
+
+    fn emit(
+        &self,
+        ctx: &mut MethodCompileCtx<'tcx, '_>,
+        source_base: Node,
+        destination_base: Node,
+    ) -> Vec<Root> {
+        let mut roots = Vec::with_capacity(self.copies.len() + 2);
+        for field in &self.copies {
+            assert!(
+                !crate::managed_storage::is_bitwise_managed_unsafe(field.ty, ctx),
+                "managed-storage preflight missed unsize copy of {:?}",
+                field.ty
+            );
+            let ty = ctx.type_from_cache(field.ty);
+            if ty == Type::Void {
+                continue;
+            }
+            let source = offset_address(source_base, field.source_offset, ctx);
+            let destination = offset_address(destination_base, field.destination_offset, ctx);
+            let field_pointer = ctx.nptr(ty);
+            let source = ctx.cast_ptr_to(source, field_pointer);
+            let destination = ctx.cast_ptr_to(destination, field_pointer);
+            let value = ctx.load(source, ty);
+            roots.push(ctx.st_ind(destination, value, ty, false));
+        }
+        roots.extend(emit_pointer_coercion(
+            self.pointer,
+            source_base,
+            destination_base,
+            ctx,
+        ));
+        roots
+    }
+}
 
 /// Preforms an unsizing cast on operand `operand`, converting it to the `target` type.
 pub fn unsize<'tcx>(
@@ -26,107 +104,252 @@ pub fn unsize<'tcx>(
     target: Ty<'tcx>,
     destination: Place<'tcx>,
 ) -> (Vec<Root>, Node) {
-    // Get the monomorphized source and target type
     let target = ctx.monomorphize(target);
     let source = ctx.monomorphize(operand.ty(ctx.body(), ctx.tcx()));
-    // Get the source and target types as .NET types
-
+    let plan = UnsizePlan::new(ctx, source, target);
+    let source_base = operand_storage_address(operand, ctx);
+    let destination_base = place_address_raw(&destination, ctx);
+    let roots = plan.emit(ctx, source_base, destination_base);
     let target_type = ctx.type_from_cache(target);
-    // Get the target type as a fat pointer.
-
-    let src_cil = operand_address(operand, ctx);
-
-    let metadata = unsize_metadata(
-        ctx,
-        src_cil,
-        ctx.layout_of(operand.ty(ctx.body(), ctx.tcx())),
-        ctx.layout_of(target),
-    );
-    let fat_ptr_type = fat_ptr_to(Ty::new_uint(ctx.tcx(), UintTy::U8), ctx);
-
-    let metadata_field = FieldDesc::new(
-        fat_ptr_type,
-        ctx.alloc_string(crate::METADATA),
-        cilly::Type::Int(Int::USize),
-    );
-    let ptr_field = FieldDesc::new(
-        fat_ptr_type,
-        ctx.alloc_string(crate::DATA_PTR),
-        ctx.nptr(cilly::Type::Void),
-    );
-    let dst = place_address_raw(&destination, ctx);
-    let target_ptr = dst;
-
-    let fat_ptr_ptr = ctx.nptr(fat_ptr_type);
-    let init_metadata = {
-        let addr = ctx.cast_ptr_to(target_ptr, fat_ptr_ptr);
-        let val = ctx.cast_ptr_to(metadata, Type::Int(Int::USize));
-        let desc = ctx.alloc_field(metadata_field);
-        ctx.set_field(desc, addr, val)
-    };
-
-    let init_ptr = if is_fat_ptr(source, ctx.tcx(), ctx.instance()) {
-        let void_ptr = ctx.nptr(Type::Void);
-        let addr = ctx.cast_ptr_to(target_ptr, fat_ptr_ptr);
-        let src_addr = operand_address(operand, ctx);
-        let void_ptr_ptr = ctx.nptr(void_ptr);
-        let src_addr = ctx.cast_ptr_to(src_addr, void_ptr_ptr);
-        let loaded = ctx.nptr(Type::Void);
-        let val = ctx.load(src_addr, loaded);
-        let desc = ctx.alloc_field(ptr_field);
-        ctx.set_field(desc, addr, val)
-    } else {
-        let operand = if source.is_any_ptr() {
-            handle_operand(operand, ctx)
-        } else {
-            let source_type = ctx.type_from_cache(source);
-            // If this type is a box<thin>, then its layout *should* be equivalent to a pointer, so this *should* be OK.
-            let op = handle_operand(operand, ctx);
-            ctx.transmute_on_stack(source_type, Type::Int(Int::USize), op)
-        };
-        // `source` is not a fat pointer, so operand should be a pointer.
-
-        let addr = ctx.cast_ptr_to(target_ptr, fat_ptr_ptr);
-        let void_ptr = ctx.nptr(Type::Void);
-        let val = ctx.cast_ptr_to(operand, void_ptr);
-        let desc = ctx.alloc_field(ptr_field);
-        ctx.set_field(desc, addr, val)
-    };
-    let source_size = ctx.layout_of(source).size.bytes();
-    // The TARGET layout — NOT the source. Reading `layout_of(source)` here made `target_size ==
-    // source_size` always, so the `target_size != source_size` guard below was permanently false and
-    // the trailing-field copy was dead code: for a struct unsizing where SIZED fields follow the
-    // coerced field (e.g. `RefMut<[T; N]>` -> `RefMut<[T]>`, whose `borrow` guard sits after the
-    // `value` pointer), those fields were never copied into the destination. The coerced `RefMut`'s
-    // borrow guard was left uninitialized and its `Drop` failed to release the `RefCell` borrow ->
-    // a spurious "already mutably borrowed" panic on the next `borrow()` (coretests
-    // `cell::refcell_ref_coercion`).
-    let target_size = ctx.layout_of(target).size.bytes();
-    // Copy the trailing sized fields. The coerced (first) field grows from a thin pointer (8 bytes)
-    // to a fat pointer (16 bytes), shifting every following field by 8, so copy `source_size - 8`
-    // bytes from `src + 8` to `dst + 16`. Assumes the coerced field is first with thin=8/fat=16 —
-    // holds for the std smart pointers (Ref/RefMut/Rc/Arc/Box); arbitrary layouts are not yet
-    // general (but were already broken before this — the copy never ran at all).
-    let copy_val = if source_size > 8 && !source.is_any_ptr() && target_size != source_size {
-        let addr = operand_address(operand, ctx);
-
-        let eight = ctx.alloc_node(8_isize);
-        let addr = ctx.biop(addr, eight, BinOp::Add);
-        let dst_addr = ctx.ref_to_ptr(dst);
-        let const_16 = ctx.alloc_node(16_isize);
-        let dst_addr = ctx.biop(dst_addr, const_16, BinOp::Add);
-        let len = ctx.alloc_node(Const::USize(source_size - 8));
-        ctx.cp_blk(dst_addr, addr, len)
-    } else {
-        ctx.alloc_root(cilly::CILRoot::Nop)
-    };
     let ptr = ctx.nptr(target_type);
-    let dst = ctx.cast_ptr_to(dst, ptr);
-    (
-        [copy_val, init_metadata, init_ptr].into(),
-        ctx.load(dst, target_type),
-    )
+    let destination = ctx.cast_ptr_to(destination_base, ptr);
+    (roots, ctx.load(destination, target_type))
 }
+
+fn operand_storage_address<'tcx>(
+    operand: &Operand<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Node {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => place_address_raw(place, ctx),
+        Operand::Constant(_) => {
+            let value = handle_operand(operand, ctx);
+            ctx.stack_addr(value)
+        }
+        Operand::RuntimeChecks(_) => {
+            unreachable!("a runtime-check boolean cannot be the operand of an Unsize cast")
+        }
+    }
+}
+
+fn offset_address(base: Node, offset: u64, ctx: &mut MethodCompileCtx<'_, '_>) -> Node {
+    if offset == 0 {
+        base
+    } else {
+        let offset = ctx.alloc_node(Const::USize(offset));
+        ctx.biop(base, offset, BinOp::Add)
+    }
+}
+
+fn custom_coerce_field<'tcx>(
+    ctx: &MethodCompileCtx<'tcx, '_>,
+    source: Ty<'tcx>,
+    destination: Ty<'tcx>,
+) -> FieldIdx {
+    let tcx = ctx.tcx();
+    let trait_ref = ty::TraitRef::new(
+        tcx,
+        tcx.require_lang_item(LangItem::CoerceUnsized, ctx.span()),
+        [source, destination],
+    );
+    let impl_source = tcx
+        .codegen_select_candidate(TypingEnv::fully_monomorphized().as_query_input(trait_ref))
+        .unwrap_or_else(|error| {
+            panic!("could not select CoerceUnsized<{destination:?}> for {source:?}: {error:?}")
+        });
+    let ImplSource::UserDefined(traits::ImplSourceUserDefinedData { impl_def_id, .. }) =
+        impl_source
+    else {
+        panic!(
+            "aggregate CoerceUnsized<{destination:?}> for {source:?} did not select a custom impl: {impl_source:?}"
+        );
+    };
+    let info = tcx
+        .coerce_unsized_info(*impl_def_id)
+        .unwrap_or_else(|_| panic!("invalid CoerceUnsized impl {impl_def_id:?}"));
+    let Some(CustomCoerceUnsized::Struct(field)) = info.custom_kind else {
+        panic!("CoerceUnsized impl {impl_def_id:?} did not identify a struct field");
+    };
+    field
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_unsize_plan<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    source: TyAndLayout<'tcx>,
+    destination: TyAndLayout<'tcx>,
+    source_base: u64,
+    destination_base: u64,
+    copies: &mut Vec<FieldCopy<'tcx>>,
+    pointer: &mut Option<PointerCoercion<'tcx>>,
+) {
+    let source = peel_pattern_type(ctx, source);
+    let destination = peel_pattern_type(ctx, destination);
+    match (source.ty.kind(), destination.ty.kind()) {
+        (
+            TyKind::Ref(_, _, _) | TyKind::RawPtr(_, _),
+            TyKind::Ref(_, _, _) | TyKind::RawPtr(_, _),
+        ) => {
+            assert!(
+                pointer.is_none(),
+                "CoerceUnsized cast contained more than one pointer leaf"
+            );
+            *pointer = Some(PointerCoercion {
+                source_offset: source_base,
+                destination_offset: destination_base,
+                source_ty: source.ty,
+                destination_ty: destination.ty,
+            });
+        }
+        (TyKind::Adt(source_def, _), TyKind::Adt(destination_def, _)) => {
+            assert_eq!(
+                source_def, destination_def,
+                "CoerceUnsized changed aggregate definitions"
+            );
+            let coerce_field = custom_coerce_field(ctx, source.ty, destination.ty).as_usize();
+            assert_eq!(
+                source.fields.count(),
+                destination.fields.count(),
+                "CoerceUnsized changed aggregate field count"
+            );
+            assert!(
+                coerce_field < source.fields.count(),
+                "CoerceUnsized selected nonexistent field {coerce_field}"
+            );
+
+            for index in 0..source.fields.count() {
+                let source_field = source.field(ctx, index);
+                let destination_field = destination.field(ctx, index);
+                let source_offset = source_base + source.fields.offset(index).bytes();
+                let destination_offset =
+                    destination_base + destination.fields.offset(index).bytes();
+                if index == coerce_field {
+                    build_unsize_plan(
+                        ctx,
+                        source_field,
+                        destination_field,
+                        source_offset,
+                        destination_offset,
+                        copies,
+                        pointer,
+                    );
+                    continue;
+                }
+
+                if source_field.is_zst() && destination_field.is_zst() {
+                    continue;
+                }
+                assert_eq!(
+                    source_field.ty, destination_field.ty,
+                    "non-coerced field {index} changed type during CoerceUnsized"
+                );
+                assert_eq!(
+                    source_field.size, destination_field.size,
+                    "non-coerced field {index} changed size during CoerceUnsized"
+                );
+                copies.push(FieldCopy {
+                    source_offset,
+                    destination_offset,
+                    ty: source_field.ty,
+                });
+            }
+        }
+        _ => panic!(
+            "invalid CoerceUnsized shape {:?} -> {:?}",
+            source.ty, destination.ty
+        ),
+    }
+}
+
+fn pointer_leaf<'tcx>(layout: TyAndLayout<'tcx>) -> (Ty<'tcx>, bool) {
+    let pointee = match layout.ty.kind() {
+        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+        _ => panic!(
+            "unsize plan pointer leaf was not a pointer: {:?}",
+            layout.ty
+        ),
+    };
+    let is_fat = match layout.layout.0.0.backend_repr {
+        BackendRepr::Scalar(_) => false,
+        BackendRepr::ScalarPair(_, _) => true,
+        ref other => panic!("pointer leaf {:?} had non-pointer ABI {other:?}", layout.ty),
+    };
+    (pointee, is_fat)
+}
+
+fn fat_pointer_class<'tcx>(
+    ty: Ty<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<cilly::ClassRef> {
+    let Type::ClassRef(class) = ctx.type_from_cache(ty) else {
+        panic!("fat pointer leaf {ty:?} did not lower to a CIL value class")
+    };
+    class
+}
+
+fn emit_pointer_coercion<'tcx>(
+    pointer: PointerCoercion<'tcx>,
+    source_base: Node,
+    destination_base: Node,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> [Root; 2] {
+    let source_layout = peel_pattern_type(ctx, ctx.layout_of(pointer.source_ty));
+    let destination_layout = peel_pattern_type(ctx, ctx.layout_of(pointer.destination_ty));
+    let (source_pointee, source_is_fat) = pointer_leaf(source_layout);
+    let (destination_pointee, destination_is_fat) = pointer_leaf(destination_layout);
+    assert!(
+        destination_is_fat,
+        "Unsize destination pointer leaf was not fat: {:?}",
+        pointer.destination_ty
+    );
+
+    let source_address = offset_address(source_base, pointer.source_offset, ctx);
+    let destination_address = offset_address(destination_base, pointer.destination_offset, ctx);
+    let void_pointer = ctx.nptr(Type::Void);
+
+    let (data, old_metadata) = if source_is_fat {
+        let source_class = fat_pointer_class(pointer.source_ty, ctx);
+        let source_pointer = ctx.nptr(Type::ClassRef(source_class));
+        let source_address = ctx.cast_ptr_to(source_address, source_pointer);
+        let data_name = ctx.alloc_string(crate::DATA_PTR);
+        let metadata_name = ctx.alloc_string(crate::METADATA);
+        let data_field = ctx.alloc_field(FieldDesc::new(source_class, data_name, void_pointer));
+        let metadata_field = ctx.alloc_field(FieldDesc::new(
+            source_class,
+            metadata_name,
+            Type::Int(Int::USize),
+        ));
+        (
+            ctx.ld_field(source_address, data_field),
+            Some(ctx.ld_field(source_address, metadata_field)),
+        )
+    } else {
+        let source_type = ctx.type_from_cache(pointer.source_ty);
+        let source_pointer = ctx.nptr(source_type);
+        let source_address = ctx.cast_ptr_to(source_address, source_pointer);
+        let data = ctx.load(source_address, source_type);
+        (ctx.cast_ptr_to(data, void_pointer), None)
+    };
+
+    let metadata = unsized_info(ctx, source_pointee, destination_pointee, old_metadata);
+    let destination_class = fat_pointer_class(pointer.destination_ty, ctx);
+    let destination_pointer = ctx.nptr(Type::ClassRef(destination_class));
+    let destination_address = ctx.cast_ptr_to(destination_address, destination_pointer);
+    let data_name = ctx.alloc_string(crate::DATA_PTR);
+    let metadata_name = ctx.alloc_string(crate::METADATA);
+    let data_field = ctx.alloc_field(FieldDesc::new(destination_class, data_name, void_pointer));
+    let metadata_field = ctx.alloc_field(FieldDesc::new(
+        destination_class,
+        metadata_name,
+        Type::Int(Int::USize),
+    ));
+    let metadata = ctx.cast_ptr_to(metadata, Type::Int(Int::USize));
+    [
+        ctx.set_field(data_field, destination_address, data),
+        ctx.set_field(metadata_field, destination_address, metadata),
+    ]
+}
+
 /// Adopted from <https://github.com/rust-lang/rustc_codegen_cranelift/blob/45600348c009303847e8cddcfa8483f1f3d56625/src/unsize.rs#L64>
 fn unsized_info<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
@@ -182,19 +405,6 @@ fn unsized_info<'tcx>(
     }
 }
 
-fn load_scalar_pair(addr: Node, ctx: &mut MethodCompileCtx<'_, '_>) -> (Node, Node) {
-    let usize_ptr = ctx.nptr(Type::Int(Int::USize));
-    let first_addr = ctx.cast_ptr_to(addr, usize_ptr);
-    let first = ctx.load(first_addr, Type::Int(Int::USize));
-
-    let size = ctx.size_of(Int::ISize).into_idx(ctx);
-    let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
-    let second_addr = ctx.biop(addr, size, BinOp::Add);
-    let usize_ptr = ctx.nptr(Type::Int(Int::USize));
-    let second_addr = ctx.cast_ptr_to(second_addr, usize_ptr);
-    let second = ctx.load(second_addr, Type::Int(Int::USize));
-    (first, second)
-}
 /// Pattern types (`T is <pattern>`, e.g. `NonNull`'s field `*const T is !null`) are
 /// *layout-identical* to their base type — the pattern only refines validity. The unsizing logic
 /// dispatches on `TyKind` (`RawPtr`/`Ref`/`Adt`) and operates on the underlying pointer + metadata,
@@ -211,101 +421,3 @@ fn peel_pattern_type<'tcx>(
         layout
     }
 }
-/// Coerce `src`, which is a reference to a value of type `src_ty`,
-/// to a value of type `dst_ty` and store the result in `dst`
-fn unsize_metadata<'tcx>(
-    fx: &mut MethodCompileCtx<'tcx, '_>,
-    src_cil: Node,
-    src_ty: TyAndLayout<'tcx>,
-    dst_ty: TyAndLayout<'tcx>,
-) -> Node {
-    // Pattern types are layout-transparent; see `peel_pattern_type`. The address (`src_cil`) is
-    // unchanged because the layout is identical.
-    let src_ty = peel_pattern_type(fx, src_ty);
-    let dst_ty = peel_pattern_type(fx, dst_ty);
-    let coerce_ptr = |fx: &mut MethodCompileCtx<'tcx, '_>| {
-        if fx
-            .layout_of(src_ty.ty.builtin_deref(true).unwrap())
-            .is_unsized()
-        {
-            let (_, old_info) = load_scalar_pair(src_cil, fx);
-            unsize_ptr_metadata(fx, src_ty, dst_ty, Some(old_info))
-        } else {
-            unsize_ptr_metadata(fx, src_ty, dst_ty, None)
-        }
-    };
-
-    match (&src_ty.ty.kind(), &dst_ty.ty.kind()) {
-        (&TyKind::Ref(..), &TyKind::Ref(..) | &TyKind::RawPtr(..))
-        | (&TyKind::RawPtr(..), &TyKind::RawPtr(..)) => coerce_ptr(fx),
-        (&TyKind::Adt(def_a, subst_a), &TyKind::Adt(def_b, subst_b)) => {
-            assert_eq!(def_a, def_b);
-
-            for i in 0..def_a.variant(FIRST_VARIANT).fields.len() {
-                let src_f = &def_a.variant(FIRST_VARIANT).fields[FieldIdx::from_usize(i)];
-                let dst_f = &def_b.variant(FIRST_VARIANT).fields[FieldIdx::from_usize(i)];
-                let src_f_ty = fx.layout_of(src_f.ty(fx.tcx(), subst_a).skip_normalization());
-                let dst_f_ty = fx.layout_of(dst_f.ty(fx.tcx(), subst_b).skip_normalization());
-                if src_f_ty.layout.is_zst() {
-                    // No data here, nothing to copy/coerce.
-                    continue;
-                }
-                if src_f_ty.ty != dst_f_ty.ty {
-                    return unsize_metadata(fx, src_cil, src_f_ty, dst_f_ty);
-                }
-            }
-            todo!()
-        }
-        _ => panic!("unsize_metadata: invalid coercion {src_ty:?} -> {dst_ty:?}",),
-    }
-}
-/// Coerce `src` to `dst_ty`.
-fn unsize_ptr_metadata<'tcx>(
-    fx: &mut MethodCompileCtx<'tcx, '_>,
-
-    src_layout: TyAndLayout<'tcx>,
-    dst_layout: TyAndLayout<'tcx>,
-    old_info: Option<Node>,
-) -> Node {
-    // Peel layout-transparent pattern types (e.g. `NonNull`'s `*const T is !null`) so the
-    // pointer/metadata dispatch below sees the underlying `RawPtr`/`Adt`.
-    let src_layout = peel_pattern_type(fx, src_layout);
-    let dst_layout = peel_pattern_type(fx, dst_layout);
-    match (&src_layout.ty.kind(), &dst_layout.ty.kind()) {
-        (&TyKind::Ref(_, a, _), &TyKind::Ref(_, b, _) | &TyKind::RawPtr(b, _))
-        | (&TyKind::RawPtr(a, _), &TyKind::RawPtr(b, _)) => unsized_info(fx, *a, *b, old_info),
-        (&TyKind::Adt(def_a, _), &TyKind::Adt(def_b, _)) => {
-            assert_eq!(def_a, def_b);
-
-            if src_layout == dst_layout {
-                return old_info.unwrap();
-            }
-
-            let mut result = None;
-            for i in 0..src_layout.fields.count() {
-                let src_f = src_layout.field(fx, i);
-
-                assert_eq!(
-                    src_layout.fields.offset(i).bytes(),
-                    0,
-                    "{:?}",
-                    src_layout.ty
-                );
-                assert_eq!(dst_layout.fields.offset(i).bytes(), 0);
-                if src_f.is_1zst() {
-                    // We are looking for the one non-1-ZST field; this is not it.
-                    continue;
-                }
-                assert_eq!(src_layout.size, src_f.size);
-
-                let dst_f = dst_layout.field(fx, i);
-                assert_ne!(src_f.ty, dst_f.ty);
-                assert_eq!(result, None);
-                result = Some(unsize_ptr_metadata(fx, src_f, dst_f, old_info));
-            }
-            result.unwrap()
-        }
-        _ => panic!("unsize_ptr_metadata: called on bad types"),
-    }
-}
-// New unsizing semantics should use new local allocator

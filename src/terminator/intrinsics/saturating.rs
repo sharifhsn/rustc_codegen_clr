@@ -142,11 +142,10 @@ pub fn saturating_add<'tcx>(
                 vec![].into(),
             );
             let clamp = ctx.alloc_methodref(clamp);
-            // TODO: this assumes isize::MAX == i64::MAX
-            #[allow(clippy::cast_sign_loss)]
-            let min = ctx.alloc_node((i128::from(i64::MIN) as u128) as i128);
-            #[allow(clippy::cast_sign_loss)]
-            let max = ctx.alloc_node((i128::from(i64::MAX) as u128) as i128);
+            let min = ctx.target_layout().signed_pointer_min();
+            let max = ctx.target_layout().signed_pointer_max();
+            let min = ctx.alloc_node(min);
+            let max = ctx.alloc_node(max);
             let diff_capped = ctx.call(clamp, &[diff, min, max], IsPure::NOT);
             crate::casts::int_to_int(
                 Type::Int(Int::I128),
@@ -319,11 +318,10 @@ pub fn saturating_sub<'tcx>(
                 vec![].into(),
             );
             let clamp = ctx.alloc_methodref(clamp);
-            // TODO: this assumes isize::MAX == i64::MAX
-            #[allow(clippy::cast_sign_loss)]
-            let min = ctx.alloc_node((i128::from(i64::MIN) as u128) as i128);
-            #[allow(clippy::cast_sign_loss)]
-            let max = ctx.alloc_node((i128::from(i64::MAX) as u128) as i128);
+            let min = ctx.target_layout().signed_pointer_min();
+            let max = ctx.target_layout().signed_pointer_max();
+            let min = ctx.alloc_node(min);
+            let max = ctx.alloc_node(max);
             let diff_capped = ctx.call(clamp, &[diff, min, max], IsPure::NOT);
             crate::casts::int_to_int(
                 Type::Int(Int::I128),

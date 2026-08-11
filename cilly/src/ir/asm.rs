@@ -295,6 +295,9 @@ pub enum RuntimeService {
     /// The libgcc/libunwind frame walker.
     /// Managed CIL has no native unwind table to walk, so the registered capability reports EOF.
     UnwindBacktrace,
+    /// LLVM's x86 extended-control-register reader used by `std_detect`.
+    /// Managed CIL cannot execute `xgetbv`, so the registered capability reports no enabled state.
+    X86Xgetbv,
 }
 
 fn is_core_ub_precondition(demangled: &str) -> bool {
@@ -358,6 +361,7 @@ impl RuntimeService {
             "_Unwind_GetCFA" => Some(Self::UnwindGetCfa),
             "_Unwind_GetIP" => Some(Self::UnwindGetIp),
             "_Unwind_Backtrace" => Some(Self::UnwindBacktrace),
+            "llvm.x86.xgetbv" => Some(Self::X86Xgetbv),
             _ => PanicKind::ALL
                 .into_iter()
                 .find(|kind| demangled == kind.canonical_symbol())
@@ -379,6 +383,7 @@ impl RuntimeService {
             Self::UnwindGetCfa => "_Unwind_GetCFA",
             Self::UnwindGetIp => "_Unwind_GetIP",
             Self::UnwindBacktrace => "_Unwind_Backtrace",
+            Self::X86Xgetbv => "llvm.x86.xgetbv",
         }
     }
 
@@ -398,6 +403,7 @@ pub enum RuntimeCapability {
     BuiltinUnwindCfaUnavailable,
     BuiltinUnwindIpUnavailable,
     BuiltinUnwindBacktraceEndOfStack,
+    BuiltinX86ExtendedStateUnavailable,
     DeclaredNativeImport,
     LegacyNativeImport,
     BuiltinNoOp,
@@ -568,6 +574,7 @@ pub struct MissingMethodResolutionStats {
     pub unwind_cfa_shims_synthesized: usize,
     pub unwind_ip_shims_synthesized: usize,
     pub unwind_backtrace_shims_synthesized: usize,
+    pub x86_xgetbv_shims_synthesized: usize,
     pub missing_stubs_synthesized: usize,
     pub unresolved_missing_methods: usize,
 }
@@ -635,6 +642,14 @@ impl MissingMethodResolutionStats {
                 capability: RuntimeCapability::BuiltinUnwindBacktraceEndOfStack,
                 service,
             } => panic!("managed unwind backtrace fallback recorded for wrong service {service:?}"),
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinX86ExtendedStateUnavailable,
+                service: Some(RuntimeService::X86Xgetbv),
+            } => self.x86_xgetbv_shims_synthesized += 1,
+            MethodResolution::Resolved {
+                capability: RuntimeCapability::BuiltinX86ExtendedStateUnavailable,
+                service,
+            } => panic!("managed xgetbv fallback recorded for wrong service {service:?}"),
             MethodResolution::Resolved {
                 capability: RuntimeCapability::DeclaredNativeImport,
                 ..
@@ -736,7 +751,7 @@ impl std::fmt::Display for MissingMethodResolutionStats {
             f,
             "processed {} method refs ({} discovered during resolution): {} overrides, {} externs, \
              {} allocator shims, {} no-alloc shims, {} panic shims, {} core UB precondition shims, \
-             {} unwind shims, \
+             {} unwind shims, {} xgetbv shims, \
              {} missing stubs; {} unresolved non-abstract MethodImpl::Missing definitions remain",
             self.method_refs_processed,
             self.method_refs_added,
@@ -747,6 +762,7 @@ impl std::fmt::Display for MissingMethodResolutionStats {
             self.panic_shims_synthesized,
             self.core_ub_precondition_shims_synthesized,
             self.unwind_shims_synthesized,
+            self.x86_xgetbv_shims_synthesized,
             self.missing_stubs_synthesized,
             self.unresolved_missing_methods,
         )
@@ -3069,7 +3085,8 @@ impl Assembly {
                 service @ (RuntimeService::UnwindFindEnclosingFunction
                 | RuntimeService::UnwindGetCfa
                 | RuntimeService::UnwindGetIp
-                | RuntimeService::UnwindBacktrace),
+                | RuntimeService::UnwindBacktrace
+                | RuntimeService::X86Xgetbv),
             ) = service
             {
                 let main_module = *self.main_module();
@@ -3086,6 +3103,10 @@ impl Assembly {
                     }
                     RuntimeService::UnwindBacktrace => {
                         self.is_unwind_backtrace_signature(signature)
+                    }
+                    RuntimeService::X86Xgetbv => {
+                        signature.inputs() == [Type::Int(Int::U32)]
+                            && *signature.output() == Type::Int(Int::I64)
                     }
                     _ => unreachable!("matched only managed unwind services"),
                 };
@@ -3104,6 +3125,9 @@ impl Assembly {
                         }
                         RuntimeService::UnwindBacktrace => {
                             "static nongeneric MainModule `(extern C fn(*void, *mut c_void) -> _Unwind_Reason_Code, *mut c_void) -> _Unwind_Reason_Code` function"
+                        }
+                        RuntimeService::X86Xgetbv => {
+                            "static nongeneric MainModule function with one `u32` XCR selector input and an `i64` output"
                         }
                         _ => unreachable!("matched only managed unwind services"),
                     };
@@ -3157,6 +3181,9 @@ impl Assembly {
                         }
                         Some(RuntimeService::UnwindBacktrace) => {
                             RuntimeCapability::BuiltinUnwindBacktraceEndOfStack
+                        }
+                        Some(RuntimeService::X86Xgetbv) => {
+                            RuntimeCapability::BuiltinX86ExtendedStateUnavailable
                         }
                         _ => RuntimeCapability::PatcherOverride,
                     },
@@ -6623,6 +6650,10 @@ fn panic_runtime_service_classification_is_exact_and_covers_the_pinned_set() {
         RuntimeService::classify("_Unwind_Backtrace"),
         Some(RuntimeService::UnwindBacktrace)
     );
+    assert_eq!(
+        RuntimeService::classify("llvm.x86.xgetbv"),
+        Some(RuntimeService::X86Xgetbv)
+    );
     for unrelated in [
         "my_crate::_Unwind_FindEnclosingFunction",
         "_Unwind_FindEnclosingFunction_suffix",
@@ -6637,6 +6668,10 @@ fn panic_runtime_service_classification_is_exact_and_covers_the_pinned_set() {
         "my_crate::_Unwind_Backtrace",
         "_Unwind_Backtrace_suffix",
         "prefix_Unwind_Backtrace",
+        "my_crate::llvm.x86.xgetbv",
+        "llvm.x86.xgetbv_suffix",
+        "prefix_llvm.x86.xgetbv",
+        "llvm.x86.xgetbv.0",
     ] {
         assert_eq!(RuntimeService::classify(unrelated), None, "{unrelated}");
     }
@@ -6679,6 +6714,189 @@ fn panic_runtime_service_classification_is_exact_and_covers_the_pinned_set() {
     ] {
         assert_eq!(RuntimeService::classify(unrelated), None, "{unrelated}");
     }
+}
+
+#[test]
+fn managed_xgetbv_capability_is_typed_conservative_zero_cil() {
+    let mut asm = Assembly::default();
+    let method = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "llvm.x86.xgetbv",
+        &[Type::Int(Int::U32)],
+        Type::Int(Int::I64),
+    );
+    let mut patcher = MissingMethodPatcher::default();
+    super::builtins::x86::xgetbv_unavailable(&mut asm, &mut patcher);
+
+    let stats = asm
+        .try_resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &patcher)
+        .unwrap();
+
+    assert_eq!(stats.x86_xgetbv_shims_synthesized, 1);
+    assert_eq!(stats.overrides_applied, 0);
+    assert_eq!(stats.unresolved_missing_methods, 0);
+    let definition = &asm[asm.method_ref_to_def(method).unwrap()];
+    assert_eq!(definition.sig(), asm[method].sig());
+    let MethodImpl::MethodBody { blocks, locals } = definition.implementation() else {
+        panic!("managed xgetbv capability did not produce a method body")
+    };
+    assert!(locals.is_empty());
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].roots().len(), 1);
+    let CILRoot::Ret(value) = &asm[blocks[0].roots()[0]] else {
+        panic!("managed xgetbv capability must return a value")
+    };
+    let CILNode::Const(value) = &asm[*value] else {
+        panic!("managed xgetbv capability must return a constant")
+    };
+    assert_eq!(value.as_ref(), &Const::I64(0));
+    assert_eq!(asm.typecheck(), 0);
+
+    let (image, _) = asm
+        .prepared()
+        .verify_for_export()
+        .unwrap()
+        .try_render_pe(&test_pe_options("xgetbv-unavailable"))
+        .unwrap();
+    assert_eq!(&image[..2], b"MZ");
+}
+
+#[test]
+fn managed_xgetbv_rejects_near_miss_abis_and_requires_capability() {
+    fn assert_signature_rejected(make: impl FnOnce(&mut Assembly) -> Interned<MethodRef>) {
+        let mut asm = Assembly::default();
+        let method = make(&mut asm);
+        let mut patcher = MissingMethodPatcher::default();
+        super::builtins::x86::xgetbv_unavailable(&mut asm, &mut patcher);
+        let error = asm
+            .try_resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &patcher)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MissingMethodResolutionError::RuntimeServiceSignatureMismatch {
+                service: RuntimeService::X86Xgetbv,
+                ..
+            }
+        ));
+        assert!(asm.method_ref_to_def(method).is_none());
+    }
+
+    assert_signature_rejected(|asm| {
+        Interned::<MethodRef>::builtin(asm, "llvm.x86.xgetbv", &[], Type::Int(Int::I64))
+    });
+    assert_signature_rejected(|asm| {
+        Interned::<MethodRef>::builtin(
+            asm,
+            "llvm.x86.xgetbv",
+            &[Type::Int(Int::I32)],
+            Type::Int(Int::I64),
+        )
+    });
+    assert_signature_rejected(|asm| {
+        Interned::<MethodRef>::builtin(
+            asm,
+            "llvm.x86.xgetbv",
+            &[Type::Int(Int::U32)],
+            Type::Int(Int::U64),
+        )
+    });
+    assert_signature_rejected(|asm| {
+        let signature = asm.sig([Type::Int(Int::U32)], Type::Int(Int::I64));
+        let main = *asm.main_module();
+        asm.new_methodref(main, "llvm.x86.xgetbv", signature, MethodKind::Instance, [])
+    });
+    assert_signature_rejected(|asm| {
+        let signature = asm.sig([Type::Int(Int::U32)], Type::Int(Int::I64));
+        let main = *asm.main_module();
+        asm.new_methodref(
+            main,
+            "llvm.x86.xgetbv",
+            signature,
+            MethodKind::Static,
+            [Type::Int(Int::I32)],
+        )
+    });
+    assert_signature_rejected(|asm| {
+        let owner_name = asm.alloc_string("NotMainModule");
+        let owner = asm
+            .class_def(ClassDef::new(
+                owner_name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Assembly,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+        let signature = asm.sig([Type::Int(Int::U32)], Type::Int(Int::I64));
+        asm.new_methodref(
+            owner.0,
+            "llvm.x86.xgetbv",
+            signature,
+            MethodKind::Static,
+            [],
+        )
+    });
+
+    let mut asm = Assembly::default();
+    let method = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "llvm.x86.xgetbv",
+        &[Type::Int(Int::U32)],
+        Type::Int(Int::I64),
+    );
+    let error = asm
+        .try_resolve_missing_methods(
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &MissingMethodPatcher::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MissingMethodResolutionError::UnsupportedRuntimeService {
+            service: RuntimeService::X86Xgetbv,
+            ..
+        }
+    ));
+    assert!(asm.method_ref_to_def(method).is_none());
+}
+
+#[test]
+fn linked_xgetbv_definition_wins_over_the_managed_fallback() {
+    let mut asm = Assembly::default();
+    let method = Interned::<MethodRef>::builtin(
+        &mut asm,
+        "llvm.x86.xgetbv",
+        &[Type::Int(Int::U32)],
+        Type::Int(Int::I64),
+    );
+    let marker = asm.alloc_node(Const::I64(7));
+    let marker = asm.alloc_root(CILRoot::Ret(marker));
+    let body = MethodImpl::MethodBody {
+        blocks: vec![super::BasicBlock::new(vec![marker], 0, None)],
+        locals: vec![],
+    };
+    let definition = asm[method].clone().into_def(body, Access::Public, &asm);
+    asm.new_method(definition);
+    let mut patcher = MissingMethodPatcher::default();
+    super::builtins::x86::xgetbv_unavailable(&mut asm, &mut patcher);
+
+    let stats = asm
+        .try_resolve_missing_methods(&FxHashMap::default(), &FxHashSet::default(), &patcher)
+        .unwrap();
+    assert_eq!(stats.already_defined, 1);
+    assert_eq!(stats.x86_xgetbv_shims_synthesized, 0);
+    let MethodImpl::MethodBody { blocks, .. } =
+        asm[asm.method_ref_to_def(method).unwrap()].implementation()
+    else {
+        panic!("linked xgetbv definition changed implementation kind")
+    };
+    assert_eq!(blocks[0].roots(), &[marker]);
 }
 
 #[cfg(test)]

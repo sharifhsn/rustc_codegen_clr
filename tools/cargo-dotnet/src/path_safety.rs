@@ -51,12 +51,6 @@ fn validate_component(
     Ok(())
 }
 
-pub(crate) fn package_cache_dir(base: &Path, id: &str, version: &str) -> Result<PathBuf> {
-    validate_nuget_id(id)?;
-    validate_nuget_version(version)?;
-    Ok(base.join(id.to_ascii_lowercase()).join(version))
-}
-
 pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty()
         || path
@@ -86,6 +80,55 @@ pub(crate) fn canonical_file_within(root: &Path, relative: &Path) -> Result<Path
         );
     }
     Ok(canonical)
+}
+
+/// Resolve an existing regular file or directory below `root` without accepting a link/reparse
+/// point in any path component.  Package feeds may be directories or local `.nupkg` files, but
+/// their recorded project-relative identity must not be redirected after manifest validation.
+pub(crate) fn canonical_file_or_directory_within(root: &Path, relative: &Path) -> Result<PathBuf> {
+    validate_relative_path(relative)?;
+    let canonical_root = fs::canonicalize(root)
+        .with_context(|| format!("resolving boundary root {}", root.display()))?;
+    let mut candidate = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("validate_relative_path accepted a non-normal component")
+        };
+        candidate.push(component);
+        let metadata = fs::symlink_metadata(&candidate)
+            .with_context(|| format!("inspecting contained path {}", candidate.display()))?;
+        if is_link_or_reparse(&metadata) {
+            bail!(
+                "contained path uses a link or reparse point: {}",
+                candidate.display()
+            );
+        }
+    }
+    let canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("resolving contained path {}", candidate.display()))?;
+    let metadata = fs::metadata(&canonical)?;
+    if !canonical.starts_with(&canonical_root) || !(metadata.is_file() || metadata.is_dir()) {
+        bail!(
+            "path escapes its project root or is not a regular file/directory: {} (root {})",
+            candidate.display(),
+            canonical_root.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 pub(crate) fn remove_dir_all_within(root: &Path, target: &Path) -> Result<()> {
@@ -130,6 +173,9 @@ pub(crate) fn planned_absolute(path: &Path) -> Result<PathBuf> {
     Ok(fs::canonicalize(parent)?.join(name))
 }
 
+/// Prevent activation from containing a live source, executable, cache, or archive authority.
+/// The reverse containment direction is intentionally allowed for ordinary protected paths (for
+/// example, a bundle and its install home may be siblings below one temporary directory).
 pub(crate) fn reject_ancestor_of(
     install_home: &Path,
     protected: impl IntoIterator<Item = (&'static str, PathBuf)>,
@@ -145,6 +191,36 @@ pub(crate) fn reject_ancestor_of(
         if protected == install_home || protected.starts_with(&install_home) {
             bail!(
                 "SDK install home {} would contain protected {label} {}",
+                install_home.display(),
+                protected.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject either containment direction between an SDK home and protected state. In addition to
+/// avoiding destructive activation over a checkout/cache, this prevents an installed driver from
+/// inheriting repository markers through an ancestor and makes the installed/development trust
+/// boundary unambiguous.
+pub(crate) fn reject_overlap_with(
+    install_home: &Path,
+    protected: impl IntoIterator<Item = (&'static str, PathBuf)>,
+) -> Result<()> {
+    let install_home = planned_absolute(install_home)?;
+    for (label, path) in protected {
+        let protected = if path.exists() {
+            fs::canonicalize(&path)
+                .with_context(|| format!("resolving protected {label} {}", path.display()))?
+        } else {
+            planned_absolute(&path)?
+        };
+        if protected == install_home
+            || protected.starts_with(&install_home)
+            || install_home.starts_with(&protected)
+        {
+            bail!(
+                "SDK install home {} overlaps protected {label} {}",
                 install_home.display(),
                 protected.display()
             );
@@ -249,12 +325,18 @@ mod tests {
     }
 
     #[test]
-    fn install_home_cannot_be_an_ancestor_of_protected_state() {
+    fn install_home_cannot_overlap_protected_state_in_either_direction() {
         let root = tempfile::tempdir().unwrap();
-        let protected = root.path().join("repo/target/debug");
-        fs::create_dir_all(&protected).unwrap();
-        assert!(reject_ancestor_of(root.path(), [("repository", protected.clone())]).is_err());
-        assert!(reject_ancestor_of(&root.path().join("sdk"), [("repository", protected)]).is_ok());
+        let repo = root.path().join("repo");
+        let protected = repo.join("target/debug");
+        std::fs::create_dir_all(&protected).unwrap();
+        assert!(reject_ancestor_of(root.path(), [("running binary", protected)]).is_err());
+        assert!(
+            reject_overlap_with(&repo.join("nested-sdk"), [("repository", repo.clone())]).is_err()
+        );
+        assert!(
+            reject_overlap_with(&root.path().join("sibling-sdk"), [("repository", repo)]).is_ok()
+        );
     }
 
     #[cfg(unix)]
@@ -268,5 +350,6 @@ mod tests {
         fs::write(&file, b"secret").unwrap();
         symlink(&file, project.path().join("linked")).unwrap();
         assert!(canonical_file_within(project.path(), Path::new("linked")).is_err());
+        assert!(canonical_file_or_directory_within(project.path(), Path::new("linked")).is_err());
     }
 }

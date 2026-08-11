@@ -14,7 +14,8 @@ use mycorrhiza::dynamic::{
     box_arg, invoke_dynamic1, invoke_dynamic1_checked, invoke_dynamic2_checked, str_arg,
 };
 use mycorrhiza::intrinsics::{
-    rustc_clr_interop_managed_checked_cast as checked_cast, RustcCLRInteropManagedClass,
+    RustcCLRInteropManagedClass, rustc_clr_interop_managed_checked_cast as checked_cast,
+    rustc_clr_interop_managed_is_null,
 };
 use mycorrhiza::system::console::Console;
 use mycorrhiza::system::{DotNetString, MObject, MString};
@@ -52,17 +53,34 @@ fn main() -> std::process::ExitCode {
     for native in [-7i32, 0, 7, i32::MIN + 1, i32::MAX] {
         // SAFETY: "System.Private.CoreLib"/"System.Math"/"Abs" is a real, known-good target and the
         // single `int` argument matches `Math.Abs(int)` exactly -- this call cannot fail to resolve.
-        let result =
-            unsafe { invoke_dynamic1("System.Private.CoreLib", "System.Math", "Abs", box_arg(native)) };
+        let result = unsafe {
+            invoke_dynamic1(
+                "System.Private.CoreLib",
+                "System.Math",
+                "Abs",
+                box_arg(native),
+            )
+        };
         chk!(unbox_i32(result), native.abs());
     }
 
     // ---------- System.String.Concat(string, string) -- a reference-type overload ----------
-    let pairs = [("foo", "bar"), ("Hello, ", "World!"), ("", "x"), ("rust", "")];
+    let pairs = [
+        ("foo", "bar"),
+        ("Hello, ", "World!"),
+        ("", "x"),
+        ("rust", ""),
+    ];
     for (a, b) in pairs {
-        let result =
-            invoke_dynamic2_checked("System.Private.CoreLib", "System.String", "Concat", str_arg(a), str_arg(b))
-                .expect("System.String.Concat(string, string) must resolve");
+        let result = invoke_dynamic2_checked(
+            "System.Private.CoreLib",
+            "System.String",
+            "Concat",
+            str_arg(a),
+            str_arg(b),
+        )
+        .expect("System.String.Concat(string, string) must resolve")
+        .into_raw();
         chk!(unbox_string(result), std::format!("{a}{b}"));
     }
 
@@ -86,10 +104,30 @@ fn main() -> std::process::ExitCode {
     // ---------- a second unambiguous static BCL call, to prove this isn't Math.Abs-specific ----------
     // `System.Math.Max(int, int)` -- two boxed `int` args, exact-type overload match.
     for (a, b) in [(3i32, 5i32), (10, -2), (0, 0)] {
-        let result = invoke_dynamic2_checked("System.Private.CoreLib", "System.Math", "Max", box_arg(a), box_arg(b))
-            .expect("System.Math.Max(int, int) must resolve");
+        let result = invoke_dynamic2_checked(
+            "System.Private.CoreLib",
+            "System.Math",
+            "Max",
+            box_arg(a),
+            box_arg(b),
+        )
+        .expect("System.Math.Max(int, int) must resolve")
+        .into_raw();
         chk!(unbox_i32(result), a.max(b));
     }
+
+    // `GC.Collect(int)` forces collection while the checked wrapper's boxed `int` argument is
+    // represented only by its ManagedRef token outside the direct managed-call slots. A void
+    // reflection result is managed `null`; rooting and consuming null must be valid too.
+    let collect = invoke_dynamic1_checked(
+        "System.Private.CoreLib",
+        "System.GC",
+        "Collect",
+        box_arg(2i32),
+    )
+    .expect("System.GC.Collect(int) must resolve")
+    .into_raw();
+    chk!(rustc_clr_interop_managed_is_null(collect), true);
 
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);

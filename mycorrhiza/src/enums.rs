@@ -11,7 +11,7 @@
 //! use mycorrhiza::dotnet_enum;
 //!
 //! dotnet_enum! {
-//!     pub enum DayOfWeek = ["System.Private.CoreLib"] "System.DayOfWeek" (i32, 4) {
+//!     unsafe pub enum DayOfWeek = ["System.Private.CoreLib"] "System.DayOfWeek" (i32, 4) {
 //!         Sunday = 0, Monday = 1, Tuesday = 2, Wednesday = 3,
 //!         Thursday = 4, Friday = 5, Saturday = 6,
 //!     }
@@ -31,16 +31,58 @@ pub trait DotNetExportEnum: Sized {
     fn try_from_managed(value: Self::Managed) -> Option<Self>;
 }
 
+/// Stack-only representation conversion used by `dotnet_enum!`.
+///
+/// # Safety
+/// `ASSEMBLY::CLASS_PATH` must be a CLR enum with exactly `SIZE == size_of::<Repr>()` and `Repr`
+/// must be its underlying integer type. The backend replaces this exact marked function with a
+/// stack transmute; it never grants the raw managed value native-storage capability.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
+#[doc(hidden)]
+#[inline(never)]
+pub unsafe fn rustc_clr_interop_enum_from_repr<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const SIZE: usize,
+    Repr,
+>(
+    _value: Repr,
+) -> crate::intrinsics::RustcCLRInteropManagedStruct<ASSEMBLY, CLASS_PATH, SIZE> {
+    core::intrinsics::abort()
+}
+
+/// The reverse of `rustc_clr_interop_enum_from_repr`; see its safety contract.
+#[doc = "__rustc_codegen_clr_intrinsic_v1"]
+#[doc(hidden)]
+#[inline(never)]
+pub unsafe fn rustc_clr_interop_enum_to_repr<
+    const ASSEMBLY: &'static str,
+    const CLASS_PATH: &'static str,
+    const SIZE: usize,
+    Repr,
+>(
+    _value: crate::intrinsics::RustcCLRInteropManagedStruct<ASSEMBLY, CLASS_PATH, SIZE>,
+) -> Repr {
+    core::intrinsics::abort()
+}
+
 /// Declare a Rust mirror of a .NET `enum` plus its boundary conversions. See the [module docs](self).
 ///
-/// Syntax: `enum <Name> = ["<assembly>"] "<Class.Path>" (<repr>, <byte-size>) { Variant = value, .. }`
+/// Syntax: `unsafe enum <Name> = ["<assembly>"] "<Class.Path>" (<repr>, <byte-size>) { Variant = value, .. }`
 /// — `<repr>` is the enum's underlying integer type (`i8`/`i16`/`i32`/`i64`/`u8`/…) and `<byte-size>`
 /// its size in bytes (1/2/4/8), matching the C# enum's base type.
+///
+/// # Safety
+///
+/// The declaration is an unsafe representation contract: the named CLR type must really be an enum
+/// with exactly the stated integer representation and byte size. The boundary conversions perform
+/// a bit reinterpretation using that promise. The raw managed handle remains stack-only; only the
+/// generated Rust `#[repr(..)]` enum is suitable for ordinary Rust-owned storage.
 #[macro_export]
 macro_rules! dotnet_enum {
     (
         $(#[$meta:meta])*
-        $vis:vis enum $Name:ident = [ $asm:tt ] $class:tt ( $repr:ty, $size:literal ) {
+        unsafe $vis:vis enum $Name:ident = [ $asm:tt ] $class:tt ( $repr:ty, $size:literal ) {
             $( $Variant:ident = $val:literal ),+ $(,)?
         }
     ) => {
@@ -50,6 +92,8 @@ macro_rules! dotnet_enum {
         $vis enum $Name {
             $( $Variant = $val ),+
         }
+
+        const _: () = assert!(::core::mem::size_of::<$repr>() == $size);
 
         impl $Name {
             /// The underlying integer value of this variant.
@@ -72,7 +116,14 @@ macro_rules! dotnet_enum {
                 self,
             ) -> $crate::intrinsics::RustcCLRInteropManagedStruct<{ $asm }, { $class }, $size> {
                 let v = self as $repr;
-                unsafe { ::core::mem::transmute_copy(&v) }
+                unsafe {
+                    $crate::enums::rustc_clr_interop_enum_from_repr::<
+                        { $asm },
+                        { $class },
+                        $size,
+                        $repr,
+                    >(v)
+                }
             }
             /// Reconstruct from a managed handle returned by a .NET API (reads the underlying integer;
             /// `None` if it is not a known variant).
@@ -80,9 +131,17 @@ macro_rules! dotnet_enum {
             pub fn from_handle(
                 h: $crate::intrinsics::RustcCLRInteropManagedStruct<{ $asm }, { $class }, $size>,
             ) -> ::core::option::Option<Self> {
-                let v: $repr = unsafe { ::core::mem::transmute_copy(&h) };
+                let v: $repr = unsafe {
+                    $crate::enums::rustc_clr_interop_enum_to_repr::<
+                        { $asm },
+                        { $class },
+                        $size,
+                        $repr,
+                    >(h)
+                };
                 Self::from_value(v)
             }
         }
+
     };
 }

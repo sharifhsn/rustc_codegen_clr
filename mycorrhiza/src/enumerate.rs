@@ -32,6 +32,8 @@ use crate::intrinsics::{
     RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric,
     RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
 };
+use crate::managed_option::ManagedRef;
+use crate::{ManagedReferenceType, NativeStorageSafe};
 
 /// The impl assembly for the `System.Collections[.Generic]` interfaces — all live in
 /// `System.Private.CoreLib`.
@@ -69,6 +71,17 @@ impl<T> ManagedEnumerable<T> {
 
     pub fn iter(&self) -> Enumerator<T> {
         self.iter_enumerator()
+    }
+
+    /// Iterate a reference-element sequence without ever placing a naked CLR reference in
+    /// `Option<T>` storage. Each yielded item owns an independent GCHandle token.
+    pub fn iter_rooted(&self) -> RootedEnumerator<T>
+    where
+        T: ManagedReferenceType + Copy,
+    {
+        RootedEnumerator {
+            inner: self.iter_enumerator(),
+        }
     }
 }
 
@@ -114,9 +127,8 @@ fn get_current<T>(en: IEnumeratorGeneric<T>) -> T {
     >(en)
 }
 
-/// A Rust [`Iterator`] over a .NET enumerator — the general enumerator bridge. It holds both the
-/// non-generic enumerator (for `MoveNext`) and its `IEnumerator<T>` view (for `get_Current`); both are
-/// the *same* underlying managed object, obtained by a `castclass` at construction.
+/// A Rust [`Iterator`] over a .NET enumerator — the general enumerator bridge. It roots the
+/// non-generic enumerator and derives its `IEnumerator<T>` view transiently for `get_Current`.
 ///
 /// `T` is the element type (a boundary-crossing .NET type — a primitive, a `#[repr(C)]` value-type
 /// struct, or a managed handle). The enumerator holds a managed reference, so `T` need not be `Copy`.
@@ -126,20 +138,50 @@ fn get_current<T>(en: IEnumeratorGeneric<T>) -> T {
 /// enumerators (a no-op `Dispose`), but an enumerator backed by a real resource (a lock, a stream) will
 /// leak that resource until GC if iteration stops early.
 pub struct Enumerator<T> {
-    /// The non-generic enumerator, used for `MoveNext()`.
-    base: IEnumeratorNonGeneric,
-    /// The same object, cast to `IEnumerator<T>`, used for `get_Current()`.
-    typed: IEnumeratorGeneric<T>,
+    /// The non-generic enumerator, rooted for the iterator's whole lifetime.
+    base: ManagedRef<IEnumeratorNonGeneric>,
+    _element: core::marker::PhantomData<fn() -> T>,
 }
 
-impl<T> Iterator for Enumerator<T> {
+impl<T> Enumerator<T> {
+    #[inline]
+    fn advance(&mut self) -> bool {
+        self.base.copy_raw().virt0::<"MoveNext", bool>()
+    }
+
+    #[inline]
+    fn current(&self) -> T {
+        let typed = crate::intrinsics::rustc_clr_interop_managed_checked_cast::<
+            IEnumeratorGeneric<T>,
+            IEnumeratorNonGeneric,
+        >(self.base.copy_raw());
+        get_current::<T>(typed)
+    }
+}
+
+impl<T: NativeStorageSafe> Iterator for Enumerator<T> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
-        if self.base.virt0::<"MoveNext", bool>() {
-            Some(get_current::<T>(self.typed))
+        if self.advance() {
+            Some(self.current())
         } else {
             None
         }
+    }
+}
+
+/// Reference-element iterator whose Rust item is a rooted token rather than a naked CLR handle.
+pub struct RootedEnumerator<T: ManagedReferenceType + Copy> {
+    inner: Enumerator<T>,
+}
+
+impl<T: ManagedReferenceType + Copy> Iterator for RootedEnumerator<T> {
+    type Item = ManagedRef<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .advance()
+            .then(|| ManagedRef::from_raw(self.inner.current()))
     }
 }
 
@@ -191,10 +233,13 @@ fn kvp_value<K, V>(kvp: &KeyValuePair<K, V>) -> V {
 pub struct EntryIter<K, V> {
     inner: Enumerator<KeyValuePair<K, V>>,
 }
-impl<K, V> Iterator for EntryIter<K, V> {
+impl<K: NativeStorageSafe, V: NativeStorageSafe> Iterator for EntryIter<K, V> {
     type Item = (K, V);
     fn next(&mut self) -> Option<(K, V)> {
-        let kvp = self.inner.next()?;
+        if !self.inner.advance() {
+            return None;
+        }
+        let kvp = self.inner.current();
         Some((kvp_key::<K, V>(&kvp), kvp_value::<K, V>(&kvp)))
     }
 }
@@ -210,7 +255,10 @@ pub trait EnumerableEntries<K, V>: Enumerable<KeyValuePair<K, V>> {
         }
     }
 }
-impl<K, V, C: Enumerable<KeyValuePair<K, V>>> EnumerableEntries<K, V> for C {}
+impl<K: NativeStorageSafe, V: NativeStorageSafe, C: Enumerable<KeyValuePair<K, V>>>
+    EnumerableEntries<K, V> for C
+{
+}
 
 /// Marker asserting that every live value of handle type `H` is a managed reference whose .NET class
 /// genuinely implements `IEnumerable<T>` — i.e. `H` is a legal `castclass` source for
@@ -281,12 +329,26 @@ pub trait Enumerable<T> {
         let base = unsafe {
             get_enumerator_nongeneric(to_nongeneric_enumerable(self.enumerable_handle()))
         };
-        let typed: IEnumeratorGeneric<T> =
-            crate::intrinsics::rustc_clr_interop_managed_checked_cast::<
-                IEnumeratorGeneric<T>,
-                IEnumeratorNonGeneric,
-            >(base);
-        Enumerator { base, typed }
+        // Validate the generic interface view at construction; subsequent `Current` reads derive
+        // the same view from the rooted object.
+        let _: IEnumeratorGeneric<T> = crate::intrinsics::rustc_clr_interop_managed_checked_cast::<
+            IEnumeratorGeneric<T>,
+            IEnumeratorNonGeneric,
+        >(base);
+        Enumerator {
+            base: ManagedRef::from_raw(base),
+            _element: core::marker::PhantomData,
+        }
+    }
+
+    /// Reference-element counterpart to [`Self::iter_enumerator`].
+    fn iter_rooted(&self) -> RootedEnumerator<T>
+    where
+        T: ManagedReferenceType + Copy,
+    {
+        RootedEnumerator {
+            inner: self.iter_enumerator(),
+        }
     }
 }
 

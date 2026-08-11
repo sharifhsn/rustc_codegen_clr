@@ -1,4 +1,4 @@
-# State of the project — July 2026
+# State of the project — August 2026
 
 `rustc_codegen_clr` can compile substantial Rust programs into managed .NET assemblies. The core
 compiler and interop mechanisms are established; the current focus is making the SDK installable,
@@ -6,7 +6,7 @@ understandable, and useful outside this checkout.
 
 ## Public preview contract
 
-The 0.0.2 SDK supports:
+The unpublished 0.0.2 release-candidate contract supports:
 
 - .NET 10;
 - Linux x64, macOS Apple Silicon, and Windows x64; and
@@ -64,12 +64,20 @@ adapter generation.
 Release bundles remove the compiler checkout from the consumer machine. Rustup and the .NET 10 SDK
 remain normal host prerequisites.
 
+Checked arithmetic is covered in both dev and release profiles. The `cargo_tests/panic_msgs`
+acceptance forces `overflow-checks=true` through build-std, compares seven bounds/arithmetic panic
+messages with native Rust, and verifies that each panic remains catchable.
+
 ## Known limits
 
 - `hard_link`, full Unix signal semantics, fork/exec fidelity, mmap fidelity, and f128 do not map
   cleanly to portable managed APIs.
 - TLS destructors and several long-tail errno/PAL behaviors remain incomplete.
-- `overflow-checks=true` has a known build-std ICE.
+- Direct PE requires a 64-bit little-endian Rust target layout. A 32-bit or big-endian target fails
+  at codegen instead of inheriting the host CLR process layout.
+- Naked CLR object, array, and byref values cannot live in Rust-owned arrays, aggregates, statics,
+  allocations, raw-pointer storage, or bulk-memory operations. Long-lived values must remain in
+  managed storage or use an audited `GCHandle`-backed wrapper.
 - Interactive IDE stepping and Source Link retrieval have not received the same end-to-end coverage
   as PDB metadata and managed stack traces.
 - Allocation-heavy code can remain slower than equivalent GC-optimized C#.

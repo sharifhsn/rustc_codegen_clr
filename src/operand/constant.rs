@@ -10,15 +10,96 @@ use cilly::{
 use rustc_middle::ty::ExistentialTraitRef;
 use rustc_middle::{
     mir::{
-        ConstOperand, ConstValue,
+        Const as MirConst, ConstOperand, ConstValue, Location,
         interpret::Scalar,
         interpret::{AllocId, GlobalAlloc},
+        visit::Visitor,
     },
     ty::{FloatTy, IntTy, Ty, TyCtxt, TyKind, UintTy},
 };
 use rustc_span::def_id::DefId;
 
-use crate::operand::static_data::{add_allocation, reify_allocation_function};
+use crate::operand::static_data::{
+    AllocationOrigin, add_allocation, reify_allocation_function, static_address,
+};
+
+fn constant_use_site<'tcx>(
+    needle: &ConstOperand<'tcx>,
+    ctx: &MethodCompileCtx<'tcx, '_>,
+) -> Option<(usize, usize, u64)> {
+    struct Locator<'a, 'tcx> {
+        needle: &'a ConstOperand<'tcx>,
+        counts: std::collections::HashMap<(usize, usize), u64>,
+        found: Option<(usize, usize, u64)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for Locator<'_, 'tcx> {
+        fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, location: Location) {
+            let key = (location.block.index(), location.statement_index);
+            let ordinal = self.counts.entry(key).or_default();
+            if std::ptr::eq(constant, self.needle) {
+                self.found = Some((key.0, key.1, *ordinal));
+            }
+            *ordinal += 1;
+        }
+    }
+
+    let body = ctx.body_opt()?;
+    let mut locator = Locator {
+        needle,
+        counts: std::collections::HashMap::new(),
+        found: None,
+    };
+    locator.visit_body(body);
+    locator.found
+}
+
+fn allocation_origin_for_constant<'tcx>(
+    const_op: &ConstOperand<'tcx>,
+    constant: MirConst<'tcx>,
+    root: AllocId,
+    ctx: &MethodCompileCtx<'tcx, '_>,
+) -> AllocationOrigin {
+    let mut details = Vec::new();
+    match constant {
+        MirConst::Unevaluated(unevaluated, _) => {
+            details.push("unevaluated".to_owned());
+            details.push(
+                ctx.tcx()
+                    .def_path_str_with_args(unevaluated.def, unevaluated.args),
+            );
+            if let Some(promoted) = unevaluated.promoted {
+                details.push("promoted".to_owned());
+                details.push(promoted.index().to_string());
+            } else {
+                details.push("item-const".to_owned());
+            }
+        }
+        MirConst::Ty(..) => details.push("type-const".to_owned()),
+        MirConst::Val(..) => details.push("evaluated-const".to_owned()),
+    }
+    if let Some((block, statement, ordinal)) = constant_use_site(const_op, ctx) {
+        details.push("mir-use".to_owned());
+        details.push(block.to_string());
+        details.push(statement.to_string());
+        details.push(ordinal.to_string());
+    } else {
+        // Synthetic constants do not belong to the body's operand graph. Their callers supply a
+        // distinct domain; the allocation graph digest still distinguishes different contents.
+        details.push("synthetic-use".to_owned());
+    }
+    AllocationOrigin::for_current_instance(root, "mir-constant", details, ctx)
+}
+
+fn allocation_root(const_val: ConstValue) -> Option<AllocId> {
+    match const_val {
+        ConstValue::Scalar(Scalar::Ptr(ptr, _)) => Some(ptr.into_raw_parts().0.alloc_id()),
+        ConstValue::Slice { alloc_id, .. } | ConstValue::Indirect { alloc_id, .. } => {
+            Some(alloc_id)
+        }
+        ConstValue::Scalar(Scalar::Int(_)) | ConstValue::ZeroSized => None,
+    }
+}
 pub fn handle_constant<'tcx>(
     const_op: &ConstOperand<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
@@ -32,7 +113,9 @@ pub fn handle_constant<'tcx>(
             const_op.span,
         )
         .expect("Could not evaluate constant!");
-    load_const_value(val, constant.ty(), ctx)
+    let origin = allocation_root(val)
+        .map(|root| allocation_origin_for_constant(const_op, constant, root, ctx));
+    load_const_value_with_origin(val, constant.ty(), origin.as_ref(), ctx)
 }
 
 /// Returns the ops neceasry to create constant value of type `ty` with byte values matching the ones in the allocation
@@ -40,6 +123,7 @@ fn create_const_from_data<'tcx>(
     ty: Ty<'tcx>,
     alloc_id: AllocId,
     offset_bytes: u64,
+    origin: &AllocationOrigin,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Interned<CILNode> {
     let ty = ctx.monomorphize(ty);
@@ -48,7 +132,7 @@ fn create_const_from_data<'tcx>(
     if let GlobalAlloc::Memory(alloc) = ctx.tcx().global_alloc(alloc_id) {
         let const_alloc = alloc.inner();
         let align = const_alloc.align.bytes().max(1);
-        let mut bytes: Vec<u8> = const_alloc
+        let bytes: Vec<u8> = const_alloc
             .inspect_with_uninit_and_ptr_outside_interpreter(0..const_alloc.len())
             .into();
         // Right aligment, fits, and has no pointers - can be a scalar. ONLY at offset 0: this path
@@ -61,14 +145,10 @@ fn create_const_from_data<'tcx>(
             && bytes.len() <= 16
             && const_alloc.provenance().ptrs().is_empty()
         {
-            while bytes.len() < 16 {
-                bytes.push(0);
-            }
-            let scalar =
-                Scalar::from_u128(u128::from_ne_bytes(bytes.as_slice().try_into().unwrap()));
-            return load_const_scalar(scalar, ty, ctx).into();
+            let scalar = Scalar::from_u128(ctx.target_layout().decode_uint(&bytes));
+            return load_const_scalar(scalar, ty, None, ctx).into();
         }
-        let (ptr, align) = alloc_ptr_unaligned(alloc_id, &alloc, ctx);
+        let (ptr, align) = alloc_ptr_unaligned(alloc_id, &alloc, origin, ctx);
         // Apply the byte offset on the raw pointer (CIL `add` is byte arithmetic), mirroring
         // `load_scalar_ptr`'s `GlobalAlloc::Memory` arm.
         let ptr = if offset_bytes != 0 {
@@ -88,7 +168,7 @@ fn create_const_from_data<'tcx>(
         }
     }
 
-    let ptr = add_allocation(alloc_id.0.into(), ctx);
+    let ptr = add_allocation(alloc_id, origin, ctx);
     let ptr = if offset_bytes != 0 {
         ctx.biop(ptr, cilly::Const::USize(offset_bytes), cilly::BinOp::Add)
     } else {
@@ -102,8 +182,28 @@ pub fn load_const_value<'tcx>(
     const_ty: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Interned<CILNode> {
+    let origin = allocation_root(const_val).map(|root| {
+        AllocationOrigin::for_current_instance(
+            root,
+            "compiler-generated-constant",
+            [format!(
+                "{:032x}",
+                ctx.tcx().type_id_hash(ctx.monomorphize(const_ty))
+            )],
+            ctx,
+        )
+    });
+    load_const_value_with_origin(const_val, const_ty, origin.as_ref(), ctx)
+}
+
+fn load_const_value_with_origin<'tcx>(
+    const_val: ConstValue,
+    const_ty: Ty<'tcx>,
+    origin: Option<&AllocationOrigin>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Interned<CILNode> {
     match const_val {
-        ConstValue::Scalar(scalar) => load_const_scalar(scalar, const_ty, ctx),
+        ConstValue::Scalar(scalar) => load_const_scalar(scalar, const_ty, origin, ctx),
         ConstValue::ZeroSized => {
             let tpe = ctx.monomorphize(const_ty);
             assert!(
@@ -124,14 +224,25 @@ pub fn load_const_value<'tcx>(
             let ptr = if meta == 0 {
                 ctx.alloc_node(Const::USize(1 << 30))
             } else {
-                alloc_ptr(alloc_id, &data, ctx)
+                alloc_ptr(
+                    alloc_id,
+                    &data,
+                    origin.expect("slice allocation must have a semantic origin"),
+                    ctx,
+                )
             };
             let ptr = ctx.cast_ptr(ptr, Type::Void);
             let meta = ctx.alloc_node(Const::USize(meta));
             ctx.create_slice(slice_dotnet, ptr, meta)
         }
         ConstValue::Indirect { alloc_id, offset } => {
-            create_const_from_data(const_ty, alloc_id, offset.bytes(), ctx)
+            create_const_from_data(
+                const_ty,
+                alloc_id,
+                offset.bytes(),
+                origin.expect("indirect allocation must have a semantic origin"),
+                ctx,
+            )
             //todo!("Can't handle by-ref allocation {alloc_id:?} {offset:?}")
         } //_ => todo!("Unhandled const value {const_val:?} of type {const_ty:?}"),
     }
@@ -144,6 +255,7 @@ pub fn static_ty<'tcx>(def_id: DefId, tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
 fn load_scalar_ptr(
     ctx: &mut MethodCompileCtx<'_, '_>,
     ptr: rustc_middle::mir::interpret::Pointer,
+    origin: &AllocationOrigin,
 ) -> Interned<CILNode> {
     let (alloc_id, offset) = ptr.into_raw_parts();
     let global_alloc = ctx.tcx().global_alloc(alloc_id.alloc_id());
@@ -193,17 +305,13 @@ fn load_scalar_ptr(
             if let Some(section) = attrs.link_section {
                 panic!("static {name} requires special linkage in section {section:?}");
             }
-            let alloc = ctx
-                .tcx()
-                .eval_static_initializer(def_id)
-                .expect("No initializer??");
-            //def_id.ty();
-            let _memory = ctx.tcx().reserve_and_set_memory_alloc(alloc);
-            let alloc_id = alloc_id.alloc_id().0.into();
-            add_allocation(alloc_id, ctx)
+            // Preserve the static's Rust identity. Re-evaluating its initializer into a fresh
+            // anonymous Memory allocation gives every use of `static mut` a different backing
+            // cell and makes its emitted name depend on rustc's session-local AllocId counter.
+            static_address(def_id, ctx)
         }
         GlobalAlloc::Memory(const_allocation) => {
-            let ptr = alloc_ptr(alloc_id.alloc_id(), &const_allocation, ctx);
+            let ptr = alloc_ptr(alloc_id.alloc_id(), &const_allocation, origin, ctx);
             if offset.bytes() != 0 {
                 ctx.biop(ptr, cilly::Const::USize(offset.bytes()), cilly::BinOp::Add)
             } else {
@@ -241,12 +349,13 @@ fn load_scalar_ptr(
 fn alloc_ptr<'tcx>(
     alloc_id: AllocId,
     const_alloc: &rustc_middle::mir::interpret::ConstAllocation,
+    origin: &AllocationOrigin,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Interned<CILNode> {
-    let (ptr, align) = alloc_ptr_unaligned(alloc_id, const_alloc, ctx);
+    let (ptr, align) = alloc_ptr_unaligned(alloc_id, const_alloc, origin, ctx);
     // If alignment is small enough to be *guaranteed*, and no pointers are present.
     if align.is_some_and(|align| align <= ctx.const_align()) {
-        add_allocation(alloc_id.0.into(), ctx)
+        add_allocation(alloc_id, origin, ctx)
     } else {
         ptr
     }
@@ -256,6 +365,7 @@ fn alloc_ptr<'tcx>(
 fn alloc_ptr_unaligned<'tcx>(
     alloc_id: AllocId,
     const_alloc: &rustc_middle::mir::interpret::ConstAllocation,
+    origin: &AllocationOrigin,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> (Interned<CILNode>, Option<u64>) {
     let const_alloc = const_alloc.inner();
@@ -282,7 +392,7 @@ fn alloc_ptr_unaligned<'tcx>(
             )
         }
     } else {
-        (add_allocation(alloc_id.0.into(), ctx), None)
+        (add_allocation(alloc_id, origin, ctx), None)
     }
 }
 /// Load a scalar integer constant of `byte_size` bytes (its value already in `bits`), then
@@ -322,6 +432,7 @@ fn transmute_scalar_to(
 fn load_const_scalar<'tcx>(
     scalar: Scalar,
     scalar_type: Ty<'tcx>,
+    origin: Option<&AllocationOrigin>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Interned<CILNode> {
     let scalar_ty = ctx.monomorphize(scalar_type);
@@ -335,7 +446,11 @@ fn load_const_scalar<'tcx>(
                 .map(|ty| ctx.type_from_cache(ty))
                 .unwrap_or(Int::USize.into());
             let const_type_idx = ctx.alloc_type(const_type);
-            let ptr = load_scalar_ptr(ctx, ptr);
+            let ptr = load_scalar_ptr(
+                ctx,
+                ptr,
+                origin.expect("pointer constant must have a semantic allocation origin"),
+            );
 
             if matches!(scalar_type, Type::Ptr(_)) {
                 return ctx.cast_ptr(ptr, const_type_idx);
@@ -399,9 +514,9 @@ fn load_const_float(
                     MethodKind::Static,
                     vec![].into(),
                 );
-                let cst = asm.alloc_node(Const::F32(HashableF32(
-                    (f16::from_ne_bytes((u16::try_from(value).unwrap()).to_ne_bytes())) as f32,
-                )));
+                let cst = asm.alloc_node(Const::F32(HashableF32(f16::from_bits(
+                    u16::try_from(value).unwrap(),
+                ) as f32)));
                 asm.call(mref, &[cst], IsPure::PURE)
             }
             #[cfg(target_family = "windows")]
@@ -411,11 +526,11 @@ fn load_const_float(
             }
         }
         FloatTy::F32 => {
-            let value = f32::from_ne_bytes((u32::try_from(value).unwrap()).to_ne_bytes());
+            let value = f32::from_bits(u32::try_from(value).unwrap());
             asm.alloc_node(Const::F32(HashableF32(value))).into()
         }
         FloatTy::F64 => {
-            let value = f64::from_ne_bytes((u64::try_from(value).unwrap()).to_ne_bytes());
+            let value = f64::from_bits(u64::try_from(value).unwrap());
             asm.alloc_node(Const::F64(HashableF64(value))).into()
         }
         FloatTy::F128 => {
@@ -427,38 +542,44 @@ fn load_const_float(
 pub fn load_const_int(
     value: u128,
     int_type: IntTy,
-    asm: &mut Assembly,
+    ctx: &mut MethodCompileCtx<'_, '_>,
 ) -> Interned<cilly::ir::CILNode> {
     match int_type {
-        IntTy::I8 => asm.alloc_node(i8::from_ne_bytes([u8::try_from(value).unwrap()])),
-        IntTy::I16 => asm.alloc_node(i16::from_ne_bytes(
-            (u16::try_from(value).unwrap()).to_ne_bytes(),
-        )),
-        IntTy::I32 => asm.alloc_node(i32::from_ne_bytes(
-            (u32::try_from(value).unwrap()).to_ne_bytes(),
-        )),
-        IntTy::I64 => asm.alloc_node(i64::from_ne_bytes(
-            (u64::try_from(value).unwrap()).to_ne_bytes(),
-        )),
-        IntTy::Isize => asm.alloc_node(cilly::Const::ISize(i64::from_ne_bytes(
-            (u64::try_from(value).unwrap()).to_ne_bytes(),
-        ))),
         #[allow(clippy::cast_possible_wrap)]
-        IntTy::I128 => asm.alloc_node(value as i128),
+        IntTy::I8 => ctx.alloc_node(u8::try_from(value).unwrap() as i8),
+        #[allow(clippy::cast_possible_wrap)]
+        IntTy::I16 => ctx.alloc_node(u16::try_from(value).unwrap() as i16),
+        #[allow(clippy::cast_possible_wrap)]
+        IntTy::I32 => ctx.alloc_node(u32::try_from(value).unwrap() as i32),
+        #[allow(clippy::cast_possible_wrap)]
+        IntTy::I64 => ctx.alloc_node(u64::try_from(value).unwrap() as i64),
+        IntTy::Isize => {
+            let signed = match ctx.target_layout().pointer_bits() {
+                32 => i64::from(u32::try_from(value).unwrap() as i32),
+                64 => u64::try_from(value).unwrap() as i64,
+                width => unreachable!("unsupported target pointer width {width}"),
+            };
+            ctx.alloc_node(cilly::Const::ISize(signed))
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        IntTy::I128 => ctx.alloc_node(value as i128),
     }
 }
 pub fn load_const_uint(
     value: u128,
     int_type: UintTy,
-    asm: &mut Assembly,
+    ctx: &mut MethodCompileCtx<'_, '_>,
 ) -> Interned<cilly::ir::CILNode> {
     match int_type {
-        UintTy::U8 => asm.alloc_node(u8::try_from(value).unwrap()),
-        UintTy::U16 => asm.alloc_node(u16::try_from(value).unwrap()),
-        UintTy::U32 => asm.alloc_node(u32::try_from(value).unwrap()),
-        UintTy::U64 => asm.alloc_node(u64::try_from(value).unwrap()),
-        UintTy::Usize => asm.alloc_node(cilly::Const::USize(u64::try_from(value).unwrap())),
-        UintTy::U128 => asm.alloc_node(value),
+        UintTy::U8 => ctx.alloc_node(u8::try_from(value).unwrap()),
+        UintTy::U16 => ctx.alloc_node(u16::try_from(value).unwrap()),
+        UintTy::U32 => ctx.alloc_node(u32::try_from(value).unwrap()),
+        UintTy::U64 => ctx.alloc_node(u64::try_from(value).unwrap()),
+        UintTy::Usize => {
+            assert!(value <= ctx.target_layout().unsigned_pointer_max());
+            ctx.alloc_node(cilly::Const::USize(u64::try_from(value).unwrap()))
+        }
+        UintTy::U128 => ctx.alloc_node(value),
     }
 }
 
@@ -602,5 +723,11 @@ pub fn get_vtable<'tcx>(
     let alloc_id = fx.tcx().vtable_allocation((ty, trait_ref));
     // `vtable_allocation` has already materialized the exact self-describing memory allocation;
     // `add_allocation` derives its field size/alignment and relocations directly from that source.
-    add_allocation(alloc_id.0.get(), fx)
+    let origin = AllocationOrigin::for_current_instance(
+        alloc_id,
+        "vtable",
+        [format!("{:032x}", fx.tcx().type_id_hash(ty))],
+        fx,
+    );
+    add_allocation(alloc_id, &origin, fx)
 }

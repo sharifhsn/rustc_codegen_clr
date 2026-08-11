@@ -77,10 +77,14 @@ feasibility/dev.sh run <crate>        # build (forced relink) + run cargo_tests/
 feasibility/dev.sh buildstd           # shorthand for `run build_std` (real core+alloc+std)
 feasibility/dev.sh il <crate> <sym>   # disassemble method(s) whose mangled name contains <sym>
                                       #   e.g. `il build_std rust_alloc`  (uses ikdasm)
-feasibility/dev.sh gate               # force-rebuild + `cargo test ::stable` (CI skips), then DIFF
-                                      #   against the known-22 baseline and report only NEW failures
+feasibility/dev.sh gate               # force-rebuild + workspace/CIL/managed-storage invariant gates
 feasibility/dev.sh sh '<bash>'        # arbitrary command in the container (correct mount, color off)
 ```
+
+The historical direct-host `::stable` corpus is no longer baseline-suppressed by this gate. It does
+not provide the product build-std closure and has known retained-verifier and behavioral failures;
+run it explicitly when doing compatibility work. Product-shaped acceptance scripts are the runtime
+authority.
 
 The application-shaped newcomer example has its own acceptance check. It builds and runs the
 managed JSON CLI with a real input file, compares exact output, and verifies the malformed-input

@@ -1,5 +1,6 @@
 //! Idiomatic Rust wrapper over the managed `System.DateTimeOffset` value type.
 
+use crate::NativeStorageSafe;
 use crate::bcl::datetime::DateTime;
 use crate::bcl::timespan::DotNetTimeSpan;
 use crate::intrinsics::RustcCLRInteropManagedStruct;
@@ -20,6 +21,9 @@ type TimeSpanHandle = RustcCLRInteropManagedStruct<{ CORELIB }, "System.TimeSpan
 /// properties retain the genuine CLR `System.DateTimeOffset` identity.
 pub type DateTimeOffset =
     RustcCLRInteropManagedStruct<{ CORELIB }, { DATETIME_OFFSET }, DATETIME_OFFSET_SIZE>;
+// SAFETY: `System.DateTimeOffset` is a `DateTime` plus a signed offset; both are native scalar data
+// and the value contains no GC references.
+unsafe impl NativeStorageSafe for DateTimeOffset {}
 
 impl DateTimeOffset {
     /// Current local time with its local offset (`DateTimeOffset.Now`).

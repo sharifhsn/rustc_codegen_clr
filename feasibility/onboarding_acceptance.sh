@@ -10,7 +10,16 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/rustdotnet-onboarding.XXXXXX")"
 log_dir="${RCL_ONBOARDING_LOG_DIR:-$work/logs}"
 install_home="$work/install-home"
 cargo_home="$work/cargo-home"
-trap 'rm -rf "$work"' EXIT
+cleanup() {
+  status=$?
+  if [[ "$status" -eq 0 ]]; then
+    rm -rf "$work"
+  else
+    echo "onboarding acceptance failed; preserved work tree: $work" >&2
+    echo "onboarding acceptance logs: $log_dir" >&2
+  fi
+}
+trap cleanup EXIT
 
 if [[ ! -x "$driver" ]]; then
     echo "cargo-dotnet driver missing: $driver" >&2
@@ -40,10 +49,14 @@ grep -F 'cargo dotnet setup --from-repo /path/to/rustc_codegen_clr' \
 grep -F 'cargo dotnet bundle install /path/to/cargo-dotnet-sdk-<host>.zip' \
   "$log_dir/bare-install.log"
 
-# Keep every newcomer guide on the downloadable release installer. Source setup remains documented
-# for contributors, but it is not the normal first-user path.
+# Until the immutable 0.0.2 tag exists, every newcomer guide must use the honest source-candidate
+# setup path and must not advertise a release asset that returns 404.
 for guide in "$repo/README.md" "$repo/QUICKSTART.md" "$repo/docs/QUICKSTART_INTEROP.md"; do
-    grep -F 'releases/download/rust-dotnet-v0.0.2/install.sh' "$guide"
+    grep -F 'cargo run --release --manifest-path tools/cargo-dotnet/Cargo.toml -- setup --from-repo "$PWD"' "$guide"
+    if grep -F 'releases/download/rust-dotnet-v0.0.2/' "$guide"; then
+        echo "newcomer guide advertises an unpublished 0.0.2 release asset: $guide" >&2
+        exit 1
+    fi
     if head -n 40 "$guide" | grep -F 'cargo install --path tools/cargo-dotnet'; then
         echo "newcomer guide redundantly installs cargo-dotnet before setup: $guide" >&2
         exit 1
@@ -51,14 +64,16 @@ for guide in "$repo/README.md" "$repo/QUICKSTART.md" "$repo/docs/QUICKSTART_INTE
 done
 
 # Exercise the documented checkout bootstrap into isolated install/Cargo homes. The native setup
-# caller must reuse `driver` instead of compiling cargo-dotnet a second time in the legacy
-# provisioner. Keep the log: the explicit delegated message is the regression assertion.
+# caller must suppress the legacy provisioner's ambient front-end install, rebuild the installed
+# driver from the same immutable source snapshot as the backend, and promote that driver together
+# with the sealed SDK home. Keep the log: the delegated and activation messages are regression
+# assertions for those two boundaries.
 CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
   "$driver" setup --from-repo "$repo" --home "$install_home" \
   --skip-toolchain --skip-dotnet --force > "$log_dir/setup.log" 2>&1
 grep -F 'front-end install delegated to the native setup caller' "$log_dir/setup.log"
 grep -F 'PAL warm delegated to the native private-sysroot setup caller' "$log_dir/setup.log"
-grep -F "installed the already-built cargo-dotnet -> $cargo_home/bin/cargo-dotnet" \
+grep -F "activated SDK home $install_home and cargo-dotnet front-end $cargo_home/bin/cargo-dotnet" \
   "$log_dir/setup.log"
 if grep -F 'injecting dotnet PAL into rust-src' "$log_dir/setup.log"; then
   echo 'native setup unexpectedly mutated ambient rust-src through the legacy warm path' >&2
@@ -98,7 +113,8 @@ fresh_dotnet() {
 
 fresh_shell doctor --workspace "$work" --dotnet "$dotnet_version" \
   > "$log_dir/fresh-shell-doctor.log"
-grep -F "installed home $install_home" "$log_dir/fresh-shell-doctor.log"
+canonical_install_home="$(cd "$install_home" && pwd -P)"
+grep -F "installed home $canonical_install_home" "$log_dir/fresh-shell-doctor.log"
 
 fresh_shell new "$work/app" --app --dotnet "$dotnet_version" > "$log_dir/new-app.log"
 fresh_shell new "$work/lib" --lib --dotnet "$dotnet_version" > "$log_dir/new-lib.log"

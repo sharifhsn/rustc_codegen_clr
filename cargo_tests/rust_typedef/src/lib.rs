@@ -96,7 +96,6 @@ macro_rules! typedef_fields {
         typedef_fields!($typedef, $($tail)*)
     };
     ($typedef:ident, virtual fn $fname:ident($($args:tt)*)->$ret:ty{$($inner:tt)*}, $($tail:tt)*) => {
-        use super::*;
         mod $fname {
             use super::super::*;
             #[inline(never)]
@@ -105,9 +104,6 @@ macro_rules! typedef_fields {
             }
         }
         const FNAME: &str = stringify!($fname);
-        #[used]
-        static KEEP_FN: extern "C" fn($($args)*) -> $ret = $fname::rustc_codegen_clr_not_magic;
-
         $typedef = $crate::rustc_codegen_clr_add_method_def::<"pub", "virtual", FNAME, "", "", _>(
             $typedef,
             $fname::rustc_codegen_clr_not_magic,

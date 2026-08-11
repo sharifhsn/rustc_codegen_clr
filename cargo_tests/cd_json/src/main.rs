@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use mycorrhiza::bcl::json::{Json, Kind};
+use mycorrhiza::bindings::System::GC;
 use mycorrhiza::system::console::Console;
 
 fn main() -> std::process::ExitCode {
@@ -36,12 +37,21 @@ fn main() -> std::process::ExitCode {
         "address": { "city": "London", "zip": 90210 }
     }"#;
     let doc = Json::parse(src).expect("parse ok");
+    // `Json` owns only an opaque GCHandle token. Force a full collection after `parse` returns and
+    // before the first node access to prove the rooted document survives independently of any
+    // transient direct CLR local used by the try/catch call state.
+    GC::collect(2);
+    GC::wait_for_pending_finalizers();
+    GC::collect(2);
     chk!(doc.kind(), Kind::Object);
     chk!(doc.is_object(), true);
     chk!(doc.is_array(), false);
 
     // ---------- object navigation + scalar reads ----------
-    chk!(doc.get("name").and_then(|n| n.as_str()).as_deref(), Some("ada"));
+    chk!(
+        doc.get("name").and_then(|n| n.as_str()).as_deref(),
+        Some("ada")
+    );
     chk!(doc.get("age").and_then(|n| n.as_i64()), Some(36));
     chk!(doc.get("score").and_then(|n| n.as_f64()), Some(3.5));
     chk!(doc.get("active").and_then(|n| n.as_bool()), Some(true));
@@ -69,9 +79,18 @@ fn main() -> std::process::ExitCode {
     chk!(tags.is_array(), true);
     chk!(tags.len(), 3);
     chk!(tags.is_empty(), false);
-    chk!(tags.index(0).and_then(|n| n.as_str()).as_deref(), Some("alpha"));
-    chk!(tags.index(1).and_then(|n| n.as_str()).as_deref(), Some("beta"));
-    chk!(tags.index(2).and_then(|n| n.as_str()).as_deref(), Some("gamma"));
+    chk!(
+        tags.index(0).and_then(|n| n.as_str()).as_deref(),
+        Some("alpha")
+    );
+    chk!(
+        tags.index(1).and_then(|n| n.as_str()).as_deref(),
+        Some("beta")
+    );
+    chk!(
+        tags.index(2).and_then(|n| n.as_str()).as_deref(),
+        Some("gamma")
+    );
     chk!(tags.index(3).is_none(), true); // out of range → None
     chk!(tags.index(-1).is_none(), true); // negative → None
 
@@ -82,7 +101,10 @@ fn main() -> std::process::ExitCode {
     // ---------- nested object ----------
     let addr = doc.get("address").expect("address present");
     chk!(addr.kind(), Kind::Object);
-    chk!(addr.get("city").and_then(|n| n.as_str()).as_deref(), Some("London"));
+    chk!(
+        addr.get("city").and_then(|n| n.as_str()).as_deref(),
+        Some("London")
+    );
     chk!(addr.get("zip").and_then(|n| n.as_i64()), Some(90210));
 
     // ---------- top-level array document ----------
@@ -116,11 +138,19 @@ fn main() -> std::process::ExitCode {
     // Display uses the same serializer.
     chk!(std::format!("{compact}").as_str(), r#"{"a":1,"b":[2,3]}"#);
     // a nested node serializes just its sub-tree.
-    chk!(compact.get("b").map(|b| b.to_json_string()).as_deref(), Some("[2,3]"));
+    chk!(
+        compact.get("b").map(|b| b.to_json_string()).as_deref(),
+        Some("[2,3]")
+    );
     // re-parsing the serialized form navigates identically.
     let rt = Json::parse(&compact.to_json_string()).expect("round-trip parse");
     chk!(rt.get("a").and_then(|n| n.as_i64()), Some(1));
-    chk!(rt.get("b").and_then(|t| t.index(1)).and_then(|n| n.as_i64()), Some(3));
+    chk!(
+        rt.get("b")
+            .and_then(|t| t.index(1))
+            .and_then(|n| n.as_i64()),
+        Some(3)
+    );
 
     Console::writeln_u64(pass as u64);
     Console::writeln_u64(total as u64);

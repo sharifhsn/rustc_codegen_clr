@@ -1,5 +1,5 @@
 use crate::{
-    FromManagedSafe, IntoManagedSafe, ManagedSafe,
+    FromManagedSafe, IntoManagedSafe, ManagedSafe, NativeStorageSafe,
     intrinsics::{
         RustcCLRInteropManagedClass, RustcCLRInteropManagedGeneric, RustcCLRInteropManagedStruct,
     },
@@ -9,6 +9,9 @@ type GCHandle = RustcCLRInteropManagedStruct<
     "System.Runtime.InteropServices.GCHandle",
     { size_of::<usize>() },
 >;
+// SAFETY: `System.Runtime.InteropServices.GCHandle` is represented by one native `IntPtr`; the CLR
+// object is rooted by the runtime handle table, not by a GC reference embedded in these bytes.
+unsafe impl NativeStorageSafe for GCHandle {}
 pub struct Class<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str> {
     handle: GCHandle,
 }

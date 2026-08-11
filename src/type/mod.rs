@@ -157,7 +157,9 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
     // method's definition-shape signature), never as a runtime value, so the usual ZST→Void
     // collapse would erase them. Exempt them before the ZST early-return.
     let is_generic_marker = if let TyKind::Adt(def, _) = ty.kind() {
-        if !crate::utilis::is_mycorrhiza_intrinsic(ctx.tcx(), def.did()) {
+        if !crate::utilis::is_mycorrhiza_intrinsic(ctx.tcx(), def.did())
+            || !crate::managed_storage::is_managed_interop_type(ty, ctx)
+        {
             false
         } else {
             let item_name = ctx.tcx().item_name(def.did());
@@ -226,19 +228,9 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
         TyKind::Float(float) => from_float(float),
         TyKind::Foreign(_foregin) => Type::Void,
         TyKind::FnDef(_did, _subst) => Type::Void,
-        TyKind::FnPtr(sig, _) => {
-            let sig = ctx.tcx().normalize_erasing_late_bound_regions(
-                rustc_middle::ty::TypingEnv::fully_monomorphized(),
-                *sig,
-            );
-            //let sig = crate::function_sig::from_poly_sig(method, tcx, self, sig);
-            let output = get_type(ctx.monomorphize(sig.output()), ctx);
-            let inputs: Box<[Type]> = sig
-                .inputs()
-                .iter()
-                .map(|input| get_type(ctx.monomorphize(*input), ctx))
-                .collect();
-            let sig = ctx.sig(inputs, output);
+        TyKind::FnPtr(sig, header) => {
+            let plan = crate::abi::AbiPlan::from_fn_ptr(sig.with(*header), ctx);
+            let sig = ctx.alloc_sig(plan.signature().clone());
             Type::FnPtr(sig)
         }
         TyKind::Int(int) => from_int(int),
@@ -338,6 +330,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             let item_name = ctx.tcx().item_name(def.did());
             let item_name = item_name.as_str();
             let is_interop_adt = crate::utilis::is_mycorrhiza_intrinsic(ctx.tcx(), def.did())
+                && crate::managed_storage::is_managed_interop_type(ty, ctx)
                 && matches!(
                     item_name,
                     INTEROP_CLASS_TPE_NAME
@@ -555,6 +548,15 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
         // the .NET type is just the base's. (Matches how rustc_codegen_ssa looks through
         // `ty::Pat`.) This is pattern-agnostic — it holds for `NotNull`, `Range`, and `Or`.
         TyKind::Pat(base, _) => get_type(*base, ctx),
+        // An unsafe binder only binds otherwise-inexpressible lifetimes; its runtime storage and
+        // CIL representation are exactly those of the inner type. Instantiate the bound regions
+        // with erased regions before recurring, matching rustc's own layout query.
+        TyKind::UnsafeBinder(bound_ty) => {
+            let inner = ctx
+                .tcx()
+                .instantiate_bound_regions_with_erased((*bound_ty).into());
+            get_type(inner, ctx)
+        }
         _ => todo!("Can't yet get type {ty:?} from type cache."),
     }
 }
@@ -568,6 +570,10 @@ pub fn fixed_array(
     align: u64,
 ) -> Interned<ClassRef> {
     assert_ne!(requested_size, 0);
+    assert!(
+        !element.contains_gcref(asm),
+        "a fixed Rust array cannot contain a naked CLR GC reference; use a GCHandle-backed wrapper"
+    );
     // Key the synthetic type by the caller-known Rust storage request, not by opportunistic local
     // ClassDef availability. Two shards must derive the same identity even if only one currently
     // carries the element's authoritative managed-sidecar definition; post-link merging will then
@@ -706,6 +712,11 @@ pub fn fat_ptr_to<'tcx>(
     let name = ctx.alloc_string(name);
     let cref = ctx.alloc_class_ref(ClassRef::new(name, None, true, [].into()));
     if ctx.class_ref_to_def(cref).is_none() {
+        let pointer_bytes = u32::try_from(ctx.target_layout().pointer_bytes())
+            .expect("supported pointer width exceeds u32");
+        let fat_pointer_bytes = pointer_bytes
+            .checked_mul(2)
+            .expect("fat-pointer size exceeds u32");
         let def = ClassDef::new(
             name,
             true,
@@ -720,13 +731,13 @@ pub fn fat_ptr_to<'tcx>(
                 (
                     Type::Int(Int::USize),
                     ctx.alloc_string(cilly::METADATA),
-                    Some(8),
+                    Some(pointer_bytes),
                 ),
             ],
             vec![],
             Access::Public,
-            Some(NonZeroU32::new(16).unwrap()),
-            Some(NonZeroU32::new(8).unwrap()),
+            Some(NonZeroU32::new(fat_pointer_bytes).unwrap()),
+            Some(NonZeroU32::new(pointer_bytes).unwrap()),
             true,
         );
         ctx.class_def(def).unwrap();
@@ -851,78 +862,9 @@ struct OverlapField<'tcx> {
 fn rust_ty_contains_managed_value<'tcx>(
     ty: Ty<'tcx>,
     ctx: &MethodCompileCtx<'tcx, '_>,
-    depth: u32,
+    _depth: u32,
 ) -> bool {
-    if depth > 64 {
-        return true;
-    }
-    let ty = ctx.monomorphize(ty);
-    if is_zst(ty, ctx.tcx()) {
-        return false;
-    }
-    match ty.kind() {
-        TyKind::Adt(def, args) => {
-            let item = ctx.tcx().item_name(def.did());
-            if crate::utilis::is_mycorrhiza_intrinsic(ctx.tcx(), def.did())
-                && matches!(
-                    item.as_str(),
-                    INTEROP_CLASS_TPE_NAME
-                        | INTEROP_GENERIC_TPE_NAME
-                        | INTEROP_ARR_TPE_NAME
-                        | INTEROP_STRUCT_TPE_NAME
-                        | INTEROP_GENERIC_STRUCT_TPE_NAME
-                        | INTEROP_TYPE_GENERIC_TPE_NAME
-                        | INTEROP_METHOD_GENERIC_TPE_NAME
-                        | INTEROP_BYREF_TPE_NAME
-                )
-            {
-                return true;
-            }
-            def.all_fields().any(|field| {
-                let field_ty = ctx.monomorphize(field.ty(ctx.tcx(), args).skip_normalization());
-                rust_ty_contains_managed_value(field_ty, ctx, depth + 1)
-            })
-        }
-        TyKind::Closure(_, args) => args
-            .as_closure()
-            .upvar_tys()
-            .iter()
-            .any(|field| rust_ty_contains_managed_value(field, ctx, depth + 1)),
-        TyKind::Coroutine(def_id, args) => {
-            let args = args.as_coroutine();
-            args.upvar_tys()
-                .iter()
-                .any(|field| rust_ty_contains_managed_value(field, ctx, depth + 1))
-                || args.state_tys(*def_id, ctx.tcx()).any(|variant| {
-                    variant
-                        .into_iter()
-                        .any(|field| rust_ty_contains_managed_value(field, ctx, depth + 1))
-                })
-        }
-        TyKind::Tuple(fields) => fields
-            .iter()
-            .any(|field| rust_ty_contains_managed_value(field, ctx, depth + 1)),
-        TyKind::Array(field, _) => rust_ty_contains_managed_value(*field, ctx, depth + 1),
-        TyKind::Pat(base, _) => rust_ty_contains_managed_value(*base, ctx, depth + 1),
-        // Rust references/raw pointers and fat pointers are native pointer values. Their pointee may
-        // describe a managed marker, but the pointer itself is not a GC-tracked object reference.
-        TyKind::Ref(..)
-        | TyKind::RawPtr(..)
-        | TyKind::FnPtr(..)
-        | TyKind::Dynamic(..)
-        | TyKind::Bool
-        | TyKind::Char
-        | TyKind::Int(..)
-        | TyKind::Uint(..)
-        | TyKind::Float(..)
-        | TyKind::Never
-        | TyKind::Foreign(..)
-        | TyKind::FnDef(..)
-        | TyKind::Bound(..) => false,
-        TyKind::Slice(field) => rust_ty_contains_managed_value(*field, ctx, depth + 1),
-        TyKind::Alias(..) => true,
-        _ => false,
-    }
+    crate::managed_storage::storage_violation(ty, ctx).is_some()
 }
 
 /// Converts Rust's union-style field placement into a CoreCLR-GC-safe physical layout.

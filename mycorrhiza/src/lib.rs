@@ -74,7 +74,8 @@
     core_intrinsics,
     adt_const_params,
     unsized_const_params,
-    inherent_associated_types
+    inherent_associated_types,
+    rustc_attrs
 )]
 #[allow(non_snake_case, unused_imports)]
 pub mod bindings;
@@ -198,6 +199,85 @@ macro_rules! start {
 /// 3. .NET objects
 /// 4. .NET valuetypes
 pub unsafe trait ManagedSafe {}
+
+/// Unsafe capability for values whose complete Rust representation may live in native byte
+/// storage even though they participate in managed interop.
+///
+/// Unlike [`ManagedSafe`], this is deliberately not blanket-implemented for CLR value types: a CLR
+/// struct may itself contain object references and therefore require a GC map/write barrier. The
+/// backend recognizes this exact diagnostic item when deciding whether arrays, `Vec`, `Box`,
+/// statics, and bulk copies are sound.
+///
+/// # Safety
+/// Every bit pattern/move/copy permitted by the Rust type's public API must remain valid without a
+/// CLR GC descriptor or write barrier. Implementors must contain only native/blittable bytes or
+/// independently rooted opaque tokens (for example a `GCHandle`).
+#[rustc_diagnostic_item = "rustc_codegen_clr_native_storage_safe"]
+pub unsafe trait NativeStorageSafe {}
+
+macro_rules! native_storage_safe_primitives {
+    ($($ty:ty),+ $(,)?) => {
+        $(unsafe impl NativeStorageSafe for $ty {})+
+    };
+}
+
+native_storage_safe_primitives! {
+    (), bool, char,
+    u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, usize, isize,
+    f32, f64,
+}
+
+unsafe impl<T: NativeStorageSafe, const N: usize> NativeStorageSafe for [T; N] {}
+unsafe impl<T: NativeStorageSafe> NativeStorageSafe for Option<T> {}
+unsafe impl<T: NativeStorageSafe, E: NativeStorageSafe> NativeStorageSafe for Result<T, E> {}
+unsafe impl<A: NativeStorageSafe, B: NativeStorageSafe> NativeStorageSafe for (A, B) {}
+unsafe impl<A: NativeStorageSafe, B: NativeStorageSafe, C: NativeStorageSafe> NativeStorageSafe
+    for (A, B, C)
+{
+}
+
+/// Unsafe opt-in for the foundational marker types whose Rust definitions are replaced by CLR
+/// class/value/array/byref types by `rustc_codegen_clr`.
+///
+/// This is intentionally distinct from [`NativeStorageSafe`]: most managed interop types are
+/// *not* legal Rust-owned bytes. The backend requires this capability in addition to the exact
+/// marker name/path so a safe replacement crate named `mycorrhiza` cannot acquire CLR ABI and GC
+/// semantics merely by copying a private documentation marker.
+///
+/// # Safety
+/// Implementing this trait promises that the type is one of the backend's signature-only raw
+/// interop representations and that its const/type parameters describe the CLR identity expected
+/// by that representation. Incorrect implementations can make safe Rust values be interpreted as
+/// CLR object references or managed byrefs.
+#[doc(hidden)]
+#[rustc_diagnostic_item = "rustc_codegen_clr_managed_interop_type"]
+pub unsafe trait ManagedInteropType {}
+
+/// Unsafe opt-in for managed interop values that may be boxed behind a `GCHandle` and later
+/// recovered as an ordinary CLR local.
+///
+/// Managed byrefs and signature-only `!N`/`!!N` markers deliberately do not implement this trait:
+/// neither denotes a heap-rootable runtime object/value. CLR object/array references and boxable
+/// CLR value types do implement it.
+///
+/// # Safety
+/// Implementors must denote a concrete CLR runtime type accepted by `box`/`unbox.any` (or a CLR
+/// reference type accepted by `castclass`) and must not contain a managed byref whose lifetime would
+/// be extended by rooting.
+#[doc(hidden)]
+pub unsafe trait ManagedRootableType: ManagedInteropType {}
+
+/// Unsafe opt-in for raw interop types whose CLR representation is a nullable GC reference.
+///
+/// This is narrower than [`ManagedInteropType`]: value types, managed byrefs, and signature-only
+/// generic placeholders cannot be tested for reference null and therefore cannot back
+/// [`managed_option::ManagedOption`].
+///
+/// # Safety
+/// Implementors must lower to a CLR object or array reference for which managed `null` is a valid
+/// value and `rustc_clr_interop_managed_is_null` has reference semantics.
+#[doc(hidden)]
+pub unsafe trait ManagedReferenceType: ManagedRootableType {}
 macro_rules! managed_safe {
     ($t:ty) => {
        unsafe impl ManagedSafe for $t{}

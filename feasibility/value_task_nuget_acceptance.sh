@@ -5,22 +5,36 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-driver="$repo/target/release/cargo-dotnet"
+source_driver="$repo/target/release/cargo-dotnet"
+driver="$source_driver"
 dotnet_version="${DOTNET_VERSION:-10}"
 work="${RCL_VALUE_TASK_WORK_DIR:-$(mktemp -d)}"
 logs="${RCL_VALUE_TASK_LOG_DIR:-$work/logs}"
-package="$work/package"
-feed="$work/feed"
 consumer="$work/consumer"
+package="$work/package"
+feed="$consumer/local-feed"
+fresh_clone="$work/fresh-clone"
+cargo_home="$work/cargo-home"
+install_home="$work/sdk-home"
 
 cleanup() {
+    local status=$?
+    if [[ "${BASH_SUBSHELL:-0}" -ne 0 ]]; then
+        return "$status"
+    fi
+    if [[ "$status" -ne 0 ]]; then
+        echo "value_task_nuget_acceptance failed; retained work: $work" >&2
+        echo "logs: $logs" >&2
+        return "$status"
+    fi
     if [[ -z "${RCL_VALUE_TASK_WORK_DIR:-}" && "${RCL_VALUE_TASK_KEEP_WORK:-0}" != 1 ]]; then
         rm -rf "$work"
     fi
 }
 trap cleanup EXIT
 
-mkdir -p "$package" "$feed" "$consumer/src" "$logs"
+mkdir -p "$package" "$feed" "$consumer/src" "$logs" "$work/cache"
+export CARGO_DOTNET_CACHE_HOME="$work/cache"
 
 # Unquoted delimiter: the csproj needs $dotnet_version expanded (everything else is literal XML).
 cat > "$package/AsyncFixture.csproj" <<EOF
@@ -121,6 +135,17 @@ cargo build --manifest-path "$repo/tools/cargo-dotnet/Cargo.toml" --release \
 [[ -x "$driver" ]]
 cargo build --release --workspace > "$logs/backend-build.log" 2>&1
 
+# `restore` is an installed-SDK operation: provision the exact source snapshot into this fixture's
+# isolated SDK/Cargo homes, then use that installed driver for generation, recovery, and execution.
+# This also proves the generated async surface does not depend on checkout-mode path discovery.
+CARGO_HOME="$cargo_home" CARGO_DOTNET_HOME="$install_home" \
+    "$source_driver" setup --from-repo "$repo" --home "$install_home" \
+    --skip-toolchain --skip-dotnet --force > "$logs/setup.log" 2>&1
+driver="$cargo_home/bin/cargo-dotnet"
+[[ -x "$driver" ]]
+export CARGO_HOME="$cargo_home"
+export CARGO_DOTNET_HOME="$install_home"
+
 (
     cd "$consumer"
     "$driver" add-nuget RustcCodegenClr.AsyncFixture 1.0.0 . --force --source "$feed" \
@@ -134,6 +159,29 @@ rg -q 'fn get_answer_async\(self\) -> mycorrhiza::task::ValueTaskT<i32>' "$bindi
 rg -q 'self\.instance0::<"GetAnswerAsync", mycorrhiza::task::ValueTaskT<i32>>' "$bindings"
 rg -q 'fn stream_async\(self\) -> mycorrhiza::enumerate_async::IAsyncEnumerable<i32>' "$bindings"
 rg -q 'self\.instance0::<"StreamAsync", mycorrhiza::enumerate_async::IAsyncEnumerable<i32>>' "$bindings"
+
+# Prove the checked-in dependency record is sufficient in a real fresh-clone shape. The local
+# feed lives below the project and is recorded project-relative; remove the original checkout and
+# all gitignored staged/cache output before asking `restore` to reproduce the exact RID/TFM/feed.
+cp -R "$consumer" "$fresh_clone"
+rm -rf "$fresh_clone/.cargo-dotnet-nuget-assets" "$fresh_clone/target"
+mv "$consumer" "$work/original-unavailable"
+consumer="$fresh_clone"
+rg -q '"schema": 1' "$consumer/.cargo-dotnet-nuget-deps.json"
+rg -q '"path": "local-feed"' "$consumer/.cargo-dotnet-nuget-deps.json"
+"$driver" restore "$consumer" --dotnet "$dotnet_version" \
+    > "$logs/fresh-clone-restore.log" 2>&1
+[[ -f "$consumer/.cargo-dotnet-nuget-assets/manifest.json" ]]
+
+# Immutable NuGet cache objects retain selected assets only. Neither the old nor rebound local
+# source path (and therefore no private-feed URL/token) may survive in their bytes.
+if rg -a -F "$work/original-unavailable/local-feed" "$work/cache/nuget/v4/objects" \
+    > "$logs/source-leak.log" 2>&1 \
+    || rg -a -F "$fresh_clone/local-feed" "$work/cache/nuget/v4/objects" \
+        >> "$logs/source-leak.log" 2>&1; then
+    echo "NuGet cache leaked a source path" >&2
+    exit 1
+fi
 
 for profile in release debug; do
     CARGO_DOTNET_BACKEND=native \

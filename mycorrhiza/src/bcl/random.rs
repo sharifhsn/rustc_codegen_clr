@@ -50,6 +50,7 @@ pub type MRandom =
 /// Move-only (a plain handle to a managed object; the .NET GC owns the object, so there is no
 /// `Drop`). See the [module docs](self) for the full member mapping and semantics.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Random(MRandom);
 
 impl Random {

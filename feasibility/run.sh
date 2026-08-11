@@ -4,7 +4,7 @@
 #
 #   feasibility/run.sh build      # build cilly + the codegen backend
 #   feasibility/run.sh smoke      # compile+run a Rust program on .NET
-#   feasibility/run.sh test       # run cargo test ::stable subset
+#   feasibility/run.sh test       # run the current compiler/linker invariant gates
 #   feasibility/run.sh demo       # Rust -> C# interop demo
 #   feasibility/run.sh shell      # drop into a shell in the container
 #

@@ -25,9 +25,8 @@ The backend's intrinsic dispatch (`src/terminator/call.rs` → `src/terminator/i
 entire generic-argument list, including the `AtomicOrdering` const generic. Both examples above
 stem to the literal string `"atomic_load"`. Grepping the live codegen path for
 `AtomicOrdering`/`ORD_SUCC`/`ORD_FAIL` finds no hits — the ordering argument is **never read**
-anywhere that actually runs. (`src/builder.rs` has ordering-aware `todo!()` stubs, but that file
-has no `mod builder;` entry in `src/lib.rs` and is not compiled into the crate — dead scaffolding,
-not a second dispatch route.)
+anywhere that actually runs. Historical ordering-aware builder scaffolding was never part of this
+dispatch path and has since been removed.
 
 **Consequence**: every Rust ordering variant of a given atomic operation lowers to bit-identical
 CIL. This document is therefore a table of `operation -> CIL`, and each lowering must be sound
@@ -104,7 +103,7 @@ actually exercise this on real weak-memory hardware, within the calibration limi
 
 ### 3.3 Optimizer soundness gap — volatile flag silently dropped on local-address folds
 
-Independent of the two lowering cells above, the V2 optimizer had a peephole rewrite that
+Independent of the two lowering cells above, the interned-IR optimizer had a peephole rewrite that
 collapsed `ldind`/`stind` against a directly-owned local's address (`ldloca X` / `ldarga X`) down
 to a plain `ldloc X` / `stloc X` — **discarding the `volatile` flag regardless of its value**
 (`cilly/src/ir/opt/opt_node.rs`, the `LdInd { addr: LdLocA(loc), .. }` arm; `cilly/src/ir/opt/root.rs`,
@@ -115,7 +114,7 @@ In practice this could not fire for `atomic_load`/`atomic_store` before the fixe
 operate through raw pointers passed into the intrinsic, not `LdLocA` of a directly-owned local),
 but it is a latent hole for `volatile_load`/`volatile_store` (reachable from
 `std::ptr::read_volatile`/`write_volatile`) and for the newly-`volatile_load`-based `atomic_load`
-if the optimizer or inliner ever produces that shape. Since this is in `cilly/src/ir/opt/` (not
+if an optimizer rewrite ever produces that shape. Since this is in `cilly/src/ir/opt/` (not
 `typecheck.rs`, which is off-limits), it was in scope to fix.
 
 **Fix**: both rewrite rules now guard on `!volatile` — the fold only fires for non-volatile
@@ -132,12 +131,10 @@ any exporter.
 | `volatile_load`/`atomic_load_{acquire,seqcst,unordered}` (dead arm, see §7) | n/a | `volatile.ldind` via `volitale_load` | Acquire | already sound, unchanged |
 | `volatile_store` | n/a | `volatile.stind` via `make_store_volatile` | Release | already sound (volatile_store has no SeqCst Rust caller), unchanged |
 | `atomic_xchg`, ptr/native-width int/float fallthrough | (identical) | `Interlocked.Exchange(ref T, T)` | full fence | all orderings |
-| `atomic_xchg`, U8/Bool (.NET 8 only) | (identical) | `atomic_xchng_u8` builtin: `volatile.` ld then `volatile.` st, **no CAS/lock** | none (not atomic against a racing writer) | **NOT SOUND** — see §6 known-unsound residual |
-| `atomic_xchg`, I8/U16/I16 (.NET 8) | (identical) | `atomic_xchng{8,16}_correct`: masked 32-bit `Interlocked.CompareExchange` retry loop | full fence | all orderings |
-| `atomic_xchg`, sub-word int (.NET 9) | (identical) | native `Interlocked.Exchange` overload | full fence | all orderings |
+| `atomic_xchg`, U8/I8/U16/I16/Bool | (identical) | .NET 10: native `Interlocked.Exchange`; Unity preview: `atomic_xchng{8,16}_correct` masked 32-bit CAS loop (Bool bridges through U8) | full fence | all orderings |
 | `atomic_cxchg[weak]`, ptr/native-width int | (identical) | `Interlocked.CompareExchange(ref T, T, T)` | full fence | all orderings |
-| `atomic_cxchg[weak]`, U8/I8/U16/I16 (.NET 8) | (identical) | `atomic_cmpxchng{8,16}_correct`: masked 32-bit `Interlocked.CompareExchange` loop, comparand-checked | full fence | all orderings |
-| rmw family (`xadd`/`xsub`/`or`/`xor`/`and`/`nand`/`min`/`max`/`umin`/`umax`), widths 1–8 | (identical) | CAS retry loop on `compare_exchange`: width 4–8 → `Interlocked.CompareExchange`; width 1–2 → masked-32-bit `_correct` loop | full fence | all orderings |
+| `atomic_cxchg[weak]`, U8/I8/U16/I16 | (identical) | .NET 10: native `Interlocked.CompareExchange`; Unity preview: `atomic_cmpxchng{8,16}_correct` masked loop with an exact comparand check | full fence | all orderings |
+| rmw family (`xadd`/`xsub`/`or`/`xor`/`and`/`nand`/`min`/`max`/`umin`/`umax`), widths 1–8 | (identical) | Generated CAS retry loop for the complete signed/unsigned integer matrix; exact .NET 10 32/64-bit `Interlocked.And`/`Or` overloads are an optional fast path, while Unity remains on the generated loop | full fence | all orderings |
 | `atomic_fence` / `atomic_singlethreadfence` | (identical) | `Thread.MemoryBarrier()` | full fence | all orderings (compiler-fence is over-strong; harmless) |
 
 ## 5. Litmus methodology and results
@@ -327,17 +324,11 @@ a scaling or correctness risk.
   `demangled_to_stem`/intrinsic dispatch, out of scope for a "close the correctness question" pass.
   Tracked as a legitimate follow-up, not a defect — the current lowering is sound, just not
   minimal.
-- **`atomic_xchng_u8` / the `Bool`-via-U8 bridge on .NET 8** remain genuinely non-atomic (plain
-  `volatile.` ld/st with no CAS or lock at all between them — a lost-update race against a
-  concurrent writer of the same byte, not merely a fence-ordering gap). This is reachable from
-  100% safe/stable Rust via `AtomicU8::swap`/`AtomicBool::swap` (both call the `xchg` intrinsic per
-  `core::sync::atomic`'s `atomic_swap` helper), contradicting an in-repo comment that had called it
-  "unreachable from safe stable Rust." **This was NOT fixed in this pass** — fixing it means
-  routing U8/Bool `xchg` through the existing masked-32-bit `_correct` CAS-loop builtin (the same
-  one `I8`/`U16`/`I16` already use) instead of the bespoke non-atomic `atomic_xchng_u8` builtin, a
-  change to `cilly/src/ir/builtins/atomics.rs` dispatch, not a memory-ordering fix — filing this as
-  a follow-up rather than attempting a same-session backend surgery beyond this task's scope of
-  "the memory-model question." Tracked here explicitly so it is not silently dropped.
+- **The Unity preview's subword fallback is a containing-word CAS.** It is now genuinely atomic for
+  U8/I8/U16/I16 and Bool—including `swap`—but it aligns the address down to a 32-bit word and is
+  therefore intentionally isolated from the public .NET 10 path. The public path uses the runtime's
+  exact subword `Interlocked` overloads and has no surrounding-word access. Unity is a separate,
+  pinned preview profile rather than part of the public SDK compatibility matrix.
 - **Mixed-size / overlapping access** (e.g. one thread doing a `u8` atomic op while another does a
   `u32` atomic op on overlapping memory) is not covered by any litmus test here — Rust does not
   guarantee anything about this either, so it is out of scope by definition, not an oversight.
@@ -384,8 +375,8 @@ runs (300,000 iterations each) against a native-oracle-calibrated harness on rea
 hardware, plus the fuller `pal_litmus` MP/SB/LB/IRIW sweep in §5.4 (subject to the calibration
 limits in §5.6 — the MP and LB backend zero results are corroborating, not independently
 calibration-proven, for those two shapes).
-`cargo test -p cilly --lib` (186 tests) remained green throughout. The xchg/cxchg/rmw/fence
-families were already sound and are unchanged. One known-unsound residual (`AtomicU8::swap`/
-`AtomicBool::swap` on .NET 8 — a lost-update race, not a fence gap) was newly identified as
-reachable from safe stable Rust (contradicting a prior in-repo "unreachable" comment) and is
-explicitly deferred as a follow-up, not silently left undocumented.
+The xchg/cxchg/rmw/fence families use a complete generated integer matrix. Public .NET 10 selects
+native subword exchange/compare-exchange and exact 32/64-bit And/Or fast paths; the retained Unity
+preview selects the masked-CAS helpers for all subword swaps and comparisons and the generated CAS
+loops for And/Or. In particular, safe `AtomicU8::swap` and `AtomicBool::swap` no longer pass through
+the former volatile-load/store helper.

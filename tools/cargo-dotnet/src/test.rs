@@ -58,6 +58,7 @@ fn run_native_tests(ctx: &Context, libtest_args: &[String]) -> Result<i32> {
     // full test build on a crate that would otherwise fail the harness run with
     // `FileNotFoundException` — see `pipeline::run_native`'s identical call for the full doc.
     nuget::ensure_staged(ctx)?;
+    let nuget_lease = nuget::acquire_project_lease(&ctx.crate_dir)?;
     let json = buildstd::build_with_sysroot(ctx, &private_sysroot)?;
     let art = artifact::locate(&json, ctx)?;
     crate::receipt::write(ctx, &art, &private_sysroot)?;
@@ -67,7 +68,7 @@ fn run_native_tests(ctx: &Context, libtest_args: &[String]) -> Result<i32> {
             // NuGet runtime closure next to it as any other build/run artifact (see
             // `pipeline::run_native`'s identical copy_assets call for the full doc).
             if let Some(out_dir) = exe.parent() {
-                nuget::copy_assets(&ctx.crate_dir, out_dir)?;
+                nuget_lease.copy_assets(out_dir)?;
             }
             eprintln!("== running #[test] harness on .NET: {} ==", exe.display());
             // The located executable IS the libtest harness; forward the libtest args.

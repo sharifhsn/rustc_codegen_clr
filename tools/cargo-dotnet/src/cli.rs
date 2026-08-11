@@ -422,6 +422,11 @@ pub struct DoctorArgs {
     /// required check fails, while failure-translation reports return 0.
     #[arg(long)]
     pub json: bool,
+
+    /// Rehash every cached private-sysroot and ambient-toolchain leaf. This is intentionally
+    /// expensive; normal builds use bounded typed-receipt validation instead.
+    #[arg(long)]
+    pub full_integrity: bool,
 }
 
 #[derive(clap::Args)]

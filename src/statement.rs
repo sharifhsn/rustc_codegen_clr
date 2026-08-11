@@ -83,6 +83,10 @@ pub fn handle_statement<'tcx>(
                     if is_zst(ctx.monomorphize(pointee), ctx.tcx()) {
                         return vec![ctx.alloc_root(cilly::ir::CILRoot::Nop)];
                     }
+                    assert!(
+                        !crate::managed_storage::is_bitwise_managed_unsafe(pointee, ctx),
+                        "managed-storage preflight missed CopyNonOverlapping of {pointee:?}"
+                    );
                     let dst_op = handle_operand(dst, ctx);
                     let src_op = handle_operand(src, ctx);
                     let count_op = handle_operand(count, ctx);

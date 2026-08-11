@@ -102,7 +102,7 @@ pub fn run(args: &DoctorArgs) -> Result<i32> {
     }
 
     // Environment check mode.
-    let checks = environment_checks(&args.dotnet);
+    let checks = environment_checks(&args.dotnet, args.full_integrity);
     let mut wiring_checks = workspace_wiring_checks(&args.workspace);
     wiring_checks.extend(native_import_checks(&args.workspace));
     let fails = checks
@@ -313,7 +313,7 @@ fn inspect_native_import(
 
     let mut failures = Vec::new();
     for asset in host_assets {
-        match inspect_native_binary(&asset.source, host, imports) {
+        match inspect_native_binary(&asset.contents, host, imports) {
             Ok(()) => {
                 return Check::pass(
                     format!("native import {library}"),
@@ -332,14 +332,13 @@ fn inspect_native_import(
 }
 
 fn inspect_native_binary(
-    path: &Path,
+    bytes: &[u8],
     host: &HostFacts,
     imports: &std::collections::BTreeSet<NativeImport>,
 ) -> anyhow::Result<()> {
     use object::{Object as _, ObjectSymbol as _};
 
-    let bytes = std::fs::read(path)?;
-    let file = object::File::parse(bytes.as_slice())?;
+    let file = object::File::parse(bytes)?;
     let expected_architecture = if host.host_rid.ends_with("-arm64") {
         object::Architecture::Aarch64
     } else {
@@ -444,22 +443,35 @@ fn environment_report_json(
 // Environment checks.
 // ---------------------------------------------------------------------------------
 
-fn environment_checks(dotnet_version: &str) -> Vec<Check> {
+fn environment_checks(dotnet_version: &str, full_integrity: bool) -> Vec<Check> {
     let mut checks = Vec::new();
     let facts = HostFacts::detect();
 
     if let Ok(Mode::Installed { home }) = mode::detect() {
         checks.push(match crate::bundle::verify_installed_if_locked(&home) {
-            Ok(true) => Check::pass(
+            Ok(crate::bundle::InstalledIntegrity::Sealed) => Check::pass(
                 "install bundle integrity",
                 "BUNDLE-LOCK.json and all declared SDK files match".to_string(),
             ),
-            Ok(false) => Check::warn(
+            Ok(crate::bundle::InstalledIntegrity::Legacy001) => Check::warn(
                 "install bundle integrity",
-                "source-checkout setup has no BUNDLE-LOCK.json; install a release bundle for checksummed SDK inputs"
+                "immutable cargo-dotnet 0.0.1 compatibility home has no BUNDLE-LOCK.json; upgrade for checksummed SDK inputs"
                     .to_string(),
             ),
             Err(error) => Check::fail("install bundle integrity", format!("{error:#}")),
+        });
+    }
+
+    if full_integrity {
+        checks.push(match crate::private_sysroot::verify_all_cached_full() {
+            Ok(report) => Check::pass(
+                "private sysroot full integrity",
+                format!(
+                    "rehash verified {} private sysroot(s) and {} active ambient toolchain input(s); {} sealed input(s) belong to moved or uninstalled toolchains and were not followed",
+                    report.sysroots, report.ambient_inputs, report.stale_ambient_inputs
+                ),
+            ),
+            Err(error) => Check::fail("private sysroot full integrity", format!("{error:#}")),
         });
     }
 
@@ -617,13 +629,22 @@ fn check_backend_install(facts: &HostFacts) -> Vec<Check> {
     let mut checks = Vec::new();
     let backend_name = facts.backend_dylib_name();
     let (root_label, dylib, linker, target_spec, targets) = match mode::detect() {
-        Ok(Mode::Installed { home }) => (
-            format!("installed home {}", home.display()),
-            home.join("bin").join(&backend_name),
-            home.join(format!("bin/linker{}", facts.exe_ext)),
-            home.join("target/x86_64-unknown-dotnet.json"),
-            home.join("msbuild/RustDotnet.targets"),
-        ),
+        Ok(Mode::Installed { home }) => {
+            let layout = match crate::bundle::installed_layout(&home) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    checks.push(Check::fail("SDK inventory", error.to_string()));
+                    return checks;
+                }
+            };
+            (
+                format!("installed home {}", home.display()),
+                home.join(&layout.backend),
+                home.join(&layout.linker),
+                home.join(&layout.target_spec),
+                home.join(&layout.msbuild_root).join("RustDotnet.targets"),
+            )
+        }
         Ok(Mode::Dev { repo_root }) => (
             format!("dev checkout {}", repo_root.display()),
             repo_root.join("target/release").join(&backend_name),
@@ -1472,9 +1493,10 @@ mod tests {
     #[test]
     fn binary_inspection_distinguishes_architecture_and_missing_entry_point() {
         let executable = std::env::current_exe().unwrap();
+        let executable_bytes = std::fs::read(&executable).unwrap();
         let host = HostFacts::detect();
         let no_imports = std::collections::BTreeSet::new();
-        inspect_native_binary(&executable, &host, &no_imports).unwrap();
+        inspect_native_binary(&executable_bytes, &host, &no_imports).unwrap();
 
         let missing = [NativeImport {
             rust_symbol: "rust_probe".into(),
@@ -1482,7 +1504,7 @@ mod tests {
         }]
         .into_iter()
         .collect();
-        let error = inspect_native_binary(&executable, &host, &missing).unwrap_err();
+        let error = inspect_native_binary(&executable_bytes, &host, &missing).unwrap_err();
         assert!(error.to_string().contains("missing entry point"));
         assert!(error.to_string().contains("rust_probe"));
 
@@ -1499,7 +1521,7 @@ mod tests {
             },
             ..host
         };
-        let error = inspect_native_binary(&executable, &wrong_host, &no_imports).unwrap_err();
+        let error = inspect_native_binary(&executable_bytes, &wrong_host, &no_imports).unwrap_err();
         assert!(error.to_string().contains("architecture mismatch"));
     }
 

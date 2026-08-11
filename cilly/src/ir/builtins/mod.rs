@@ -27,6 +27,7 @@ pub mod f16;
 pub use f16::*;
 pub mod simd;
 pub mod unwind;
+pub mod x86;
 
 /// Converts a pointer-like runtime result to the exact return type of the Rust method being
 /// synthesized. ECMA-335 pointer types are verifier-visible: returning `void*` from a method

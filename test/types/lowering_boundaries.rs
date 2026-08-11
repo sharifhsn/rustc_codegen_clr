@@ -34,6 +34,8 @@ fn middle_zst(left: u32, _: Zst, right: u32) -> u32 {
     left.wrapping_add(right)
 }
 
+static STATIC_MIDDLE: fn(u32, Zst, u32) -> u32 = middle_zst;
+
 #[track_caller]
 #[inline(never)]
 fn tracked_leading_zst(_: Zst, value: u32) -> u32 {
@@ -119,6 +121,66 @@ fn test_enum_zst_addresses() {
     test_eq!(unit, expected_payload);
 }
 
+#[repr(C, u8)]
+enum ProjectionEnum {
+    Active { marker: AlignedZst, value: u32 },
+    Other(u16),
+}
+
+#[inline(never)]
+fn invoke_rust_call<F>(function: F, left: u32, right: u32) -> u32
+where
+    F: FnOnce(Zst, u32, Zst, u32) -> u32,
+{
+    function(Zst, left, Zst, right)
+}
+
+fn test_projection_reads_writes() -> u32 {
+    let mut array = [3_u32, 5, 7, 11, 13];
+    let index = black_box(2_usize);
+    let array_base = array.as_mut_ptr() as usize;
+    let indexed = core::ptr::addr_of_mut!(array[index]) as usize;
+    test_eq!(indexed, array_base + index * core::mem::size_of::<u32>());
+    test_eq!(array[index], 7);
+    array[index] = 17;
+
+    let slice: &mut [u32] = black_box(&mut array[..]);
+    let slice_index = black_box(3_usize);
+    let slice_indexed = core::ptr::addr_of_mut!(slice[slice_index]) as usize;
+    test_eq!(
+        slice_indexed,
+        slice.as_mut_ptr() as usize + slice_index * core::mem::size_of::<u32>()
+    );
+    test_eq!(slice[slice_index], 11);
+    slice[slice_index] = 19;
+
+    let [first, middle @ .., last] = slice else {
+        core::intrinsics::abort()
+    };
+    test_eq!(*first, 3);
+    test_eq!(*last, 13);
+    test_eq!(middle[1], 17);
+    middle[0] = 23;
+    middle[2] = 29;
+
+    let mut projected_enum = ProjectionEnum::Active {
+        marker: AlignedZst { unit: () },
+        value: 31,
+    };
+    let enum_base = core::ptr::addr_of!(projected_enum) as usize;
+    let (marker_address, enum_value) = match &mut projected_enum {
+        ProjectionEnum::Active { marker, value } => {
+            *value = value.wrapping_add(6);
+            (marker as *mut AlignedZst as usize, *value)
+        }
+        ProjectionEnum::Other(_) => core::intrinsics::abort(),
+    };
+    test!(marker_address >= enum_base);
+    test_eq!(enum_value, 37);
+
+    array.iter().copied().sum::<u32>().wrapping_add(enum_value)
+}
+
 // These deliberately reproduce backend-reserved names and even the private intrinsic marker in a
 // different crate. They are ordinary Rust items and must never be intercepted as mycorrhiza APIs.
 mod ordinary_lookalikes {
@@ -144,18 +206,27 @@ fn main() {
     let middle: fn(u32, Zst, u32) -> u32 = middle_zst;
     let tracked: fn(Zst, u32) -> u32 = tracked_leading_zst;
     let closure: fn(Zst, u32) -> u32 = |_, value| value.wrapping_add(4);
+    let multi_zst_closure: fn(Zst, u32, Zst, u32) -> u32 =
+        |_, left, _, right| left.wrapping_mul(2).wrapping_add(right);
 
     test_eq!(black_box(leading)(Zst, 10), 11);
     test_eq!(black_box(middle)(20, Zst, 22), 42);
     test_eq!(black_box(tracked)(Zst, 30), 33);
     test_eq!(black_box(closure)(Zst, 40), 44);
+    test_eq!(black_box(STATIC_MIDDLE)(50, Zst, 8), 58);
+    test_eq!(black_box(multi_zst_closure)(Zst, 9, Zst, 4), 22);
+
+    let captured = black_box(7_u32);
+    let rust_call = invoke_rust_call(
+        |_, left, _, right| captured.wrapping_add(left).wrapping_add(right),
+        12,
+        23,
+    );
+    test_eq!(rust_call, 42);
 
     let outer = Outer {
         word: 0x1234_5678,
-        inner: Inner {
-            byte: 9,
-            zst: Zst,
-        },
+        inner: Inner { byte: 9, zst: Zst },
     };
     let outer_ptr = black_box(&outer as *const Outer);
     let projected = unsafe { core::ptr::addr_of!((*outer_ptr).inner.zst) } as usize;
@@ -166,6 +237,7 @@ fn main() {
 
     test_zst_sequence_addresses();
     test_enum_zst_addresses();
+    test_eq!(test_projection_reads_writes(), 122);
     let lookalike = ordinary_lookalikes::RustcCLRInteropManagedClass { value: 5 };
     test_eq!(lookalike.value, 5);
     test_eq!(ordinary_lookalikes::rustc_clr_interop_managed_ld_len(9), 19);

@@ -75,6 +75,13 @@ pub fn test_dotnet_executable(file_path: &str, test_dir: &str) -> String {
 
         let stderr = String::from_utf8(out.stderr).expect("Stdout is not UTF8 String!");
         assert!(
+            out.status.success(),
+            "Test program exited with status {}. stdout:\n{}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            stderr,
+        );
+        assert!(
             stderr.is_empty(),
             "Test program failed with message {stderr:}"
         );
@@ -799,6 +806,7 @@ run_test! {intrinsics,arithmetic_misc,stable}
 run_test! {intrinsics,assert,stable}
 run_test! {intrinsics,float_minmax,stable}
 run_test! {intrinsics,atomics,stable}
+compare_tests! {intrinsics,atomic_u16_i16_rmw,stable}
 
 run_test! {intrinsics,bswap,stable}
 run_test! {intrinsics,caller_location,stable}
@@ -859,7 +867,11 @@ run_test! {types,dyns,stable}
 run_test! {types,enums,stable}
 run_test! {types,int128,stable}
 run_test! {types,interop,stable}
-run_test! {types,lowering_boundaries,stable}
+compare_tests! {types,lowering_boundaries,stable}
+compare_tests! {types,generated_ctor_authority,stable}
+compare_tests! {types,generic_fn_ptr_abi,stable}
+compare_tests! {types,track_caller_abi,stable}
+compare_tests! {types,vtable_identity,stable}
 run_test! {types,interop_typedef,unstable}
 run_test! {types,maybeuninit,stable}
 run_test! {types,nbody,stable}
@@ -1034,6 +1046,236 @@ static RUSTC_BUILD_STATUS: std::sync::LazyLock<Result<(), String>> =
     std::sync::LazyLock::new(build_backend);
 
 #[test]
+fn emitted_compiler_object_is_repeatable_across_output_paths() {
+    RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
+    let source = std::fs::canonicalize("test/types/deterministic_identities.rs")
+        .expect("deterministic identity fixture is missing");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates the Unix epoch")
+        .as_nanos();
+    let output_dir = std::env::temp_dir().join(format!(
+        "rustc_codegen_clr_identity_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir(&output_dir).expect("could not create identity test directory");
+
+    let compile = |stem: &str, perturb: bool| {
+        let requested_output = output_dir.join(format!("{stem}.o"));
+        let mut command = std::process::Command::new("rustc");
+        command
+            .arg(format!(
+                "-Zcodegen-backend={}",
+                absolute_backend_path().display()
+            ))
+            .args([
+                "--edition",
+                STANDALONE_TEST_EDITION,
+                "--crate-name",
+                "deterministic_identities",
+                "--crate-type",
+                "lib",
+                "--emit",
+                "obj",
+                "-O",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&requested_output);
+        if perturb {
+            command.args(["--cfg", "identity_perturb"]);
+        }
+        let display = format!("{command:?}");
+        let output = command
+            .output()
+            .expect("failed to compile deterministic identity fixture");
+        assert_compile_succeeded(&display, &output);
+
+        // Backend object emission is a serialized cilly assembly. rustc names it from the
+        // requested output stem, so compare its contents rather than the deliberately different
+        // archive member/output names.
+        let emitted_object = output_dir.join(format!("{stem}..rcgu.bc"));
+        std::fs::read(&emitted_object).unwrap_or_else(|err| {
+            panic!(
+                "could not read compiler object at {}: {err}",
+                emitted_object.display()
+            )
+        })
+    };
+
+    let first = compile("first", false);
+    let second = compile("second", false);
+    assert_eq!(
+        first, second,
+        "compiler-emitted identities changed between identical builds"
+    );
+
+    let static_names = |bytes: &[u8]| {
+        let artifact = cilly::decode_assembly_artifact(bytes)
+            .expect("compiler object is not a current cilly assembly artifact");
+        let assembly = artifact.assembly();
+        assembly
+            .class_defs()
+            .values()
+            .flat_map(|class| class.static_fields())
+            .map(|field| assembly[field.name].to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let baseline_names = static_names(&first);
+    let baseline_methods = {
+        let artifact = cilly::decode_assembly_artifact(&first)
+            .expect("compiler object is not a current cilly assembly artifact");
+        let assembly = artifact.assembly();
+        assembly
+            .method_defs()
+            .values()
+            .map(|method| assembly[method.name()].to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    for exported in ["deterministic_identity_probe", "mutable_counter_probe"] {
+        assert!(
+            baseline_methods.contains(exported),
+            "canonical instance naming did not preserve explicit #[no_mangle] symbol {exported:?}: {baseline_methods:#?}"
+        );
+    }
+    let perturbed = compile("perturbed", true);
+    let perturbed_names = static_names(&perturbed);
+
+    let baseline_counter: Vec<_> = baseline_names
+        .iter()
+        .filter(|name| name.contains("MUTABLE_COUNTER"))
+        .collect();
+    assert_eq!(
+        baseline_counter.len(),
+        1,
+        "the named mutable static must have exactly one backing field: {baseline_names:#?}"
+    );
+    assert!(
+        perturbed_names.contains(baseline_counter[0]),
+        "an unrelated promotion changed the mutable static's emitted identity"
+    );
+    assert!(
+        !baseline_names.iter().any(|name| name.starts_with("mut_")),
+        "a named `static mut` was incorrectly reified as an anonymous allocation: {baseline_names:#?}"
+    );
+    for name in baseline_names
+        .iter()
+        .filter(|name| name.starts_with("ro_") || name.starts_with("mut_"))
+    {
+        assert!(
+            perturbed_names.contains(name),
+            "unrelated promotion changed stable allocation field {name:?}"
+        );
+    }
+    assert!(
+        perturbed_names
+            .iter()
+            .filter(|name| name.starts_with("ro_"))
+            .any(|name| !baseline_names.contains(name)),
+        "the perturbation did not materialize its independent promoted allocation"
+    );
+    std::fs::remove_dir_all(&output_dir).expect("could not remove identity test directory");
+}
+
+#[test]
+fn upstream_inline_instances_ignore_the_instantiating_crate_suffix() {
+    RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
+    let support = std::fs::canonicalize("test/types/instance_identity_support.rs")
+        .expect("instance identity support fixture is missing");
+    let consumer = std::fs::canonicalize("test/types/instance_identity_consumer.rs")
+        .expect("instance identity consumer fixture is missing");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates the Unix epoch")
+        .as_nanos();
+    let output_dir = std::env::temp_dir().join(format!(
+        "rustc_codegen_clr_cross_crate_identity_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir(&output_dir).expect("could not create instance identity test directory");
+
+    let compile =
+        |source: &std::path::Path, crate_name: &str, extern_crate: Option<&std::path::Path>| {
+            let mut command = std::process::Command::new("rustc");
+            command
+                .arg(format!(
+                    "-Zcodegen-backend={}",
+                    absolute_backend_path().display()
+                ))
+                .args([
+                    "--edition",
+                    STANDALONE_TEST_EDITION,
+                    "--crate-name",
+                    crate_name,
+                    "--crate-type",
+                    "lib",
+                    "--emit",
+                    "metadata,obj",
+                    "-O",
+                ])
+                .arg(source)
+                .arg("--out-dir")
+                .arg(&output_dir);
+            if let Some(metadata) = extern_crate {
+                command
+                    .arg("--extern")
+                    .arg(format!("instance_identity_support={}", metadata.display()));
+            }
+            let display = format!("{command:?}");
+            let output = command
+                .output()
+                .expect("failed to compile cross-crate instance identity fixture");
+            assert_compile_succeeded(&display, &output);
+            std::fs::read(output_dir.join(format!("{crate_name}..rcgu.bc")))
+                .expect("compiler did not emit the expected cilly object")
+        };
+
+    let defining = compile(&support, "instance_identity_support", None);
+    let metadata = output_dir.join("libinstance_identity_support.rmeta");
+    let consuming = compile(&consumer, "instance_identity_consumer", Some(&metadata));
+    let probe_names = |bytes: &[u8]| {
+        let artifact = cilly::decode_assembly_artifact(bytes)
+            .expect("compiler object is not a current cilly assembly artifact");
+        let assembly = artifact.assembly();
+        assembly
+            .method_defs()
+            .values()
+            .map(|method| assembly[method.name()].to_string())
+            .filter(|name| {
+                name.contains("instance_suffix_probe")
+                    || name.contains("instance_unreachable_probe")
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let defining_names = probe_names(&defining);
+    let consuming_names = probe_names(&consuming);
+    assert_eq!(
+        defining_names.len(),
+        2,
+        "defining crate did not emit both inline probes: {defining_names:#?}"
+    );
+    assert_eq!(
+        consuming_names, defining_names,
+        "the same semantic upstream Instance acquired an instantiating-crate-specific managed name"
+    );
+
+    let (_, mut defining_assembly) = cilly::decode_assembly_artifact(&defining)
+        .expect("defining object is not a current cilly artifact")
+        .into_parts();
+    let (_, consuming_assembly) = cilly::decode_assembly_artifact(&consuming)
+        .expect("consuming object is not a current cilly artifact")
+        .into_parts();
+    defining_assembly
+        .try_link_in_place(consuming_assembly)
+        .expect("identical upstream method bodies must merge across defining/consuming crates");
+
+    std::fs::remove_dir_all(&output_dir)
+        .expect("could not remove instance identity test directory");
+}
+
+#[test]
 fn global_asm_is_a_hard_codegen_error() {
     RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
     let source = std::fs::canonicalize("test/compile_fail/global_asm.rs")
@@ -1066,6 +1308,708 @@ fn global_asm_is_a_hard_codegen_error() {
         stderr.contains("UnsupportedFeature") && stderr.contains("global_asm"),
         "global_asm failed without the structured unsupported diagnostic:\n{stderr}"
     );
+}
+
+#[test]
+fn indirect_c_variadic_fn_pointer_is_rejected_before_calli() {
+    RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
+    let source = std::fs::canonicalize("test/compile_fail/indirect_c_variadic.rs")
+        .expect("indirect C-variadic compile-fail fixture is missing");
+    let output_path = std::env::temp_dir().join(format!(
+        "rustc_codegen_clr_indirect_c_variadic_{}.rlib",
+        std::process::id()
+    ));
+    let output = std::process::Command::new("rustc")
+        .env("ABORT_ON_ERROR", "1")
+        .arg(format!(
+            "-Zcodegen-backend={}",
+            absolute_backend_path().display()
+        ))
+        .args([
+            "--edition",
+            STANDALONE_TEST_EDITION,
+            "--crate-name",
+            "indirect_c_variadic",
+            "--crate-type",
+            "lib",
+        ])
+        .arg(source)
+        .arg("-o")
+        .arg(&output_path)
+        .output()
+        .expect("failed to run indirect C-variadic compile-fail fixture");
+    let _ = std::fs::remove_file(output_path);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "indirect C-variadic function-pointer call unexpectedly compiled"
+    );
+    assert!(
+        stderr.contains("UnsupportedFeature(indirect_c_variadic_fn_pointer)")
+            && stderr.contains("requires a CIL vararg call-site signature"),
+        "indirect C-variadic call failed without the exact structured diagnostic:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("internal compiler error") && !stderr.contains("thread 'rustc' panicked"),
+        "indirect C-variadic rejection became an ICE:\n{stderr}"
+    );
+}
+
+#[test]
+fn unsupported_target_layouts_are_rejected_at_codegen_entry() {
+    RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
+    let source = std::fs::canonicalize("test/compile_fail/unsupported_target_layout.rs")
+        .expect("unsupported-target compile-fail fixture is missing");
+
+    for (target, expected_facts) in [
+        ("i686-unknown-linux-gnu", "32-bit little-endian"),
+        ("s390x-unknown-linux-gnu", "64-bit big-endian"),
+    ] {
+        let output_path = std::env::temp_dir().join(format!(
+            "rustc_codegen_clr_unsupported_target_{}_{}.rlib",
+            target,
+            std::process::id()
+        ));
+        let output = std::process::Command::new("rustc")
+            .arg(format!(
+                "-Zcodegen-backend={}",
+                absolute_backend_path().display()
+            ))
+            .args([
+                "--edition",
+                STANDALONE_TEST_EDITION,
+                "--crate-name",
+                "unsupported_target_layout",
+                "--crate-type",
+                "lib",
+                "--target",
+                target,
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&output_path)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to compile for target {target}: {error}"));
+        let _ = std::fs::remove_file(output_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "unsupported target {target} unexpectedly reached codegen"
+        );
+        assert!(
+            stderr.contains("UnsupportedFeature(target_layout)")
+                && stderr.contains("requires a 64-bit little-endian Rust target")
+                && stderr.contains(expected_facts),
+            "target {target} failed without the exact backend target-layout diagnostic:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("internal compiler error")
+                && !stderr.contains("thread 'rustc' panicked"),
+            "target-layout rejection for {target} became an ICE:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn managed_references_are_rejected_from_rust_byte_storage() {
+    RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
+    let support = std::fs::canonicalize("test/compile_fail/support/managed_storage_mycorrhiza.rs")
+        .expect("managed-storage support crate is missing");
+    let source = std::fs::canonicalize("test/compile_fail/managed_storage.rs")
+        .expect("managed-storage compile-fail fixture is missing");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates the Unix epoch")
+        .as_nanos();
+    let output_dir = std::env::temp_dir().join(format!(
+        "rustc_codegen_clr_managed_storage_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir(&output_dir).expect("could not create managed-storage test directory");
+    let support_rlib = output_dir.join("libmycorrhiza.rlib");
+    let support_output = std::process::Command::new("rustc")
+        .args([
+            "--edition",
+            STANDALONE_TEST_EDITION,
+            "--crate-name",
+            "mycorrhiza",
+            "--crate-type",
+            "rlib",
+        ])
+        .arg(&support)
+        .arg("-o")
+        .arg(&support_rlib)
+        .output()
+        .expect("failed to compile managed-storage support crate");
+    assert_compile_succeeded("rustc managed_storage_mycorrhiza.rs", &support_output);
+
+    let compile_case = |case: &str, support_rlib: &std::path::Path| {
+        let output_path = output_dir.join(format!("{case}.rlib"));
+        // Definition-boundary escape checks apply only to actual native-facing library exports.
+        // Keep these cases product-shaped; a private `extern "C"` function in an rlib can instead
+        // be a managed-only delegate trampoline.
+        let crate_type = if matches!(
+            case,
+            "external_argument"
+                | "external_return"
+                | "external_safe_managed_marker"
+                | "external_managed_marker"
+                | "external_unsafe_no_managed_marker"
+                | "external_marked_nonunwind"
+        ) {
+            "cdylib"
+        } else {
+            "lib"
+        };
+        let mut command = std::process::Command::new("rustc");
+        command
+            .env("ABORT_ON_ERROR", "1")
+            .arg(format!(
+                "-Zcodegen-backend={}",
+                absolute_backend_path().display()
+            ))
+            .args([
+                "--edition",
+                STANDALONE_TEST_EDITION,
+                "--crate-name",
+                "managed_storage",
+                "--crate-type",
+                crate_type,
+            ])
+            .arg("--extern")
+            .arg(format!("mycorrhiza={}", support_rlib.display()))
+            .arg("--cfg")
+            .arg(format!("managed_case=\"{case}\""))
+            .arg(&source)
+            .arg("-o")
+            .arg(output_path);
+        // A successful cdylib backend compile produces a serialized cilly object, not a native
+        // Mach-O/ELF input. Stop after codegen for the positive marked-export case; the product
+        // fixtures exercise the real managed linker and runtime path.
+        if case == "external_managed_marker" {
+            command.args(["--emit", "obj"]);
+        }
+        let display = format!("{command:?}");
+        let output = command.output().unwrap_or_else(|error| {
+            panic!("failed to compile managed-storage case {case}: {error}")
+        });
+        (display, output)
+    };
+
+    for case in [
+        "array",
+        "managed_struct_storage",
+        "aggregate",
+        "recursive_raw",
+        "enum",
+        "coroutine",
+        "coroutine_closure",
+        "closure",
+        "box",
+        "vec",
+        "rc",
+        "arc",
+        "vecdeque",
+        "static",
+        "static_ref",
+        "static_slice",
+        "static_wrapped_ref",
+        "anonymous_promotion",
+        "copy",
+        "write_bytes",
+        "volatile_load",
+        "volatile_store",
+        "typed_swap",
+        "indirect_write",
+        "indirect_read",
+        "transmute",
+        "raw_pointer_formation",
+        "reference_storage",
+        "pointer_return",
+        "external_argument",
+        "external_return",
+        "external_safe_managed_marker",
+        "external_unsafe_no_managed_marker",
+        "external_marked_nonunwind",
+        "external_fn_pointer",
+        "external_call_return",
+        "rust_call_tuple_persist",
+        "rust_call_tuple_borrow",
+        "rust_call_tuple_copy",
+        "try_managed_naked_capture",
+        "try_managed_naked_result",
+        "forged_root",
+        "conditional_capability_raw",
+        "lifetime_capability",
+        "reference_capability",
+        "container_reference_capability",
+        "unsafe_binder",
+    ] {
+        let (_display, output) = compile_case(case, &support_rlib);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "managed-storage case {case} unexpectedly compiled successfully"
+        );
+        assert!(
+            stderr.contains("managed_reference_storage")
+                && (stderr.contains("UnsupportedFeature")
+                    || stderr.contains("error: managed_reference_storage")),
+            "managed-storage case {case} failed without the structured diagnostic:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("internal compiler error")
+                && !stderr.contains("unexpected panic")
+                && !stderr.contains("thread 'rustc' panicked"),
+            "managed-storage case {case} turned a structured rejection into an ICE:\n{stderr}"
+        );
+        let operation_fragment = match case {
+            "copy" => Some("CopyNonOverlapping"),
+            "write_bytes" => Some("intrinsic `write_bytes`"),
+            "volatile_load" => Some("intrinsic `volatile_load`"),
+            "volatile_store" => Some("intrinsic `volatile_store`"),
+            "typed_swap" => Some("intrinsic `typed_swap_nonoverlapping`"),
+            "indirect_write" | "indirect_read" => Some("indirect MIR place access"),
+            "transmute" => Some("transmute source"),
+            "raw_pointer_formation" => Some("raw pointer formation"),
+            "pointer_return" => Some("function return pointer/reference escape"),
+            "external_argument" => Some("external `\"C\"` function argument"),
+            "external_return" => Some("external `\"C\"` function return"),
+            "external_safe_managed_marker" => Some("external `\"C-unwind\"` function return"),
+            "external_unsafe_no_managed_marker" => Some("external `\"C-unwind\"` function return"),
+            "external_marked_nonunwind" => Some("external `\"C\"` function return"),
+            "external_call_return" => Some("external `\"C\"` call return"),
+            _ => None,
+        };
+        if let Some(operation_fragment) = operation_fragment {
+            assert!(
+                stderr.contains(operation_fragment),
+                "managed-storage case {case} missed its operation-specific gate `{operation_fragment}`:\n{stderr}"
+            );
+        }
+    }
+
+    for case in [
+        "transient",
+        "rooted",
+        "rooted_registration",
+        "recursive_safe",
+        "zero_array",
+        "pointer_phantom",
+        "safe_helper_near_miss",
+        "unsafe_binder_primitive",
+        "internal_fn_pointer",
+        "private_c_abi_definition",
+        "external_managed_marker",
+        "rust_call_tuple",
+        "try_managed_rooted_state",
+        "value_type_receiver",
+        "conditional_capability",
+    ] {
+        let (display, output) = compile_case(case, &support_rlib);
+        assert_compile_succeeded(&display, &output);
+    }
+
+    // Compilation alone cannot distinguish the safe same-name helper from an accidentally
+    // substituted stack transmute. Execute the exact crate/module/name/doc collision and compare
+    // its observable `41 -> 42` result.
+    if !crate::config::current().dry_run() {
+        let helper_base = output_dir.join("safe_helper_near_miss");
+        let helper_exe = helper_base.with_extension("exe");
+        let mut command = std::process::Command::new("rustc");
+        command
+            .args(rustc_args().iter())
+            .args([
+                "-O",
+                "--crate-name",
+                "mycorrhiza",
+                "--cfg",
+                "safe_helper_binary",
+            ])
+            .arg(&support)
+            .arg("-o")
+            .arg(&helper_exe);
+        let display = format!("{command:?}");
+        let output = command
+            .output()
+            .expect("failed to compile executable safe-helper near miss");
+        assert_compile_succeeded(&display, &output);
+        let helper_base = helper_base
+            .to_str()
+            .expect("safe-helper output path is not UTF-8");
+        let output_dir_str = output_dir
+            .to_str()
+            .expect("managed-storage output directory is not UTF-8");
+        let stdout = test_dotnet_executable(helper_base, output_dir_str);
+        assert!(
+            stdout.is_empty(),
+            "safe-helper oracle unexpectedly wrote output: {stdout:?}"
+        );
+    }
+
+    // `ManagedRef::copy_raw` must be a non-consuming peek. Prove the exact lowered CIL shape:
+    // both helpers recover the target through `handle_to_obj`, but only Take releases the root.
+    let managed_box_source = std::fs::canonicalize("test/types/managed_box_get.rs")
+        .expect("managed-box lowering fixture is missing");
+    let requested_object = output_dir.join("managed_box_get.o");
+    let mut command = std::process::Command::new("rustc");
+    command
+        .arg(format!(
+            "-Zcodegen-backend={}",
+            absolute_backend_path().display()
+        ))
+        .args([
+            "--edition",
+            STANDALONE_TEST_EDITION,
+            "--crate-name",
+            "managed_box_get",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "obj",
+        ])
+        .arg("--extern")
+        .arg(format!("mycorrhiza={}", support_rlib.display()))
+        .arg(&managed_box_source)
+        .arg("-o")
+        .arg(&requested_object);
+    let display = format!("{command:?}");
+    let output = command
+        .output()
+        .expect("failed to compile managed-box lowering fixture");
+    assert_compile_succeeded(&display, &output);
+    let emitted_object = output_dir.join("managed_box_get..rcgu.bc");
+    let bytes = std::fs::read(&emitted_object).unwrap_or_else(|error| {
+        panic!(
+            "could not read managed-box compiler object at {}: {error}",
+            emitted_object.display()
+        )
+    });
+    let artifact = cilly::decode_assembly_artifact(&bytes)
+        .expect("managed-box fixture did not emit a current cilly assembly artifact");
+    let assembly = artifact.assembly();
+    let calls_in = |method_name: &str| {
+        let method = assembly
+            .method_defs()
+            .values()
+            .find(|method| &assembly[method.name()] == method_name)
+            .unwrap_or_else(|| panic!("managed-box fixture omitted method {method_name}"));
+        method
+            .iter_cil(assembly)
+            .expect("managed-box probe has no CIL body")
+            .filter_map(|element| match element {
+                cilly::CILIterElem::Node(cilly::CILNode::Call(call))
+                | cilly::CILIterElem::Root(cilly::CILRoot::Call(call)) => Some(call.0),
+                _ => None,
+            })
+            .map(|method_ref| assembly[assembly[method_ref].name()].to_string())
+            .collect::<Vec<_>>()
+    };
+    let peek_calls = calls_in("managed_box_peek_probe");
+    assert_eq!(
+        peek_calls
+            .iter()
+            .filter(|name| *name == "handle_to_obj")
+            .count(),
+        1,
+        "ManagedBoxGet must recover the rooted target exactly once: {peek_calls:?}"
+    );
+    assert_eq!(
+        peek_calls
+            .iter()
+            .filter(|name| *name == "handle_free")
+            .count(),
+        0,
+        "ManagedBoxGet must leave the GCHandle live: {peek_calls:?}"
+    );
+    let take_calls = calls_in("managed_box_take_probe");
+    assert_eq!(
+        take_calls
+            .iter()
+            .filter(|name| *name == "handle_to_obj")
+            .count(),
+        1,
+        "ManagedBoxTake must recover the rooted target exactly once: {take_calls:?}"
+    );
+    assert_eq!(
+        take_calls
+            .iter()
+            .filter(|name| *name == "handle_free")
+            .count(),
+        1,
+        "ManagedBoxTake must release the GCHandle exactly once: {take_calls:?}"
+    );
+    let free_calls = calls_in("managed_box_free_probe");
+    assert_eq!(
+        free_calls
+            .iter()
+            .filter(|name| *name == "handle_to_obj")
+            .count(),
+        0,
+        "ManagedBoxFree must not materialize the managed target: {free_calls:?}"
+    );
+    assert_eq!(
+        free_calls
+            .iter()
+            .filter(|name| *name == "handle_free")
+            .count(),
+        1,
+        "ManagedBoxFree must release the GCHandle exactly once: {free_calls:?}"
+    );
+
+    let nodes_in = |method_name: &str| {
+        let method = assembly
+            .method_defs()
+            .values()
+            .find(|method| &assembly[method.name()] == method_name)
+            .unwrap_or_else(|| panic!("managed-box fixture omitted method {method_name}"));
+        method
+            .iter_cil(assembly)
+            .expect("managed-box probe has no CIL body")
+            .filter_map(cilly::CILIterElem::as_node)
+            .collect::<Vec<_>>()
+    };
+    let array_new_nodes = nodes_in("managed_box_array_new_probe");
+    assert!(
+        !array_new_nodes
+            .iter()
+            .any(|node| matches!(node, cilly::CILNode::Box { .. })),
+        "ManagedBoxNew must not box an already-managed CLR array: {array_new_nodes:?}"
+    );
+    let array_peek_nodes = nodes_in("managed_box_array_peek_probe");
+    assert!(
+        !array_peek_nodes
+            .iter()
+            .any(|node| matches!(node, cilly::CILNode::UnboxAny { .. })),
+        "ManagedBoxGet must not unbox.any an already-managed CLR array: {array_peek_nodes:?}"
+    );
+    assert_eq!(
+        array_peek_nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node,
+                    cilly::CILNode::CheckedCast(_, target)
+                        if matches!(assembly[*target], cilly::Type::PlatformArray { .. })
+                )
+            })
+            .count(),
+        1,
+        "ManagedBoxGet must cast the rooted object back to its CLR array type: {array_peek_nodes:?}"
+    );
+    let value_new_nodes = nodes_in("managed_box_value_new_probe");
+    assert_eq!(
+        value_new_nodes
+            .iter()
+            .filter(|node| matches!(node, cilly::CILNode::Box { .. }))
+            .count(),
+        1,
+        "ManagedBoxNew must still box CLR value types: {value_new_nodes:?}"
+    );
+    let value_peek_nodes = nodes_in("managed_box_value_peek_probe");
+    assert_eq!(
+        value_peek_nodes
+            .iter()
+            .filter(|node| matches!(node, cilly::CILNode::UnboxAny { .. }))
+            .count(),
+        1,
+        "ManagedBoxGet must still unbox CLR value types: {value_peek_nodes:?}"
+    );
+
+    // A safe trait with the right diagnostic-item name is not an unsafe storage contract.
+    let safe_trait_rlib = output_dir.join("libmycorrhiza_safe_trait.rlib");
+    let safe_trait_support_output = std::process::Command::new("rustc")
+        .args([
+            "--edition",
+            STANDALONE_TEST_EDITION,
+            "--crate-name",
+            "mycorrhiza",
+            "--crate-type",
+            "rlib",
+            "--cfg",
+            "forged_safe_capability",
+        ])
+        .arg(&support)
+        .arg("-o")
+        .arg(&safe_trait_rlib)
+        .output()
+        .expect("failed to compile safe-trait capability support crate");
+    assert_compile_succeeded(
+        "rustc managed_storage_mycorrhiza.rs --cfg forged_safe_capability",
+        &safe_trait_support_output,
+    );
+    let (_display, output) = compile_case("forged_root", &safe_trait_rlib);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("managed_reference_storage"),
+        "safe capability trait unexpectedly bypassed managed storage:\n{stderr}"
+    );
+
+    // Likewise, a safe foundational raw-type trait does not authorize CLR ABI interpretation.
+    // The array case is a decisive oracle: it compiles only when the copied marker remains an
+    // ordinary Rust struct.
+    let safe_raw_identity_rlib = output_dir.join("libmycorrhiza_safe_raw_identity.rlib");
+    let safe_raw_identity_output = std::process::Command::new("rustc")
+        .args([
+            "--edition",
+            STANDALONE_TEST_EDITION,
+            "--crate-name",
+            "mycorrhiza",
+            "--crate-type",
+            "rlib",
+            "--cfg",
+            "forged_raw_identity",
+        ])
+        .arg(&support)
+        .arg("-o")
+        .arg(&safe_raw_identity_rlib)
+        .output()
+        .expect("failed to compile safe raw-identity support crate");
+    assert_compile_succeeded(
+        "rustc managed_storage_mycorrhiza.rs --cfg forged_raw_identity",
+        &safe_raw_identity_output,
+    );
+    let (display, output) = compile_case("raw_identity_near_miss", &safe_raw_identity_rlib);
+    assert_compile_succeeded(&display, &output);
+
+    // A diagnostic item is only an identifier, not proof that its definition has the expected
+    // kind. A replacement crate that binds the name to a struct must be rejected structurally,
+    // never passed to `tcx.trait_def` (which would ICE on a non-trait DefId).
+    let non_trait_rlib = output_dir.join("libmycorrhiza_non_trait.rlib");
+    let non_trait_support_output = std::process::Command::new("rustc")
+        .args([
+            "--edition",
+            STANDALONE_TEST_EDITION,
+            "--crate-name",
+            "mycorrhiza",
+            "--crate-type",
+            "rlib",
+            "--cfg",
+            "forged_capability_item",
+        ])
+        .arg(&support)
+        .arg("-o")
+        .arg(&non_trait_rlib)
+        .output()
+        .expect("failed to compile non-trait capability support crate");
+    assert_compile_succeeded(
+        "rustc managed_storage_mycorrhiza.rs --cfg forged_capability_item",
+        &non_trait_support_output,
+    );
+    let (_display, output) = compile_case("forged_root", &non_trait_rlib);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "non-trait capability diagnostic item unexpectedly bypassed managed storage"
+    );
+    assert!(
+        stderr.contains("managed_reference_storage")
+            && (stderr.contains("UnsupportedFeature")
+                || stderr.contains("error: managed_reference_storage")),
+        "non-trait capability item failed without the structured diagnostic:\n{stderr}"
+    );
+    std::fs::remove_dir_all(output_dir).expect("could not remove managed-storage test directory");
+}
+
+/// Public metadata must preserve the exact marker on magic functions instantiated through an
+/// external `mycorrhiza` rlib. A private declaration loses its attributes at this boundary and
+/// silently lowers as a call to the aborting Rust placeholder instead of the managed built-in.
+#[test]
+fn cross_crate_magic_intrinsics_use_managed_builtins() {
+    RUSTC_BUILD_STATUS.as_ref().expect("Could not build rustc!");
+    let mycorrhiza =
+        std::fs::canonicalize("mycorrhiza/src/lib.rs").expect("mycorrhiza crate root is missing");
+    let source = std::fs::canonicalize("test/types/try_catch_cross_crate.rs")
+        .expect("cross-crate try/catch fixture is missing");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock predates the Unix epoch")
+        .as_nanos();
+    let output_dir = std::env::temp_dir().join(format!(
+        "rustc_codegen_clr_try_catch_metadata_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir(&output_dir).expect("could not create try/catch metadata test directory");
+    let mycorrhiza_rlib = output_dir.join("libmycorrhiza.rlib");
+    let output = std::process::Command::new("rustc")
+        .args([
+            "--edition",
+            STANDALONE_TEST_EDITION,
+            "--crate-name",
+            "mycorrhiza",
+            "--crate-type",
+            "rlib",
+        ])
+        .arg(&mycorrhiza)
+        .arg("-o")
+        .arg(&mycorrhiza_rlib)
+        .output()
+        .expect("failed to compile the real mycorrhiza rlib");
+    assert_compile_succeeded("rustc mycorrhiza/src/lib.rs", &output);
+
+    let requested_object = output_dir.join("try_catch_cross_crate.o");
+    let mut command = std::process::Command::new("rustc");
+    command
+        .arg(format!(
+            "-Zcodegen-backend={}",
+            absolute_backend_path().display()
+        ))
+        .args([
+            "--edition",
+            STANDALONE_TEST_EDITION,
+            "--crate-name",
+            "try_catch_cross_crate",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "obj",
+        ])
+        .arg("--extern")
+        .arg(format!("mycorrhiza={}", mycorrhiza_rlib.display()))
+        .arg(&source)
+        .arg("-o")
+        .arg(&requested_object);
+    let display = format!("{command:?}");
+    let output = command
+        .output()
+        .expect("failed to compile cross-crate try/catch fixture");
+    assert_compile_succeeded(&display, &output);
+
+    let emitted_object = output_dir.join("try_catch_cross_crate..rcgu.bc");
+    let bytes = std::fs::read(&emitted_object).unwrap_or_else(|error| {
+        panic!(
+            "could not read cross-crate try/catch object at {}: {error}",
+            emitted_object.display()
+        )
+    });
+    let artifact = cilly::decode_assembly_artifact(&bytes)
+        .expect("cross-crate try/catch fixture did not emit a current cilly artifact");
+    let assembly = artifact.assembly();
+    let method_names = assembly
+        .method_refs()
+        .iter_keys()
+        .map(|method| assembly[assembly[method].name()].to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        method_names.iter().any(|name| name == "interop_try_catch"),
+        "cross-crate try_managed did not lower to the managed try/catch built-in: {method_names:?}"
+    );
+    for placeholder in [
+        "rustc_clr_interop_try_catch",
+        "rustc_clr_interop_managed_box_new",
+        "rustc_clr_interop_managed_box_get",
+        "rustc_clr_interop_managed_box_take",
+        "rustc_clr_interop_managed_box_free",
+    ] {
+        assert!(
+            method_names.iter().all(|name| !name.contains(placeholder)),
+            "cross-crate lowering retained aborting Rust placeholder `{placeholder}`: {method_names:?}"
+        );
+    }
+    std::fs::remove_dir_all(output_dir)
+        .expect("could not remove try/catch metadata test directory");
 }
 
 /// The codegen backend owns rustc's `cfg(target_feature)` result. Keep that frontend contract

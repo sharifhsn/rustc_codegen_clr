@@ -343,6 +343,7 @@ pub fn await_value_task<T>(value_task: ValueTaskT<T>) -> TaskFuture<T> {
 /// method returning a bare `Task`. Awaiting it needs no generic-return handling, so it is fully
 /// supported. A move-only wrapper around a managed reference; the .NET GC owns the object.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Task {
     h: RawTask,
 }

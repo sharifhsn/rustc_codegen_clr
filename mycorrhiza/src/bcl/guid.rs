@@ -31,6 +31,7 @@
 //! `TryParse`, the many-argument ctors) is out of scope — reach for the raw handle via
 //! [`Guid::handle`] for anything not surfaced here.
 
+use crate::NativeStorageSafe;
 use crate::intrinsics::RustcCLRInteropManagedStruct;
 use crate::system::MString;
 
@@ -52,6 +53,8 @@ const GUID_SIZE: usize = 16;
 /// properties retain the genuine CLR `System.Guid` identity.
 /// See the [module docs](self) for the full member map.
 pub type Guid = RustcCLRInteropManagedStruct<{ CORELIB }, { GUID }, GUID_SIZE>;
+// SAFETY: `System.Guid` is 128 bits of integer data and contains no GC references.
+unsafe impl NativeStorageSafe for Guid {}
 
 impl Guid {
     // --- constructors / factories -----------------------------------------------------------------

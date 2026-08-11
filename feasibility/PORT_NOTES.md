@@ -65,13 +65,18 @@ The `CodegenBackend` trait was reworked; `CodegenResults` is split into `Compile
 - `FnSig::c_variadic` is a method again (`.c_variadic()`).
 - `std::range::RangeInclusive<_>` (not `core::ops`): use the `.start` / `.last` **fields**, not `.start()`/`.end()`.
 
-## Not yet runtime-verified
-The build is green and the smoke test runs, but these semantic changes deserve targeted runtime checks
-(the project's full `cargo test ::stable` suite is the real gate):
+## Historical port verification checklist
+At the time of the port, the build and smoke test were green but these semantic changes still
+needed targeted runtime checks:
 - `NullaryOp` removal — programs using `size_of`/`align_of`/`offset_of`.
 - `ShallowInitBox` removal — box-heavy code.
 - `Rvalue::Reborrow` lowering.
 - The `join_codegen`/`link` rewrite — confirm produced `.rlib`s link end-to-end.
+
+Those boundaries now have focused compiler regressions and product-shaped build-std acceptances.
+The historical direct-host `::stable` corpus is useful compatibility evidence, but it is not the
+release authority: it does not provide the managed build-std closure and currently contains known
+failures that must remain visible rather than be baseline-suppressed.
 
 ## Running on aarch64 (non-x86_64) Linux
 

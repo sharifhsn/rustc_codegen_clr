@@ -64,6 +64,23 @@ pub fn rustc_codegen_clr_add_method_def<
     }
 }
 #[inline(never)]
+pub fn rustc_codegen_clr_add_static_method_def<
+    const FNAME: &'static str,
+    const PARAM_NAMES: &'static str,
+    const NULLABILITY: &'static str,
+    FnType,
+>(
+    class: ClassDef,
+    fn_type: FnType,
+) -> ClassDef {
+    black_box(());
+    loop {
+        if black_box(true) {
+            core::intrinsics::abort()
+        }
+    }
+}
+#[inline(never)]
 pub fn rustc_codegen_clr_new_typedef<
     const NAME: &'static str,
     const IS_VALUETYPE: bool,
@@ -99,7 +116,6 @@ macro_rules! typedef_fields {
         typedef_fields!($typedef, $($tail)*)
     };
     ($typedef:ident, virtual fn $fname:ident($($args:tt)*)->$ret:ty{$($inner:tt)*}, $($tail:tt)*) => {
-        use super::*;
         mod $fname{
             use super::super::*;
             #[inline(never)]
@@ -109,9 +125,6 @@ macro_rules! typedef_fields {
             }
         }
         const FNAME:&str = stringify!($fname);
-        #[used]
-        static KEEP_FN: extern "C" fn ($($args)*)->$ret = $fname::rustc_codegen_clr_not_magic;
-
         $typedef = $crate::rustc_codegen_clr_add_method_def::<"pub","virtual",FNAME,"","",_>($typedef,$fname::rustc_codegen_clr_not_magic);
         typedef_fields!($typedef, $($tail)*)
     };
@@ -166,6 +179,38 @@ dotnet_typedef! {
         // NOTE: the current shape of this macro, and it's implementation is
         // highly experimental. All of this is subject to change,
         // This is a **very** early prototype!
+    }
+}
+
+// Exact producer regression for `#[dotnet_methods]`' private marshalling shims. Neither the shim nor
+// its generic slice helper has an ordinary Rust caller: only the comptime-declared managed static
+// method reaches them. The backend must emit the complete rustc mono dependency closure at that
+// declaration edge instead of leaving either method as a reachable `MethodImpl::Missing`.
+#[inline(never)]
+unsafe fn handle_as_mut_slice<T>(data: *mut T, len: usize) -> &'static mut [T] {
+    unsafe { core::slice::from_raw_parts_mut(data, len) }
+}
+
+#[inline(never)]
+fn __dotnet_methods_shim_sum_span(mut value: i32) -> i32 {
+    let values = unsafe { handle_as_mut_slice::<i32>(&raw mut value, 1) };
+    values[0] + 1
+}
+
+mod __dotnet_methods_ShimClass {
+    use super::*;
+
+    #[used]
+    static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
+    #[doc = "__rustc_codegen_clr_comptime_entrypoint_v1"]
+    #[inline(never)]
+    pub fn rustc_codegen_clr_comptime_entrypoint() {
+        let class = rustc_codegen_clr_new_typedef::<"ShimClass", false, "", "", false>();
+        let class = rustc_codegen_clr_add_static_method_def::<"SumSpan", "value", "", _>(
+            class,
+            __dotnet_methods_shim_sum_span,
+        );
+        rustc_codegen_clr_finish_type(class);
     }
 }
 

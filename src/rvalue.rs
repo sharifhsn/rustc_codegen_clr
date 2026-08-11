@@ -9,10 +9,11 @@ use cilly::{
 
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
-use crate::call_info::CallInfo;
-use crate::fn_ctx::fn_name;
+use crate::abi::AbiPlan;
+use crate::fn_ctx::fn_name_for_instance;
 use crate::operand::{
-    handle_operand, is_const_zero, is_uninit, operand_address, static_data::add_allocation,
+    handle_operand, is_const_zero, is_uninit, operand_address,
+    static_data::{AllocationOrigin, add_allocation},
 };
 use crate::place::{place_address, place_get};
 use crate::r#type::{GetTypeExt, adt::enum_tag_info, get_type, utilis::ptr_is_fat};
@@ -158,10 +159,10 @@ pub fn handle_rvalue<'tcx>(
                     args,
                     rustc_middle::ty::ClosureKind::FnOnce,
                 );
-                let call_info = CallInfo::sig_from_instance_(instance, ctx);
+                let real_abi = AbiPlan::from_instance(instance, ctx);
 
-                let function_name = fn_name(ctx.tcx().symbol_name(instance));
-                let fn_ptr_sig = ctx.alloc_sig(call_info.sig().clone());
+                let function_name = fn_name_for_instance(ctx.tcx(), instance);
+                let fn_ptr_sig = ctx.alloc_sig(real_abi.signature().clone());
                 let call_site = MethodRef::new(
                     *ctx.main_module(),
                     ctx.alloc_string(function_name),
@@ -169,6 +170,7 @@ pub fn handle_rvalue<'tcx>(
                     MethodKind::Static,
                     vec![].into(),
                 );
+                let target_abi = AbiPlan::from_fn_ptr_ty(*to_ty, ctx);
                 let target_type = ctx.type_from_cache(*to_ty);
                 let Type::FnPtr(target_sig) = target_type else {
                     rustc_middle::bug!(
@@ -176,17 +178,11 @@ pub fn handle_rvalue<'tcx>(
                         target_type.mangle(ctx)
                     )
                 };
-                // Route through the adapter-thunk helper: when the physical method has elided
-                // (Void/ZST) params that the fn-ptr type lacks, this synthesises an arity-matching
-                // adapter instead of lying about the pointer's ABI with a bare cast.
-                // A closure-to-fn coercion removes exactly the closure receiver. For a
-                // captureless closure that receiver lowers to `Void`, but a real user argument may
-                // also be a ZST/`Void`; positional type matching cannot distinguish the two. Pass
-                // the proven receiver slot explicitly so legitimate ZST arguments remain in the
-                // indirect-call signature.
+                assert_eq!(target_abi.signature(), &ctx[target_sig]);
+                let ignored = real_abi.ignored_slots_for_fn_pointer(&target_abi);
                 (
                     vec![],
-                    ctx.reify_fnptr_with_ignored(call_site, target_sig, &[0]),
+                    ctx.reify_fnptr_with_ignored(call_site, target_sig, &ignored),
                 )
             }
             _ => panic!(
@@ -310,27 +306,29 @@ pub fn handle_rvalue<'tcx>(
             } else {
                 todo!("Trying to call a type which is not a function definition!");
             };
-            let function_name = fn_name(ctx.tcx().symbol_name(instance));
-            let function_sig = crate::function_sig::sig_from_instance_(instance, ctx)
-                .expect("Could not get function signature when trying to get a function pointer!");
+            let function_name = fn_name_for_instance(ctx.tcx(), instance);
+            let real_abi = AbiPlan::from_instance(instance, ctx);
             // `resolve_for_fn_ptr` is important here: it selects rustc's `ReifyShim` for targets
             // such as `#[track_caller]` functions, whose hidden caller-location argument cannot be
             // represented in a bare Rust fn-pointer type.
             let call_site = MethodRef::new(
                 *ctx.main_module(),
                 ctx.alloc_string(function_name),
-                ctx.alloc_sig(function_sig),
+                ctx.alloc_sig(real_abi.signature().clone()),
                 MethodKind::Static,
                 vec![].into(),
             );
             // The destination type is a bare `fn`-pointer type built receiver-free (`from_poly_sig`),
             // so it may have fewer params than the physical method's keep-ZST signature. Reconcile
             // arity via the adapter-thunk helper (a no-op fast path when the sigs already agree).
+            let target_abi = AbiPlan::from_fn_ptr_ty(*target, ctx);
             let target_type = ctx.type_from_cache(*target);
             if let Type::FnPtr(target_sig) = target_type {
+                assert_eq!(target_abi.signature(), &ctx[target_sig]);
+                let ignored = real_abi.ignored_slots_for_fn_pointer(&target_abi);
                 (
                     vec![],
-                    ctx.reify_fnptr_with_ignored(call_site, target_sig, &[]),
+                    ctx.reify_fnptr_with_ignored(call_site, target_sig, &ignored),
                 )
             } else {
                 // Defensive: the destination is not a fn-ptr type (should not happen for
@@ -393,7 +391,13 @@ pub fn handle_rvalue<'tcx>(
                 let rvalue_ty = rvalue.ty(ctx.body(), ctx.tcx());
                 let rvalue_type = ctx.type_from_cache(rvalue_ty);
                 let tpe = ctx.alloc_type(rvalue_type);
-                let ptr = add_allocation(alloc_id.0.into(), ctx);
+                let origin = AllocationOrigin::for_current_instance(
+                    alloc_id,
+                    "thread-local-ref",
+                    [ctx.tcx().def_path_str(*def_id)],
+                    ctx,
+                );
+                let ptr = add_allocation(alloc_id, &origin, ctx);
                 let tpe = ctx[tpe].pointed_to().unwrap();
                 (vec![], ctx.cast_ptr(ptr, tpe))
             }
@@ -421,6 +425,10 @@ fn repeat<'tcx>(
 ) -> (Vec<Root>, Node) {
     // Get the type of the operand
     let element_ty = ctx.monomorphize(element.ty(ctx.body(), ctx.tcx()));
+    assert!(
+        !crate::managed_storage::is_bitwise_managed_unsafe(element_ty, ctx),
+        "managed-storage preflight missed array repeat of {element_ty:?}"
+    );
     let element_type = ctx.type_from_cache(element_ty);
     let element = handle_operand(element, ctx);
     // Array size

@@ -49,6 +49,7 @@ impl From<&str> for MString {
 /// Construct one from a Rust string with `DotNetString::from("…")`; get the underlying handle with
 /// [`DotNetString::handle`] for lower-level BCL calls.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct DotNetString(MString);
 
 impl DotNetString {
@@ -193,13 +194,6 @@ impl From<DotNetString> for std::string::String {
     }
 }
 
-impl core::str::FromStr for DotNetString {
-    type Err = core::convert::Infallible;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(DotNetString::from(s))
-    }
-}
-
 impl Default for DotNetString {
     /// The empty managed string (`""`).
     fn default() -> Self {
@@ -231,16 +225,13 @@ impl core::cmp::Ord for DotNetString {
     }
 }
 
-// `a + b` and `a += b` concatenate, like Rust's `String`.
+// `a + b` concatenates like Rust's `String`. `AddAssign` is intentionally absent: assigning through
+// `&mut DotNetString` would store a naked CLR reference through an ordinary Rust byref. Keep the
+// wrapper as a direct managed local and assign the result to a direct local instead.
 impl core::ops::Add for DotNetString {
     type Output = DotNetString;
     fn add(self, rhs: DotNetString) -> DotNetString {
         self.concat(rhs)
-    }
-}
-impl core::ops::AddAssign for DotNetString {
-    fn add_assign(&mut self, rhs: DotNetString) {
-        *self = self.concat(rhs);
     }
 }
 

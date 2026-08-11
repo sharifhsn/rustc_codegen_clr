@@ -3,7 +3,9 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 release="$repo/.github/workflows/release.yml"
+fork_gate="$repo/.github/workflows/fork-gate.yml"
 bundle="$repo/feasibility/release_bundle.sh"
+compat_launcher="$repo/feasibility/cargo-dotnet"
 workflows="$repo/.github/workflows"
 
 fail() {
@@ -43,7 +45,25 @@ grep -Fq 'runner: macos-15' "$release" \
 
 grep -Fq 'cargo build --release --workspace' "$release" \
     || fail "release does not build the compiler workspace"
+grep -Fq 'cargo test -p rust-dotnet-sdk-core --frozen' "$release" \
+    || fail "Windows release does not execute SDK filesystem capability tests"
+grep -Fq "if: matrix.host == 'windows-x64'" "$release" \
+    || fail "release SDK filesystem tests are not scoped to the Windows host"
+grep -Fq 'cargo test -p rust-dotnet-sdk-core --locked' "$fork_gate" \
+    || fail "Windows fork gate does not execute SDK filesystem capability tests"
 grep -Fq 'feasibility/release_bundle.sh' "$release" || fail "release does not run the bundle builder"
+grep -Fq 'CARGO_DOTNET_BUILD_ID="source-sha256:' "$release" \
+    || fail "release driver is not bound to the captured source-tree digest"
+grep -Fq 'release bundle refuses a dirty source tree' "$bundle" \
+    || fail "release bundle does not fail closed on dirty sources"
+grep -Fq 'source_tree_sha256' "$bundle" \
+    || fail "release VERSION does not record its source-tree digest"
+grep -Fq 'CARGO_DOTNET_BUILD_ID="$driver_build_id"' "$bundle" \
+    || fail "release bundle does not rebuild the packaged driver with its recorded identity"
+grep -Fq 'release_tag="${CARGO_DOTNET_SOURCE_RELEASE_TAG:-untagged}"' "$compat_launcher" \
+    || fail "local setup can still mistake an unverified Git tag for release attestation"
+grep -Fq 'git_tag="${CARGO_DOTNET_SOURCE_GIT_TAG:-' "$compat_launcher" \
+    || fail "local setup does not retain descriptive exact-tag provenance separately"
 grep -Fq 'bundle create' "$bundle" || fail "release does not create SDK bundles"
 grep -Fq 'bundle verify' "$bundle" || fail "release does not verify SDK bundles"
 grep -Fq 'bundle install' "$bundle" || fail "release does not clean-install SDK bundles"

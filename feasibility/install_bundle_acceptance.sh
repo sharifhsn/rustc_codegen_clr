@@ -31,48 +31,27 @@ mkdir -p "$work"
 source_home="$work/producer-home"
 restore_home="$work/consumer-home"
 consumer_cargo_home="$work/consumer-cargo-home"
-mkdir -p "$source_home/bin" "$source_home/target" "$source_home/crates"
+if [[ -n "$(git -C "$repo" status --porcelain=v1 --untracked-files=all)" ]]; then
+    echo "install bundle acceptance requires a clean source tree so setup can seal honest provenance" >&2
+    exit 2
+fi
 
-for candidate in "$repo/target/release/librustc_codegen_clr.so" \
-    "$repo/target/release/librustc_codegen_clr.dylib" \
-    "$repo/target/release/rustc_codegen_clr.dll"; do
-    [[ -f "$candidate" ]] && cp "$candidate" "$source_home/bin/"
-done
-[[ -f "$repo/target/release/linker.exe" ]] \
-    && cp "$repo/target/release/linker.exe" "$source_home/bin/" \
-    || cp "$repo/target/release/linker" "$source_home/bin/"
-cp "$repo/x86_64-unknown-dotnet.json" "$source_home/target/"
-cp "$repo/feasibility/_cargo_dotnet_core.sh" "$source_home/core.sh"
-cp "$repo/feasibility/cargo-dotnet" "$source_home/cargo-dotnet"
-cp -R "$repo/dotnet_pal" "$source_home/dotnet_pal"
-cp -R "$repo/dotnet_overlays" "$source_home/dotnet_overlays"
-cp -R "$repo/msbuild" "$source_home/msbuild"
-cp -R "$repo/mycorrhiza" "$source_home/crates/mycorrhiza"
-cp -R "$repo/dotnet_macros" "$source_home/crates/dotnet_macros"
-cp -R "$repo/crates/rust-dotnet-pinvoke" "$source_home/crates/rust-dotnet-pinvoke"
-cp -R "$repo/crates/rust-dotnet-native-contract-macros" \
-    "$source_home/crates/rust-dotnet-native-contract-macros"
-cp -R "$repo/mycorrhiza_interop_helpers" "$source_home/mycorrhiza_interop_helpers"
-
-toolchain="$(awk -F '"' '/channel/ { print $2; exit }' "$repo/rust-toolchain.toml")"
-version="$(awk -F '"' '/^version = / { print $2; exit }' "$repo/tools/cargo-dotnet/Cargo.toml")"
-git_rev="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)"
-case "${RUNNER_OS:-$(uname -s)}:$(uname -m)" in
-    Linux:x86_64) host_rid=linux-x64 ;;
-    macOS:arm64|Darwin:arm64) host_rid=osx-arm64 ;;
-    Windows:x86_64|MINGW*:x86_64|MSYS*:x86_64|CYGWIN*:x86_64) host_rid=win-x64 ;;
-    *) echo "install bundle acceptance: unsupported host $(uname -sm)" >&2; exit 2 ;;
-esac
-printf 'schema = 1\ngit_rev = %s\nrelease_tag = rust-dotnet-v%s\ncargo_dotnet_version = %s\nhost_rid = %s\ntoolchain = %s\n' \
-    "$git_rev" "$version" "$version" "$host_rid" "$toolchain" > "$source_home/VERSION"
+producer_cargo_home="$work/producer-cargo-home"
+CARGO_HOME="$producer_cargo_home" CARGO_DOTNET_HOME="$source_home" \
+    "$driver" setup --from-repo "$repo" --home "$source_home" \
+    --skip-toolchain --skip-dotnet --force > "$work/setup.log" 2>&1
+source_driver="$source_home/bin/cargo-dotnet"
+[[ -f "$source_home/bin/cargo-dotnet.exe" ]] \
+    && source_driver="$source_home/bin/cargo-dotnet.exe"
+[[ -x "$source_driver" || -f "$source_driver" ]]
 
 mkdir -p "$work/artifacts"
-"$driver" bundle create --home "$source_home" --out "$work/artifacts/sdk-a.zip"
-"$driver" bundle create --home "$source_home" --out "$work/artifacts/sdk-b.zip"
+"$source_driver" bundle create --home "$source_home" --out "$work/artifacts/sdk-a.zip"
+"$source_driver" bundle create --home "$source_home" --out "$work/artifacts/sdk-b.zip"
 cmp "$work/artifacts/sdk-a.zip" "$work/artifacts/sdk-b.zip"
-"$driver" bundle verify "$work/artifacts/sdk-a.zip"
+"$source_driver" bundle verify "$work/artifacts/sdk-a.zip"
 printf 'corrupt' >> "$work/artifacts/sdk-b.zip"
-if "$driver" bundle verify "$work/artifacts/sdk-b.zip" \
+if "$source_driver" bundle verify "$work/artifacts/sdk-b.zip" \
     > "$work/artifacts/archive-tamper.log" 2>&1; then
     echo "corrupted bundle archive unexpectedly verified" >&2
     exit 1
@@ -120,6 +99,40 @@ fresh_shell new "$work/hello" \
 fresh_shell run "$work/hello" --dotnet "$dotnet_version" \
     > "$work/artifacts/run.log" 2>&1
 grep -Fx 'hello from Rust on .NET' "$work/artifacts/run.log"
+
+# Exercise the installed binary's reflection build path. The source checkout remains elsewhere on
+# disk but is not an ancestor of either the PATH-discovered front-end or this consumer, so mode
+# detection and the generated bindgen manifest must resolve mycorrhiza from the restored schema-2
+# SDK inventory rather than from cargo-dotnet's compile-time CARGO_MANIFEST_DIR.
+fresh_shell new "$work/installed-nuget" \
+    --app --dotnet "$dotnet_version" > "$work/artifacts/nuget-new.log"
+mkdir -p "$work/installed-nuget-package" "$work/installed-nuget/local-feed"
+cat > "$work/installed-nuget-package/InstalledFixture.csproj" <<EOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net${dotnet_version}.0</TargetFramework>
+    <PackageId>RustcCodegenClr.InstalledFixture</PackageId>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+</Project>
+EOF
+cat > "$work/installed-nuget-package/InstalledFixture.cs" <<'EOF'
+namespace InstalledFixture;
+
+public sealed class Probe
+{
+    public int Twice(int value) => value * 2;
+}
+EOF
+dotnet pack "$work/installed-nuget-package/InstalledFixture.csproj" \
+    -c Release -o "$work/installed-nuget/local-feed" --nologo \
+    > "$work/artifacts/nuget-pack.log" 2>&1
+fresh_shell add-nuget RustcCodegenClr.InstalledFixture 1.0.0 "$work/installed-nuget" \
+    --source "$work/installed-nuget/local-feed" --force --dotnet "$dotnet_version" \
+    > "$work/artifacts/installed-bindgen.log" 2>&1
+installed_bindings="$work/installed-nuget/src/nuget/rustccodegenclr_installedfixture.rs"
+[[ -s "$installed_bindings" ]]
+grep -F 'InstalledFixture' "$installed_bindings" > /dev/null
 
 printf 'fn injected() {}\n' > "$restore_home/dotnet_pal/injected.rs"
 if fresh_shell doctor \

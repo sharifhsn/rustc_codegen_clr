@@ -1305,7 +1305,6 @@ fn dto_backing_name(name: &str) -> String {
 fn expand_dotnet_data_object(
     mut parsed: ItemStruct,
     class_options: proc_macro2::TokenStream,
-    keep_default_constructor: bool,
 ) -> proc_macro2::TokenStream {
     // Public CLR schema fields may be PascalCase. Normalize only the hidden backing field.
     for field in &mut parsed.fields {
@@ -1345,14 +1344,6 @@ fn expand_dotnet_data_object(
     let ctor_magic = format_ident!("rustc_clr_interop_managed_ctor{}_", fields.len());
     let class_expansion =
         proc_macro2::TokenStream::from(expand_dotnet_class(class_options.into(), parsed));
-    let keep_primary = format_ident!("KEEP_{}_PRIMARY_CTOR", dto_name);
-    let keep_default = format_ident!("KEEP_{}_DEFAULT_CTOR", dto_name);
-    let default_constructor_anchor = keep_default_constructor.then(|| {
-        quote! {
-            #[used]
-            static #keep_default: fn() -> #dto_handle = #dto_handle::ctor0;
-        }
-    });
     quote! {
         #class_expansion
 
@@ -1362,7 +1353,8 @@ fn expand_dotnet_data_object(
             #[allow(non_snake_case, dead_code, unused_variables, internal_features)]
             pub fn new_managed(#(#field_names: #field_types),*) -> #dto_handle {
                 #[inline(never)]
-                fn #ctor_magic<
+                #[doc = "__rustc_codegen_clr_generated_ctor_v1"]
+                unsafe fn #ctor_magic<
                     const ASSEMBLY: &'static str,
                     const CLASS_PATH: &'static str,
                     const IS_VALUETYPE: bool,
@@ -1372,13 +1364,14 @@ fn expand_dotnet_data_object(
                 ) -> ::mycorrhiza::intrinsics::RustcCLRInteropManagedClass<ASSEMBLY, CLASS_PATH> {
                     loop { ::core::hint::spin_loop(); }
                 }
-                #ctor_magic::<"", #dto_name_lit, false, #(#seam_types),*>(#(#seam_values),*)
+                // SAFETY: this helper is generated from the same schema that emitted the CLR
+                // primary constructor; its identity, arity, seam types, and argument order are
+                // therefore exact. The backend recognizes only this unsafe, marked bridge.
+                unsafe {
+                    #ctor_magic::<"", #dto_name_lit, false, #(#seam_types),*>(#(#seam_values),*)
+                }
             }
         }
-
-        #[used]
-        static #keep_primary: fn(#(#field_types),*) -> #dto_handle = #dto_name::new_managed;
-        #default_constructor_anchor
     }
 }
 
@@ -1404,7 +1397,7 @@ pub fn dotnet_dto(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
-    expand_dotnet_data_object(parsed, quote!(default_ctor = true, properties = true), true).into()
+    expand_dotnet_data_object(parsed, quote!(default_ctor = true, properties = true)).into()
 }
 
 /// Declares an immutable managed data object with a primary constructor and getter-only PascalCase
@@ -1432,7 +1425,6 @@ pub fn dotnet_record(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_dotnet_data_object(
         parsed,
         quote!(readonly_properties = true, record_semantics = true),
-        false,
     )
     .into()
 }
@@ -1485,8 +1477,8 @@ mod dotnet_export_name_tests {
     use super::{
         XmlDocException, clr_member_id_type_name, dotnet_export_member_id, dto_backing_name,
         imported_delegate_param, interface_member_id_type_name, managed_nullability_spec,
-        marshal_param, marshal_return, marshalled_reference_needs_borrow, parse_dotnet_export_args,
-        render_rustdoc_xml, to_pascal_case,
+        marshal_param, marshal_return, marshalled_reference_needs_borrow,
+        parameter_seam_needs_root, parse_dotnet_export_args, render_rustdoc_xml, to_pascal_case,
     };
     use quote::quote;
     use syn::parse_quote;
@@ -1755,6 +1747,105 @@ mod dotnet_export_name_tests {
         assert!(marshalled.returns_managed_handle);
         assert!(marshalled.from_rust.is_some());
         assert!(marshalled.seam_ty.to_string().contains("IAsyncEnumerable"));
+    }
+
+    #[test]
+    fn return_storage_plan_roots_every_stack_only_managed_shape() {
+        // `true` means the idiomatic Rust return itself cannot inhabit `catch_unwind`'s Result and
+        // must be converted/rooted inside the closure. Keep this list exhaustive with respect to
+        // `marshal_return`: it is the macro-level mirror of managed_storage's structural classifier.
+        for ty in [
+            parse_quote!(DotNetString),
+            parse_quote!(mycorrhiza::task::Task),
+            parse_quote!(TaskT<i32>),
+            parse_quote!(Nullable<i32>),
+            parse_quote!(ManagedArray<i32>),
+            parse_quote!(ManagedOption<MString>),
+            parse_quote!(ManagedEnumerable<i32>),
+            parse_quote!(AsyncEnumerable<i32>),
+            parse_quote!(MutableList<i32>),
+            parse_quote!(MutableDictionary<i32, i32>),
+            parse_quote!(Memory<i32>),
+            parse_quote!(ReadOnlyMemory<i32>),
+            parse_quote!(ReadOnlyList<i32>),
+        ] {
+            let marshalled = marshal_return(&ty).unwrap_or_else(|error| {
+                panic!(
+                    "stack-only managed return `{}` was rejected: {error}",
+                    quote!(#ty)
+                )
+            });
+            assert!(
+                marshalled.returns_managed_handle,
+                "stack-only managed return `{}` was not rooted",
+                quote!(#ty)
+            );
+        }
+
+        // These values remain entirely native while inside catch_unwind. Their conversion to a CLR
+        // seam value happens only after the Result is unwrapped, so rooting would be redundant.
+        for ty in [
+            parse_quote!(&'static str),
+            parse_quote!(String),
+            parse_quote!(i32),
+            parse_quote!(Option<i32>),
+            parse_quote!(Vec<i32>),
+            parse_quote!(RustOwnedVec<i32>),
+        ] {
+            let marshalled = marshal_return(&ty).unwrap_or_else(|error| {
+                panic!("native return `{}` was rejected: {error}", quote!(#ty))
+            });
+            assert!(
+                !marshalled.returns_managed_handle,
+                "native return `{}` was unnecessarily rooted",
+                quote!(#ty)
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_storage_plan_roots_every_clr_seam_before_catch_unwind() {
+        for ty in [
+            parse_quote!(&'static str),
+            parse_quote!(String),
+            parse_quote!(DotNetString),
+            parse_quote!(CancellationToken),
+            parse_quote!(Cancellation),
+            parse_quote!(UiDispatcher),
+            parse_quote!(Progress<i32>),
+            parse_quote!(ProgressReporter<i32>),
+            parse_quote!(Option<i32>),
+            parse_quote!(Vec<i32>),
+            parse_quote!(ManagedArray<i32>),
+            parse_quote!(ReadOnlyList<i32>),
+            parse_quote!(MutableList<i32>),
+            parse_quote!(MutableDictionary<i32, i32>),
+            parse_quote!(ManagedEnumerable<i32>),
+            parse_quote!(ManagedOption<MString>),
+            parse_quote!(Memory<i32>),
+            parse_quote!(ReadOnlyMemory<i32>),
+            parse_quote!(Action1<i32>),
+        ] {
+            assert!(
+                parameter_seam_needs_root(&ty, false),
+                "managed parameter seam `{}` was not rooted",
+                quote!(#ty)
+            );
+        }
+
+        for ty in [
+            parse_quote!(i32),
+            parse_quote!(RustOwnedVec<i32>),
+            parse_quote!(&'static [i32]),
+            parse_quote!(&'static mut [i32]),
+        ] {
+            assert!(
+                !parameter_seam_needs_root(&ty, false),
+                "native/scoped parameter seam `{}` was unnecessarily rooted",
+                quote!(#ty)
+            );
+        }
+        assert!(!parameter_seam_needs_root(&parse_quote!(ExportEnum), true));
     }
 
     #[test]
@@ -3430,26 +3521,8 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .to_compile_error()
                 .into();
             }
-            // `#[used]` fn-pointer anchor: the lifted fn has a REAL body the mono-collector must
-            // codegen (nothing calls it — the entrypoint only NAMES it and is interpreted, not
-            // codegen'd; without this the `AliasFor` edge would dangle). Exact idiom of
-            // `#[dotnet_methods]`' KEEP anchors.
-            let in_tys: Vec<Type> = dim_inputs
-                .iter()
-                .map(|arg| match arg {
-                    FnArg::Typed(pt) => (*pt.ty).clone(),
-                    FnArg::Receiver(_) => unreachable!("dim_inputs holds no receiver"),
-                })
-                .collect();
-            let out_tokens = match output {
-                ReturnType::Default => quote! { () },
-                ReturnType::Type(_, ty) => quote! { #ty },
-            };
-            let keep_ident = format_ident!("KEEP_DIM_{}", fn_ident);
             carriers.push(quote! {
                 fn #dim_ident(#dim_inputs) #output #body
-                #[used]
-                static #keep_ident: fn(#(#in_tys),*) -> #out_tokens = #dim_ident;
             });
             method_calls.push(quote! {
                 let class = ::mycorrhiza::comptime::rustc_codegen_clr_add_default_method_def::<
@@ -3632,10 +3705,10 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         mod #entry_mod {
             use super::*;
             #iface_def_handle_alias
-            // Signature-only carriers (named ONLY in the interpreted entrypoint below, so the
-            // mono-collector never codegens them — an abstract interface member has no body),
-            // plus, for default interface methods, the LIFTED real bodies with their `#[used]`
-            // KEEP anchors (those MUST be codegen'd — the interface member aliases them).
+            // Signature-only carriers are named only in the interpreted entrypoint, so abstract
+            // members never need bodies. Default-interface carriers are real lifted functions:
+            // the backend compiles their complete mono dependency closure before installing the
+            // retained `AliasFor` member, with no independently typed function-pointer anchor.
             #(#carriers)*
             // The comptime interpreter only *reads* this fn's MIR; a `#[used]` root keeps it (and
             // the interface) from being dropped as dead code.
@@ -4392,7 +4465,6 @@ pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Emit one `add_*_method_def` call per method, in declaration order. `self`-taking methods and
     // non-fn impl items are rejected loudly.
     let mut method_calls = Vec::new();
-    let mut keep_anchors = Vec::new();
     let mut saw_dispose = false;
     let mut saw_dispose_async = false;
     // Generated marshalling shims (see the `needs_shim` block below) — free fns emitted at the SAME
@@ -4645,8 +4717,7 @@ pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
         // today via direct aliasing, and must keep working exactly as before. So this is purely
         // ADDITIVE ergonomic sugar, never a narrowing.
         struct ParamPlan {
-            /// Bare seam type (no name) — used for both the shim's parameter list and the `KEEP_`
-            /// anchor's fn-pointer type.
+            /// Bare seam type (no name), used for the shim's parameter list.
             seam_ty: proc_macro2::TokenStream,
             pname: syn::Ident,
             /// `Some` if this param needs an in-conversion statement (e.g. `MString` → `String`).
@@ -4698,8 +4769,8 @@ pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         }
-        let (ret_seam_ty, ret_seam_arrow, ret_expr, ret_marshalled) = match &f.sig.output {
-            ReturnType::Default => (quote! { () }, quote! {}, quote! { __ret }, false),
+        let (ret_seam_arrow, ret_expr, ret_marshalled) = match &f.sig.output {
+            ReturnType::Default => (quote! {}, quote! { __ret }, false),
             ReturnType::Type(_, ty) => match if registered_export_enum(ty, &enum_types) {
                 Ok(marshal_export_enum_return(ty))
             } else {
@@ -4711,9 +4782,9 @@ pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
                         Some(conv) => conv(&format_ident!("__ret")),
                         None => quote! { __ret },
                     };
-                    (seam_ty.clone(), quote! { -> #seam_ty }, expr, true)
+                    (quote! { -> #seam_ty }, expr, true)
                 }
-                Err(_) => (quote! { #ty }, quote! { -> #ty }, quote! { __ret }, false),
+                Err(_) => (quote! { -> #ty }, quote! { __ret }, false),
             },
         };
         let needs_shim = param_plans.iter().any(|p| p.marshalled) || ret_marshalled;
@@ -4721,8 +4792,8 @@ pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
         // The identity actually aliased into the managed method: either the original method
         // (unmarshalled — today's exact behavior, byte-identical codegen) or a generated shim that
         // converts seam-typed args to idiomatic ones, calls the original, and converts the result
-        // back. Both are plain free-fn *values*, so everything downstream (the `KEEP_` anchor, the
-        // `add_method_def`/`add_static_method_def` call) treats them uniformly.
+        // back. Both are plain free-fn *values*, so the comptime
+        // `add_method_def`/`add_static_method_def` declaration treats them uniformly.
         let alias_target = if needs_shim {
             let shim_ident = format_ident!("__dotnet_methods_shim_{}", fn_ident);
             let seam_params: Vec<_> = param_plans
@@ -4751,24 +4822,10 @@ pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #self_ty::#fn_ident }
         };
 
-        // A `#[used]` anchor holding the reified fn pointer forces rustc's own mono-collector to
-        // codegen the aliased fn (a plain `pub fn` on a cdylib type is otherwise pruned as
-        // unreachable — nothing *calls* it directly; the comptime entrypoint only names it, and that
-        // entrypoint is interpreted, not codegen'd — EXCEPT when a shim is generated: the shim itself
-        // is what needs anchoring, and it naturally keeps the ORIGINAL method alive too, since the
-        // shim's body genuinely calls it). Without this the managed method's `AliasFor` edge would
-        // dangle (`method_def_from_ref` → None → "alias for an extern function" panic at typecheck
-        // time). A `fn(...) -> ...` pointer static is used (not `*const ()`/`usize`) because only a
-        // fn-pointer-typed const initializer is legal in const-eval (this is the same anchor shape the
-        // older `dotnet_typedef!` used) — so its type must exactly match whatever's aliased, hence
-        // being built from the (possibly shim-adjusted) seam types above rather than the original
-        // signature unconditionally.
-        let seam_in_types: Vec<_> = param_plans.iter().map(|p| p.seam_ty.clone()).collect();
-        let keep_ident = format_ident!("KEEP_{}", fn_ident);
-        keep_anchors.push(quote! {
-            #[used]
-            static #keep_ident: fn(#(#seam_in_types),*) -> #ret_seam_ty = #alias_target;
-        });
+        // The comptime declaration is the authoritative reachability edge. The backend compiles
+        // its resolved target into the same isolated shard before installing `AliasFor`; a second
+        // `#[used] fn`-pointer static is both redundant and harmful because its independently
+        // lowered signature can create an obsolete, reachable MethodRef for stack-only seam types.
 
         let managed_parameter_names: Vec<String> = f
             .sig
@@ -4953,8 +5010,6 @@ pub fn dotnet_methods(attr: TokenStream, item: TokenStream) -> TokenStream {
             // root is required or the dead-code pass would drop it.
             #[used]
             static PREVENT_DCE: fn() = rustc_codegen_clr_comptime_entrypoint;
-            // Keep each aliased method fn alive through rustc's mono-collector (see above).
-            #(#keep_anchors)*
             #[inline(never)]
             #[doc = "__rustc_codegen_clr_comptime_entrypoint_v1"]
             pub fn rustc_codegen_clr_comptime_entrypoint() {
@@ -5028,17 +5083,15 @@ struct Marshal {
     /// Given a binding `#id` of the idiomatic Rust return type, produce an expression of `seam_ty`.
     /// `None` means "return `#id` unchanged".
     from_rust: Option<Box<dyn Fn(&syn::Ident) -> proc_macro2::TokenStream>>,
-    /// `true` if the **return** type itself is (or directly embeds) a managed object reference
-    /// (`RustcCLRInteropManagedClass`/`RustcCLRInteropManagedGeneric`-shaped) — e.g.
-    /// `mycorrhiza::task::Task`/`TaskT<T>`. Such a value must NOT be threaded through
+    /// `true` if the idiomatic **return** type is a stack-only CLR value (an object reference or a
+    /// managed value struct) that must not be threaded through
     /// `catch_unwind`'s `Result<T, Box<dyn Any + Send>>` return: that `Result` is an enum with
     /// overlapping variant storage, and `cilly`'s `ClassDef::layout_check` correctly rejects ANY
-    /// managed reference in an overlapping field (the same GC-soundness rule `mycorrhiza::task`'s own
-    /// docs describe for coroutine state) — so `catch_unwind::<F, T>` would need a `ClassDef` for
-    /// `Result<T, ..>` with a GC-ref `Ok` payload placed in overlapping storage, which is unsound and
-    /// correctly refused, surfacing as a `ManagedRefInOverlapingField` compiler panic. The shim
-    /// generator (`dotnet_export`) checks this flag to route such returns through a raw-pointer
-    /// out-slot instead (see its body), keeping the `catch_unwind` payload a plain `()`.
+    /// stack-only managed value in overlapping/native Rust storage. This includes transparent Rust
+    /// wrappers such as `DotNetString` and CLR value structs such as `Nullable<T>`, not only raw class
+    /// marker aliases. The shim generator checks this flag to convert and root the seam value behind
+    /// a GCHandle token outside the `catch_unwind` result (see its body), keeping the payload a plain
+    /// `()` without ever nesting that CLR value in Rust enum or byte storage.
     returns_managed_handle: bool,
 }
 
@@ -5403,15 +5456,6 @@ fn imported_delegate_param(ty: &Type) -> Option<Result<Marshal, String>> {
         _ => unreachable!("delegate name and arity were validated above"),
     };
     Some(Ok(marshal))
-}
-
-fn is_imported_delegate_type(ty: &Type) -> bool {
-    generic_type_args(ty).is_some_and(|(name, _)| {
-        matches!(
-            name.as_str(),
-            "Action1" | "Action2" | "Action3" | "Func1" | "Func2" | "Func3" | "Comparison"
-        )
-    })
 }
 
 /// Resolve how a **parameter** type is marshalled, or `Err(message)` if unsupported.
@@ -5827,6 +5871,33 @@ fn marshalled_reference_needs_borrow(ty: &Type) -> bool {
     !matches!(&*reference.elem, Type::Slice(_))
 }
 
+/// Whether the managed seam value itself must be rooted before the generated panic boundary.
+///
+/// The conversion for native conveniences (`String`, `Vec<T>`, spans, and primitive options) may
+/// run before `catch_unwind` only when its result is native Rust storage. Direct CLR references and
+/// CLR value structs instead become a `ManagedRef<SeamTy>` first; the closure copies the direct value
+/// back out only as a transient local. This keeps every closure capture native without weakening the
+/// compiler's managed-storage wall.
+fn parameter_seam_needs_root(ty: &Type, registered_enum: bool) -> bool {
+    if registered_enum {
+        return false;
+    }
+    if let Type::Reference(reference) = ty {
+        // Primitive spans are converted to native Rust fat pointers before the panic boundary. A
+        // CLR string is a rootable object reference and must not be captured directly.
+        return !matches!(&*reference.elem, Type::Slice(_));
+    }
+    if let Some(name) = simple_path_ident(ty) {
+        return !is_passthrough_primitive(&name);
+    }
+    if let Some((name, _)) = generic_type_args(ty) {
+        // RustOwnedVec crosses as an opaque native token. Every other supported generic parameter
+        // shape has a CLR class/array/value-struct seam and is rootable.
+        return name != "RustOwnedVec";
+    }
+    false
+}
+
 /// Resolve how the **return** type is marshalled, or `Err(message)` if unsupported.
 fn marshal_return(ty: &Type) -> Result<Marshal, String> {
     // `&str` return (typically a `&'static str`) → managed string outbound.
@@ -5911,7 +5982,7 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
                 seam_ty: quote! { ::mycorrhiza::system::MString },
                 to_rust: None,
                 from_rust: Some(Box::new(|id| quote! { #id.handle() })),
-                returns_managed_handle: false,
+                returns_managed_handle: true,
             });
         }
         if is_passthrough_primitive(&name) {
@@ -5945,20 +6016,20 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
         });
     }
 
-    // `mycorrhiza::nullable::Nullable<T>` — a real `System.Nullable<T>` value (a fixed-size inline
-    // byte buffer, NOT a managed reference — see that module's doc), already FFI-safe across the
-    // seam for any `T`. This is the answer to "how do I return an Option<T>": a bare Rust `Option<T>`
+    // `mycorrhiza::nullable::Nullable<T>` — a real `System.Nullable<T>` value. It is stack-only CLR
+    // storage rather than a NativeStorageSafe Rust aggregate, so it cannot be the payload of
+    // `catch_unwind`'s Rust `Result`; route it through the rooted seam path just like class handles.
+    // This is the answer to "how do I return an Option<T>": a bare Rust `Option<T>`
     // can't cross directly (its layout is whatever niche/tag encoding rustc picked for this specific
     // `T`, not Nullable<T>'s fixed `{bool,T}` layout), so an exported fn computes an `Option<T>`
     // internally and converts with `.into()` at the boundary (`Nullable<T>: From<Option<T>>`) before
-    // returning. `returns_managed_handle: false` — unlike Task/TaskT<T>, this is an inline value type
-    // with no gcref field, so it has none of the catch_unwind-hazard those two need.
+    // returning.
     if nullable_inner(ty).is_some() {
         return Ok(Marshal {
             seam_ty: quote! { #ty },
             to_rust: None,
             from_rust: None,
-            returns_managed_handle: false,
+            returns_managed_handle: true,
         });
     }
 
@@ -7279,7 +7350,8 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Marshal each parameter. `receiver` (self) is rejected — only free functions are exportable.
     let mut seam_params = Vec::new(); // `#pname: #seam_ty` tokens for the shim signature.
-    let mut pre_call = Vec::new(); // in-conversion statements (seam value → idiomatic Rust value).
+    let mut pre_call = Vec::new(); // statements before the panic boundary.
+    let mut call_prelude = Vec::new(); // transient managed copies/conversions inside the boundary.
     let mut call_args = Vec::new(); // expressions passed to the inner fn.
     let mut doc_param_types = Vec::new(); // CLR type names, for the XML-doc member-ID (see below).
     let mut doc_param_names = Vec::new(); // Managed parameter names, for `<param name="...">`.
@@ -7303,8 +7375,8 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
             _ => format_ident!("arg{}", idx),
         };
         doc_param_names.push(documented_parameter_name(&pat_ty.pat, idx));
-        let imported_delegate = is_imported_delegate_type(&pat_ty.ty);
-        let marshal = if registered_export_enum(&pat_ty.ty, enum_types) {
+        let registered_enum = registered_export_enum(&pat_ty.ty, enum_types);
+        let marshal = if registered_enum {
             marshal_export_enum_param(&pat_ty.ty)
         } else {
             match marshal_param(&pat_ty.ty) {
@@ -7325,36 +7397,31 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         let seam_ty = &marshal.seam_ty;
         seam_params.push(quote! { #pname: #seam_ty });
+        let root_seam = parameter_seam_needs_root(&pat_ty.ty, registered_enum);
+        if root_seam {
+            let root = format_ident!("__managed_param_root_{}", idx);
+            pre_call.push(quote! {
+                let #root = ::mycorrhiza::managed_option::ManagedRef::<#seam_ty>::from_raw(#pname);
+            });
+            call_prelude.push(quote! {
+                let #pname: #seam_ty = #root.copy_raw();
+            });
+        }
         match marshal.to_rust {
             Some(conv) => {
                 // `#pname` is rebound (shadowed) to the idiomatic Rust value; `&str` params also
                 // need a borrow at the call site.
-                pre_call.push(conv(&pname));
+                if root_seam {
+                    call_prelude.push(conv(&pname));
+                } else {
+                    pre_call.push(conv(&pname));
+                }
                 if let Type::Reference(reference) = &*pat_ty.ty {
                     if matches!(&*reference.elem, Type::Slice(_)) {
                         call_args.push(quote! { #pname });
                     } else {
                         call_args.push(quote! { &#pname });
                     }
-                } else if imported_delegate {
-                    // A delegate wrapper contains a managed object reference. Moving it directly
-                    // into `catch_unwind`'s closure makes rustc erase a managed-containing closure
-                    // environment through `*mut u8`, which this backend correctly rejects as a
-                    // ManagedPtrCast in unoptimized/debug MIR. Keep the value in an outer Option;
-                    // the closure captures only `&mut Option<Wrapper>` and takes it once. This is
-                    // the same GC-safe shape used below for managed return values.
-                    let slot = format_ident!("__managed_param_slot_{}", idx);
-                    pre_call.push(quote! {
-                        let mut #slot = ::core::option::Option::Some(#pname);
-                    });
-                    call_args.push(quote! {
-                        match #slot.take() {
-                            ::core::option::Option::Some(__value) => __value,
-                            ::core::option::Option::None => unreachable!(
-                                "dotnet_export: managed delegate parameter consumed more than once"
-                            ),
-                        }
-                    });
                 } else {
                     call_args.push(quote! { #pname });
                 }
@@ -7366,7 +7433,7 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Marshal the return type. `returns_managed_handle` (Task/TaskT<T>) picks a different
     // `catch_unwind` shape below — see that field's doc comment on `Marshal` for why.
     let mut result_error_ty = None;
-    let (seam_ret, ret_expr, ret_ty_for_slot, returns_managed_handle) = match &sig.output {
+    let (seam_ret, ret_expr, rooted_seam_ty, returns_managed_handle) = match &sig.output {
         ReturnType::Default => (quote! {}, quote! { __ret }, None, false), // `-> ()`; identity.
         ReturnType::Type(_, ty) => {
             let marshal_ty = if let Some((ok_ty, error_ty)) = result_args(ty) {
@@ -7418,7 +7485,7 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
             (
                 quote! { -> #seam_ty },
                 expr,
-                Some(marshal_ty.clone()),
+                Some(seam_ty.clone()),
                 marshal.returns_managed_handle,
             )
         }
@@ -7448,7 +7515,10 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    let raw_call = quote! { super::#fn_name(#(#call_args),*) };
+    let raw_call = quote! {{
+        #(#call_prelude)*
+        super::#fn_name(#(#call_args),*)
+    }};
     let call = if result_error_ty.is_some() {
         let throw_error = if export_args.error_managed {
             quote! { ::mycorrhiza::error::throw_managed_error(&__error) }
@@ -7505,51 +7575,35 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   reference directly in that overlapping storage, which `cilly`'s `ClassDef::layout_check`
     //   correctly refuses (a real GC-soundness rule, not a bug to route around) — surfacing as a
     //   `ManagedRefInOverlapingField` compiler panic. So this arm keeps `catch_unwind`'s payload a
-    //   plain `()`: the closure writes the call's result through a raw pointer into an
-    //   already-allocated `MaybeUninit<RetTy>` local (never itself living inside the `Result`), and
-    //   the `Ok(())` arm reads it back out afterward. `RetTy` is `Copy` here (Task/TaskT<T> are
-    //   `#[repr(C)]`/`Copy` handles), so writing through the raw pointer and reading the
-    //   `MaybeUninit` back out is sound.
+    //   plain `()`: the closure converts the return to its seam type and immediately roots it in a
+    //   `ManagedRef<SeamTy>`. The out-slot therefore contains only an opaque GCHandle token, which
+    //   is ordinary native storage; the `Ok(())` arm consumes that root back into a direct CLR local.
     let body = if returns_managed_handle {
-        let ret_ty = ret_ty_for_slot.expect("returns_managed_handle implies a return type");
+        let seam_ty = rooted_seam_ty.expect("returns_managed_handle implies a return type");
         quote! {
-            // `#ret_ty` (`Task`/`TaskT<T>`) carries a real .NET object reference, so it can't live
-            // in `catch_unwind`'s own `Result<RetTy, _>` (a genuine gcref in the `Err` variant's
-            // overlapping storage — `cilly`'s `ClassDef::layout_check` correctly refuses that, see
-            // the module note above). The ORIGINAL fix for this routed the value out through a raw
-            // pointer into a `MaybeUninit<RetTy>` slot instead — but `MaybeUninit`'s own write/read
-            // (`as_mut_ptr`, and even the "safe" `write`/`assume_init`, which still lower to
-            // `self as *mut Self as *mut T` internally) is itself a CIL `PtrCast` reinterpreting a
-            // possibly-uninitialized location as a live gcref — exactly the hazard `Type::
-            // contains_gcref`'s (correctly) deepened check now also catches. It slipped through for
-            // the simplest `#[dotnet_export]` bodies only because rustc's own optimizer proved the
-            // `MaybeUninit` dance redundant and elided the cast before our backend ever saw it; a
-            // bigger fn body (e.g. one driving a real multi-`.await` coroutine through
-            // `future_to_task`) keeps the cast in the final MIR and the verifier correctly rejects
-            // it (`ManagedPtrCast`).
-            //
-            // Fix: use a plain `Option<RetTy>` out-slot instead of `MaybeUninit<RetTy>`. Writing
-            // `*out = Some(__v)` is an ordinary tagged-enum construction (`aggregate.rs`), not a
-            // storage reinterpretation, and reading it back is an ordinary `match` (a normal field
-            // read off the `Some` variant) — neither lowers to a `PtrCast`, so `contains_gcref`
-            // never enters the picture. The slot itself is captured by the closure as `&mut
-            // Option<RetTy>` (a managed byref field in the closure's environment, not a `RetTy`
-            // value), so it still never sits inside `catch_unwind`'s own `Result`.
-            let mut __slot: ::core::option::Option<#ret_ty> = ::core::option::Option::None;
+            // `#seam_ty` carries a real CLR reference (or a CLR value containing one), so neither
+            // `Result<#seam_ty, _>` nor `Option<#seam_ty>` is valid Rust-owned storage. Keep only a
+            // GCHandle token in the captured slot; the direct CLR value exists transiently while
+            // converting/rooting it and again when returning from the successful arm.
+            let mut __slot: ::core::option::Option<
+                ::mycorrhiza::managed_option::ManagedRef<#seam_ty>
+            > = ::core::option::Option::None;
             match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                let __v = #call;
-                __slot = ::core::option::Option::Some(__v);
+                let __ret = #call;
+                let __managed: #seam_ty = #ret_expr;
+                __slot = ::core::option::Option::Some(
+                    ::mycorrhiza::managed_option::ManagedRef::from_raw(__managed)
+                );
             })) {
                 ::std::result::Result::Ok(()) => {
                     // The closure above set `__slot` on its only non-unwinding path, which is
                     // exactly the path that reaches this arm.
-                    let __ret: #ret_ty = match __slot {
-                        ::core::option::Option::Some(__v) => __v,
+                    match __slot.take() {
+                        ::core::option::Option::Some(__root) => __root.into_raw(),
                         ::core::option::Option::None => unreachable!(
                             "dotnet_export: catch_unwind returned Ok without the closure setting __slot"
                         ),
-                    };
-                    #ret_expr
+                    }
                 }
                 ::std::result::Result::Err(__panic_payload) => {
                     #throw_arm
@@ -7615,9 +7669,10 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
         mod #shim_mod {
             use super::*;
             #export_attribute
+            #[doc = "__rustc_codegen_clr_managed_export_v1"]
             #[doc = #nullability_marker]
             #(#[doc = #custom_attr_markers])*
-            pub extern "C-unwind" fn #fn_name(#(#seam_params),*) #seam_ret {
+            pub unsafe extern "C-unwind" fn #fn_name(#(#seam_params),*) #seam_ret {
                 #(#pre_call)*
                 #[cfg(cd_dotnet_unity_netstandard2_1)]
                 {

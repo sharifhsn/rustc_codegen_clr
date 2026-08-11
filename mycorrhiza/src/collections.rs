@@ -425,6 +425,7 @@ mod list {
     }
 
     /// A managed `System.Collections.Generic.List<T>`. See the [module docs](super).
+    #[repr(transparent)]
     pub struct List<T> {
         h: Handle<T>,
     }
@@ -667,7 +668,7 @@ mod list {
             crate::enumerate::as_enum_handle(self.h)
         }
     }
-    impl<'a, T> IntoIterator for &'a List<T> {
+    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a List<T> {
         type Item = T;
         type IntoIter = crate::enumerate::Enumerator<T>;
         fn into_iter(self) -> Self::IntoIter {
@@ -683,7 +684,7 @@ mod list {
         len: i32,
     }
 
-    impl<T> Iterator for ListIter<T> {
+    impl<T: crate::NativeStorageSafe> Iterator for ListIter<T> {
         type Item = T;
         fn next(&mut self) -> Option<T> {
             if self.idx < self.len {
@@ -723,6 +724,7 @@ mod dictionary {
     }
 
     /// A managed `System.Collections.Generic.Dictionary<K, V>`. See the [module docs](super).
+    #[repr(transparent)]
     pub struct Dictionary<K, V> {
         h: Handle<K, V>,
     }
@@ -784,7 +786,7 @@ mod dictionary {
         }
     }
 
-    impl<K, V> Dictionary<K, V> {
+    impl<K: crate::NativeStorageSafe, V: crate::NativeStorageSafe> Dictionary<K, V> {
         /// Iterate the `(key, value)` entries (`for (k, v) in &dict` / `dict.iter()`), driving the
         /// .NET enumerator over `KeyValuePair<K, V>`. The dictionary must not be mutated during
         /// iteration (the .NET enumerator throws `InvalidOperationException`, exactly as in C#).
@@ -814,7 +816,9 @@ mod dictionary {
             crate::enumerate::as_enum_handle::<_, crate::enumerate::KeyValuePair<K, V>>(self.h)
         }
     }
-    impl<'a, K, V> IntoIterator for &'a Dictionary<K, V> {
+    impl<'a, K: crate::NativeStorageSafe, V: crate::NativeStorageSafe> IntoIterator
+        for &'a Dictionary<K, V>
+    {
         type Item = (K, V);
         type IntoIter = crate::enumerate::EntryIter<K, V>;
         fn into_iter(self) -> Self::IntoIter {
@@ -847,6 +851,7 @@ mod hash_set {
     }
 
     /// A managed `System.Collections.Generic.HashSet<T>`. See the [module docs](super).
+    #[repr(transparent)]
     pub struct HashSet<T> {
         h: Handle<T>,
     }
@@ -898,7 +903,7 @@ mod hash_set {
             crate::enumerate::as_enum_handle(self.h)
         }
     }
-    impl<'a, T> IntoIterator for &'a HashSet<T> {
+    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a HashSet<T> {
         type Item = T;
         type IntoIter = crate::enumerate::Enumerator<T>;
         fn into_iter(self) -> Self::IntoIter {
@@ -948,6 +953,7 @@ mod stack {
     }
 
     /// A managed `System.Collections.Generic.Stack<T>` (LIFO). See the [module docs](super).
+    #[repr(transparent)]
     pub struct Stack<T> {
         h: Handle<T>,
     }
@@ -1007,7 +1013,7 @@ mod stack {
             crate::enumerate::as_enum_handle(self.h)
         }
     }
-    impl<'a, T> IntoIterator for &'a Stack<T> {
+    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a Stack<T> {
         type Item = T;
         type IntoIter = crate::enumerate::Enumerator<T>;
         fn into_iter(self) -> Self::IntoIter {
@@ -1037,6 +1043,7 @@ mod queue {
     }
 
     /// A managed `System.Collections.Generic.Queue<T>` (FIFO). See the [module docs](super).
+    #[repr(transparent)]
     pub struct Queue<T> {
         h: Handle<T>,
     }
@@ -1096,7 +1103,7 @@ mod queue {
             crate::enumerate::as_enum_handle(self.h)
         }
     }
-    impl<'a, T> IntoIterator for &'a Queue<T> {
+    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a Queue<T> {
         type Item = T;
         type IntoIter = crate::enumerate::Enumerator<T>;
         fn into_iter(self) -> Self::IntoIter {
@@ -1130,6 +1137,7 @@ mod sorted_dictionary {
     /// red-black tree; keys iterate in ascending order). Same surface as [`super::Dictionary`], but
     /// `K` must be `.NET`-comparable (implements `IComparable`) or operations throw at runtime.
     /// See the [module docs](super).
+    #[repr(transparent)]
     pub struct SortedDictionary<K, V> {
         h: Handle<K, V>,
     }
@@ -1220,6 +1228,7 @@ mod sorted_set {
     /// red-black tree; iteration yields elements sorted). Same surface as [`super::HashSet`], but `T`
     /// must be `.NET`-comparable (`IComparable`) or operations throw at runtime. See the
     /// [module docs](super).
+    #[repr(transparent)]
     pub struct SortedSet<T> {
         h: Handle<T>,
     }
@@ -1271,7 +1280,7 @@ mod sorted_set {
             crate::enumerate::as_enum_handle(self.h)
         }
     }
-    impl<'a, T> IntoIterator for &'a SortedSet<T> {
+    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a SortedSet<T> {
         type Item = T;
         type IntoIter = crate::enumerate::Enumerator<T>;
         fn into_iter(self) -> Self::IntoIter {
@@ -1361,6 +1370,7 @@ mod linked_list {
     /// A managed `System.Collections.Generic.LinkedList<T>` — a doubly-linked list. `push_front`
     /// (`AddFirst`) and `push_back` are both exposed; `AddFirst`'s returned `LinkedListNode<T>` (a
     /// nested generic) is now bindable and simply discarded. See the [module docs](super).
+    #[repr(transparent)]
     pub struct LinkedList<T> {
         h: Handle<T>,
     }
@@ -1420,7 +1430,7 @@ mod linked_list {
             crate::enumerate::as_enum_handle(self.h)
         }
     }
-    impl<'a, T> IntoIterator for &'a LinkedList<T> {
+    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a LinkedList<T> {
         type Item = T;
         type IntoIter = crate::enumerate::Enumerator<T>;
         fn into_iter(self) -> Self::IntoIter {
@@ -1469,6 +1479,7 @@ mod priority_queue {
     /// queue (the lowest priority dequeues first; `P` must be `.NET`-comparable, `IComparable`).
     /// Elements with equal priority are **not** ordered relative to each other (as in C#). See the
     /// [module docs](super).
+    #[repr(transparent)]
     pub struct PriorityQueue<E, P> {
         h: Handle<E, P>,
     }
@@ -1551,6 +1562,7 @@ mod concurrent_dictionary {
     /// Removal (`TryRemove(K, out V)`) is **not** exposed: it returns the removed value through a .NET
     /// `out` parameter, which the current generic bridge cannot marshal (no by-ref `!N` argument).
     /// Everything else is by-value and fully supported. See the [module docs](super).
+    #[repr(transparent)]
     pub struct ConcurrentDictionary<K, V> {
         h: Handle<K, V>,
     }
@@ -1643,6 +1655,7 @@ mod concurrent_queue {
     /// supported pattern is *produce then drain by iteration* — enqueue on producers, then read the
     /// snapshot with `for x in &q` (each iteration takes a moment-in-time snapshot, as in C#). See the
     /// [module docs](super).
+    #[repr(transparent)]
     pub struct ConcurrentQueue<T> {
         h: Handle<T>,
     }
@@ -1682,7 +1695,7 @@ mod concurrent_queue {
             crate::enumerate::as_enum_handle(self.h)
         }
     }
-    impl<'a, T> IntoIterator for &'a ConcurrentQueue<T> {
+    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a ConcurrentQueue<T> {
         type Item = T;
         type IntoIter = crate::enumerate::Enumerator<T>;
         fn into_iter(self) -> Self::IntoIter {
@@ -1734,6 +1747,7 @@ mod concurrent_bag {
     /// `out` parameter, which the current generic bridge cannot marshal (no by-ref `!N` argument). The
     /// supported pattern is *add then drain by iteration* — `add` on producers, then read the snapshot
     /// with `for x in &bag` (unordered, as in C#). See the [module docs](super).
+    #[repr(transparent)]
     pub struct ConcurrentBag<T> {
         h: Handle<T>,
     }
@@ -1773,7 +1787,7 @@ mod concurrent_bag {
             crate::enumerate::as_enum_handle(self.h)
         }
     }
-    impl<'a, T> IntoIterator for &'a ConcurrentBag<T> {
+    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a ConcurrentBag<T> {
         type Item = T;
         type IntoIter = crate::enumerate::Enumerator<T>;
         fn into_iter(self) -> Self::IntoIter {

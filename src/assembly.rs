@@ -1,7 +1,7 @@
 use crate::{
     IString,
     basic_block::handler_for_block,
-    codegen_error::{CodegenError, MethodCodegenError},
+    codegen_error::CodegenError,
     utilis::{classify_magic_fn, is_comptime_entrypoint},
 };
 use cilly::{
@@ -14,17 +14,17 @@ use cilly::{
 };
 
 type Root = Interned<cilly::ir::CILRoot>;
-use crate::call_info::CallInfo;
+use crate::abi::AbiPlan;
 pub use crate::fn_ctx::MethodCompileCtx;
-use crate::fn_ctx::fn_name;
-use crate::operand::static_data::add_static;
-use crate::r#type::{GetTypeExt, adt::field_descrptor, get_type, utilis::is_zst};
+use crate::fn_ctx::fn_name_for_instance;
+use crate::operand::static_data::{add_static, static_is_nested};
+use crate::r#type::{GetTypeExt, adt::field_descrptor, get_type};
 use rustc_hir::attrs::CrateType;
 use rustc_middle::{
     middle::codegen_fn_attrs::CodegenFnAttrFlags,
     mir::{Local, LocalDecl, Statement, Terminator, interpret::GlobalAlloc},
     mono::MonoItem,
-    ty::{TyCtxt, TyKind},
+    ty::{Instance, TyCtxt, TyKind},
 };
 type LocalDefList = Vec<LocalDef>;
 type ArgsDebugInfo = Vec<Option<Interned<IString>>>;
@@ -38,6 +38,34 @@ fn is_reserved_runtime_symbol(name: &str) -> bool {
         && !["rcl_vec_", "rcl_map_", "rcl_str_"]
             .iter()
             .any(|prefix| name.starts_with(prefix))
+}
+
+/// Whether a non-Rust-ABI local function is part of the crate's native-facing public surface.
+///
+/// Merely using `extern "C"` does not make a function an external boundary: Mycorrhiza generates
+/// private C-ABI trampolines whose function pointers are consumed by managed delegate shims. Only
+/// an explicitly named export in a final library artifact can escape to a native caller. Keep this
+/// predicate shared with managed-storage validation so accessibility and GC-reference escape rules
+/// cannot drift apart.
+pub(crate) fn is_explicit_local_export<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: Instance<'tcx>,
+    name: &str,
+) -> bool {
+    let is_final_library_artifact = tcx.crate_types().iter().any(|crate_type| {
+        matches!(
+            crate_type,
+            CrateType::Cdylib | CrateType::Dylib | CrateType::StaticLib
+        )
+    });
+    if !is_final_library_artifact
+        || !instance.def_id().is_local()
+        || is_reserved_runtime_symbol(name)
+    {
+        return false;
+    }
+    let attrs = tcx.codegen_fn_attrs(instance.def_id());
+    attrs.flags.contains(CodegenFnAttrFlags::NO_MANGLE) || attrs.symbol_name.is_some()
 }
 
 /// Returns the list of all local variables within MIR of a function, and converts them to the internal type represenation `Type`
@@ -195,7 +223,7 @@ pub fn statement_to_ops<'tcx>(
 pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     name: &str,
     ctx: &'a mut MethodCompileCtx<'tcx, 'asm>,
-) -> Result<(), MethodCodegenError> {
+) -> Result<(), CodegenError> {
     let kind = ctx
         .instance()
         .ty(
@@ -262,8 +290,8 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         // creates a reachable `MethodImpl::Missing`, which the fatal post-link verifier correctly
         // rejects. Materialize a harmless void body: the function has already done its only job at
         // compile time, but remains a valid target if metadata reachability keeps the symbol alive.
-        let sig = CallInfo::sig_from_instance_(ctx.instance(), ctx)
-            .sig()
+        let sig = AbiPlan::from_instance(ctx.instance(), ctx)
+            .signature()
             .clone();
         assert!(
             sig.inputs().is_empty() && *sig.output() == Type::Void,
@@ -289,12 +317,10 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         return Ok(());
     }
     if classify_magic_fn(ctx.tcx(), ctx.instance().def_id()).is_some() {
-        println!(
-            "fn item {instance:?} is magic and is being skiped.",
-            instance = ctx.instance()
-        );
         return Ok(());
     }
+
+    crate::managed_storage::validate_body(ctx)?;
 
     let timer = ctx.tcx().prof.generic_activity_with_arg("codegen fn", name);
     // Check if function is public or not.
@@ -312,16 +338,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // (`eliminate_dead_fns`). This is what lets a **library** crate keep its public API: a library has
     // no entrypoint to root the call graph, so without this every method would be eliminated. (For a
     // binary it is a no-op beyond keeping unused exports, which is the correct semantics.)
-    let is_final_library_artifact = ctx.tcx().crate_types().iter().any(|crate_type| {
-        matches!(
-            crate_type,
-            CrateType::Cdylib | CrateType::Dylib | CrateType::StaticLib
-        )
-    });
-    let is_explicit_local_export = is_final_library_artifact
-        && ctx.instance().def_id().is_local()
-        && !is_reserved_runtime_symbol(name)
-        && (attrs.flags.contains(CodegenFnAttrFlags::NO_MANGLE) || attrs.symbol_name.is_some());
+    let is_explicit_local_export = is_explicit_local_export(ctx.tcx(), ctx.instance(), name);
     let access = if is_explicit_local_export {
         Access::Extern
     } else if attrs.contains_extern_indicator() {
@@ -359,25 +376,15 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         vec![]
     };
     // Handle the function signature
-    let call_site = CallInfo::sig_from_instance_(ctx.instance(), ctx);
-    let sig = call_site.sig().clone();
+    let abi = AbiPlan::from_instance(ctx.instance(), ctx);
+    let sig = abi.signature().clone();
 
     // Get locals
-    let (mut arg_names, mut locals) =
+    let (arg_names, mut locals) =
         locals_from_mir(&mir.local_decls, mir.arg_count, &mir.var_debug_info, ctx);
-    let requires_caller_location = ctx.instance().def.requires_caller_location(ctx.tcx());
-    let ordinary_abi_args = sig
-        .inputs()
-        .len()
-        .checked_sub(usize::from(requires_caller_location))
-        .expect("track_caller function ABI is missing its caller-location argument");
-    // Argument names are metadata for the physical CIL signature, not a semantic mirror of MIR
-    // locals. Rust-call may spread one MIR tuple into several ABI slots, while other shims may
-    // elide MIR-only arguments. Resize in either direction so metadata never invents an ABI
-    // invariant; lowering of the actual values is validated at each call site.
-    arg_names.resize(ordinary_abi_args, None);
-    if requires_caller_location {
-        arg_names.push(Some("panic_location".into_idx(ctx)));
+    let mut arg_names = abi.physical_argument_names(arg_names, mir, ctx);
+    if let Some(slot) = abi.caller_location_slot() {
+        arg_names[slot] = Some("panic_location".into_idx(ctx));
     }
     assert_eq!(arg_names.len(), sig.inputs().len());
 
@@ -402,16 +409,15 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         ));
         let mut repack_cil: Vec<Root> = Vec::new();
         // For each element of the tuple, get the argument spread_arg + n
-        let TyKind::Tuple(packed) = repacked_ty.kind() else {
-            panic!("Arg to spread not a tuple???")
-        };
-        for (arg_id, ty) in packed.iter().enumerate() {
-            if is_zst(ty, ctx.tcx()) {
+        let spread_fields = abi.rust_call_tuple_fields(mir, ctx);
+        for (field_id, (physical_slot, ty)) in spread_fields.into_iter().enumerate() {
+            if ctx.type_from_cache(ty) == Type::Void {
                 continue;
             }
-            let arg_field = field_descrptor(repacked_ty, arg_id.try_into().unwrap(), ctx);
-            let arg = spread_arg.as_u32() - 1 + u32::try_from(arg_id).unwrap();
-            let arg = ctx.alloc_node(cilly::ir::CILNode::LdArg(arg));
+            let arg_field = field_descrptor(repacked_ty, field_id.try_into().unwrap(), ctx);
+            let arg = ctx.alloc_node(cilly::ir::CILNode::LdArg(
+                u32::try_from(physical_slot).expect("ABI argument index exceeds u32"),
+            ));
             let repacked = ctx.alloc_node(cilly::ir::CILNode::LdLocA(repacked));
             repack_cil.push(ctx.alloc_root(cilly::CILRoot::SetField(Box::new((
                 arg_field, repacked, arg,
@@ -470,7 +476,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
                 let msg = rustc_middle::ty::print::with_no_trimmed_paths!(format!("{statement:?}"));
                 let dbg = ctx.debug_msg(&msg);
                 trees.push(dbg);
-                let msg = format!("{:?}", statement.source_info.span);
+                let msg = source_info_diagnostic_location(ctx, statement.source_info);
                 let dbg = ctx.debug_msg(&msg);
                 trees.push(dbg);
             }
@@ -665,7 +671,7 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
 pub fn checked_add_fn<'a: 'c, 'b: 'c, 'c>(
     ctx: &'a mut MethodCompileCtx<'b, 'c>,
     name: &str,
-) -> Result<(), MethodCodegenError> {
+) -> Result<(), CodegenError> {
     add_fn(name, ctx)
     /*match std::panic::catch_unwind(add_fn) {
         Ok(success) => success,
@@ -690,13 +696,14 @@ pub fn add_item<'tcx>(
 ) -> Result<(), CodegenError> {
     match item {
         MonoItem::Fn(instance) => {
-            let symbol_name: IString = fn_name(item.symbol_name(tcx)).into();
+            let symbol_name: IString = fn_name_for_instance(tcx, instance).into();
             let mut ctx = MethodCompileCtx::new(tcx, None, instance, asm);
             let fn_timer = tcx
                 .prof
                 .generic_activity_with_arg("compile function", item.symbol_name(tcx).to_string());
-            rustc_middle::ty::print::with_no_trimmed_paths! {checked_add_fn(  &mut ctx,&symbol_name,)
-            .expect("Could not add function!")};
+            rustc_middle::ty::print::with_no_trimmed_paths! {
+                checked_add_fn(&mut ctx, &symbol_name)?
+            };
             drop(fn_timer);
             Ok(())
         }
@@ -710,13 +717,31 @@ pub fn add_item<'tcx>(
                 item.symbol_name(tcx).to_string(),
             );
 
-            let alloc = tcx.eval_static_initializer(stotic).unwrap();
-            // The reservation registers the allocation with `tcx`; we don't need the id itself here.
-            let _alloc_id = tcx.reserve_and_set_memory_alloc(alloc);
-            let attrs = tcx.codegen_fn_attrs(stotic);
             let instance =
                 rustc_middle::ty::Instance::new_raw(stotic, rustc_middle::ty::List::empty());
             let mut ctx = MethodCompileCtx::new(tcx, None, instance, asm);
+            // Anonymous nested statics have no queryable Rust type (see `add_static`); their bytes
+            // come only from a const allocation and therefore cannot contain a runtime CLR ref.
+            if !static_is_nested(tcx, stotic) {
+                let static_ty = tcx
+                    .type_of(stotic)
+                    .instantiate_identity()
+                    .skip_normalization();
+                if let Some(violation) =
+                    crate::managed_storage::static_storage_violation(static_ty, &ctx)
+                {
+                    return Err(CodegenError::unsupported(
+                        "managed_reference_storage",
+                        format!(
+                            "static {stotic:?} stores {} at {} in native Rust storage (type {static_ty:?}); use a GCHandle-backed wrapper",
+                            violation.kind.description(),
+                            violation.path,
+                        ),
+                    ));
+                }
+            }
+            let alloc = tcx.eval_static_initializer(stotic).unwrap();
+            let attrs = tcx.codegen_fn_attrs(stotic);
             let int8_ptr = ctx.nptr(Type::Int(Int::I8));
             let int8_ptr_ptr = ctx.nptr(int8_ptr);
             if let Some(section) = attrs.link_section {
@@ -734,12 +759,12 @@ pub fn add_item<'tcx>(
                     {
                         let mut ctx = MethodCompileCtx::new(tcx, None, finstance, &mut ctx);
                         // If it is a function, patch its pointer up.
-                        let call_info = CallInfo::sig_from_instance_(finstance, &mut ctx);
-                        let function_name = fn_name(tcx.symbol_name(finstance));
+                        let abi = AbiPlan::from_instance(finstance, &mut ctx);
+                        let function_name = fn_name_for_instance(tcx, finstance);
                         MethodRef::new(
                             *ctx.main_module(),
                             ctx.alloc_string(function_name),
-                            ctx.alloc_sig(call_info.sig().clone()),
+                            ctx.alloc_sig(abi.signature().clone()),
                             MethodKind::Static,
                             vec![].into(),
                         )
@@ -789,10 +814,7 @@ pub(crate) fn span_source_info<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     source_info: rustc_middle::mir::SourceInfo,
 ) -> Interned<CILRoot> {
-    let span = outermost_inlined_callsite_span(ctx.body(), source_info);
-    let (file, lstart, cstart, lend, mut cend) =
-        ctx.tcx().sess.source_map().span_to_location_info(span);
-    let file = file.map_or(String::new(), |file| debuginfo_file_name(&file));
+    let (file, lstart, cstart, lend, mut cend) = source_info_location(ctx, source_info);
     if cstart >= cend {
         cend = cstart + 1;
     }
@@ -812,6 +834,31 @@ pub(crate) fn span_source_info<'tcx>(
         col_len,
         file,
     })
+}
+
+/// Formats a MIR source location without rustc's session-local hygiene/scope indices.
+///
+/// `Debug` formatting a `Span` appends values such as `(#510)`. The same upstream inline MIR can
+/// acquire a different number when instantiated in another crate, which made otherwise identical
+/// CIL method bodies fail strict cross-shard comparison. File/line/column coordinates are the
+/// stable, user-relevant part of that diagnostic.
+pub(crate) fn source_info_diagnostic_location<'tcx>(
+    ctx: &MethodCompileCtx<'tcx, '_>,
+    source_info: rustc_middle::mir::SourceInfo,
+) -> String {
+    let (file, line_start, col_start, line_end, col_end) = source_info_location(ctx, source_info);
+    format!("{file}:{line_start}:{col_start}: {line_end}:{col_end}")
+}
+
+fn source_info_location<'tcx>(
+    ctx: &MethodCompileCtx<'tcx, '_>,
+    source_info: rustc_middle::mir::SourceInfo,
+) -> (String, usize, usize, usize, usize) {
+    let span = outermost_inlined_callsite_span(ctx.body(), source_info);
+    let (file, line_start, col_start, line_end, col_end) =
+        ctx.tcx().sess.source_map().span_to_location_info(span);
+    let file = file.map_or(String::new(), |file| debuginfo_file_name(&file));
+    (file, line_start, col_start, line_end, col_end)
 }
 
 fn outermost_inlined_callsite_span<'tcx>(

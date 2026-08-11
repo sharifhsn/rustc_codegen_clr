@@ -1,21 +1,12 @@
 use crate::fn_ctx::MethodCompileCtx;
-use crate::r#type::{
-    GetTypeExt,
-    adt::{field_descrptor, variant_field_desc},
-    fat_ptr_to,
-    utilis::ptr_is_fat,
-};
-
 use crate::place::{PlaceTy, pointed_type};
-use cilly::{
-    Assembly, BinOp, Const, Interned, IntoAsmIndex, Type,
-    cilnode::{ExtendKind, IsPure},
-    {ClassRef, FieldDesc, Int, MethodRef, cilnode::MethodKind},
-};
+use crate::r#type::{GetTypeExt, utilis::ptr_is_fat};
+use cilly::{Assembly, ClassRef, Int, Interned, Type};
 use rustc_middle::{
     mir::PlaceElem,
-    ty::{FloatTy, IntTy, Ty, TyKind, UintTy},
+    ty::{FloatTy, IntTy, TyKind, UintTy},
 };
+
 pub fn local_set(
     local: usize,
     method: &rustc_middle::mir::Body,
@@ -41,212 +32,43 @@ pub fn local_set(
         asm.st_arg(u32::try_from(local - 1).unwrap(), tree)
     }
 }
-pub fn place_elem_set<'a>(
-    place_elem: &PlaceElem<'a>,
-    curr_type: PlaceTy<'a>,
-    ctx: &mut MethodCompileCtx<'a, '_>,
-    addr_calc: Interned<cilly::ir::CILNode>,
-    value_calc: Interned<cilly::ir::CILNode>,
+
+pub fn place_elem_set<'tcx>(
+    place_elem: &PlaceElem<'tcx>,
+    curr_type: PlaceTy<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    base: Interned<cilly::ir::CILNode>,
+    value: Interned<cilly::ir::CILNode>,
 ) -> Interned<cilly::ir::CILRoot> {
+    let curr_type = curr_type.monomorphize(ctx);
+    if let Some(field) = super::projection::FieldProjection::lower(place_elem, curr_type, base, ctx)
+    {
+        return field.set(base, value, ctx);
+    }
+    if let Some(sequence) =
+        super::projection::SequenceProjection::lower(place_elem, curr_type, base, ctx)
+    {
+        return ptr_set_op(sequence.element_ty.into(), ctx, sequence.address, value);
+    }
+    if super::projection::SubsliceProjection::lower(place_elem, curr_type, base, ctx).is_some() {
+        panic!("cannot assign to a subslice by value");
+    }
+
     match place_elem {
-        PlaceElem::Deref => {
-            let pointed_type = pointed_type(curr_type);
-
-            ptr_set_op(pointed_type.into(), ctx, addr_calc, value_calc)
+        PlaceElem::Deref => ptr_set_op(pointed_type(curr_type).into(), ctx, base, value),
+        PlaceElem::Downcast(..) | PlaceElem::OpaqueCast(..) | PlaceElem::UnwrapUnsafeBinder(..) => {
+            let ty = curr_type
+                .as_ty()
+                .expect("cannot assign an enum-variant marker without a field");
+            ptr_set_op(ty.into(), ctx, base, value)
         }
-        PlaceElem::Field(field_index, field_type) => match curr_type {
-            PlaceTy::Ty(curr_type) => {
-                let curr_type = ctx.monomorphize(curr_type);
-                // When the field's owner is a DST-tailed struct (e.g. `ArcInner<[u8]>`), it is
-                // addressed through a *fat pointer*, so `addr_calc` is the address of that fat
-                // pointer — not the object itself. A plain `SetField` would write into the fat
-                // pointer's own bytes (clobbering its DATA_PTR/METADATA). Mirror the read/address
-                // paths (`body_field` / `field_address` `(true, _)`): load DATA_PTR, add the field
-                // offset, and store through that address. (The fat-tail field — `(true, true)` — is
-                // itself unsized and cannot be assigned through a place-set, so only the sized-field
-                // `(true, false)` case is handled here.)
-                if ptr_is_fat(curr_type, ctx.tcx(), ctx.instance()) {
-                    let field_type = ctx.monomorphize(*field_type);
-                    let offset = crate::r#type::adt::FieldOffsetIterator::fields(
-                        ctx.layout_of(curr_type).layout.0.0.clone(),
-                    )
-                    .nth(field_index.as_usize())
-                    .expect("Field index not in field offset iterator");
-                    let curr_type_fat_ptr = ctx.type_from_cache(Ty::new_ptr(
-                        ctx.tcx(),
-                        curr_type,
-                        rustc_middle::ty::Mutability::Mut,
-                    ));
-                    let void_ptr = ctx.nptr(Type::Void);
-                    let data_ptr_name = ctx.alloc_string(cilly::DATA_PTR);
-                    let addr_descr = ctx.alloc_field(FieldDesc::new(
-                        curr_type_fat_ptr.as_class_ref().unwrap(),
-                        data_ptr_name,
-                        void_ptr,
-                    ));
-                    // The real object address is the fat pointer's DATA_PTR (+ the field offset).
-                    let obj_addr = ctx.ld_field(addr_calc, addr_descr);
-                    let field_addr = if offset == 0 {
-                        obj_addr
-                    } else {
-                        ctx.biop(obj_addr, Const::USize(u64::from(offset)), BinOp::Add)
-                    };
-                    return ptr_set_op(field_type.into(), ctx, field_addr, value_calc);
-                }
-                let field_desc = field_descrptor(curr_type, (*field_index).into(), ctx);
-                ctx.set_field(field_desc, addr_calc, value_calc)
-            }
-            super::PlaceTy::EnumVariant(enm, var_idx) => {
-                let enm = ctx.monomorphize(enm);
-                let field_desc = variant_field_desc(enm, field_index.as_u32(), var_idx, ctx);
-
-                ctx.set_field(field_desc, addr_calc, value_calc)
-            }
+        _ => rustc_middle::ty::print::with_no_trimmed_paths! {
+            todo!("cannot assign through projection {place_elem:?}")
         },
-        PlaceElem::Index(index) => {
-            let curr_ty = curr_type
-                .as_ty()
-                .expect("INVALID PLACE: Indexing into enum variant???");
-            let index = crate::place::get::local_get(index.as_usize(), ctx.body(), ctx);
-
-            match curr_ty.kind() {
-                TyKind::Slice(inner) => {
-                    let inner = ctx.monomorphize(*inner);
-                    let inner_type = ctx.type_from_cache(inner);
-                    let inner_ptr = ctx.nptr(inner_type);
-                    let slice = fat_ptr_to(Ty::new_slice(ctx.tcx(), inner), ctx);
-                    let desc = FieldDesc::new(
-                        slice,
-                        ctx.alloc_string(cilly::DATA_PTR),
-                        ctx.nptr(Type::Void),
-                    );
-                    let desc = ctx.alloc_field(desc);
-                    let field_val = ctx.ld_field(addr_calc, desc);
-                    let size = ctx.size_of(inner_type).into_idx(ctx);
-                    let size = ctx.alloc_node(cilly::CILNode::IntCast {
-                        input: size,
-                        target: Int::USize,
-                        extend: cilly::cilnode::ExtendKind::ZeroExtend,
-                    });
-                    let offset = ctx.biop(index, size, BinOp::Mul);
-                    let field_val = ctx.cast_ptr(field_val, inner_ptr);
-                    let addr_calc = ctx.biop(field_val, offset, BinOp::Add);
-                    ptr_set_op(super::PlaceTy::Ty(inner), ctx, addr_calc, value_calc)
-                }
-                TyKind::Array(element, _length) => {
-                    let element = ctx.monomorphize(*element);
-                    let array_type = ctx.type_from_cache(curr_ty);
-                    let element_type = ctx.type_from_cache(element);
-
-                    let array_dotnet = array_type.as_class_ref().expect("Non array type");
-                    let arr_ref = ctx.nref(array_type);
-                    let mref = MethodRef::new(
-                        array_dotnet,
-                        ctx.alloc_string("set_Item"),
-                        ctx.sig([arr_ref, Type::Int(Int::USize), element_type], Type::Void),
-                        MethodKind::Instance,
-                        vec![].into(),
-                    );
-                    let mref = ctx.alloc_methodref(mref);
-                    ctx.call_root(mref, &[addr_calc, index, value_calc], IsPure::NOT)
-                }
-                _ => {
-                    rustc_middle::ty::print::with_no_trimmed_paths! { todo!("Can't index into {curr_ty}!")}
-                }
-            }
-        }
-        PlaceElem::ConstantIndex {
-            offset,
-            min_length,
-            from_end,
-        } => {
-            let _ = min_length;
-            let curr_ty = curr_type
-                .as_ty()
-                .expect("INVALID PLACE: Indexing into enum variant???");
-
-            match curr_ty.kind() {
-                TyKind::Slice(inner) => {
-                    let inner = ctx.monomorphize(*inner);
-
-                    let inner_type = ctx.type_from_cache(inner);
-                    let slice = fat_ptr_to(Ty::new_slice(ctx.tcx(), inner), ctx);
-                    let desc = FieldDesc::new(
-                        slice,
-                        ctx.alloc_string(cilly::DATA_PTR),
-                        ctx.nptr(Type::Void),
-                    );
-                    let metadata = FieldDesc::new(
-                        slice,
-                        ctx.alloc_string(cilly::METADATA),
-                        Type::Int(Int::USize),
-                    );
-                    let mref = MethodRef::new(
-                        *ctx.main_module(),
-                        ctx.alloc_string("bounds_check"),
-                        ctx.sig(
-                            [Type::Int(Int::USize), Type::Int(Int::USize)],
-                            Type::Int(Int::USize),
-                        ),
-                        MethodKind::Static,
-                        vec![].into(),
-                    );
-                    let desc = ctx.alloc_field(desc);
-                    let metadata = ctx.alloc_field(metadata);
-                    let inner_ptr = ctx.nptr(inner_type);
-
-                    let base = ctx.ld_field(addr_calc, desc);
-                    let base = ctx.cast_ptr(base, inner_ptr);
-
-                    let meta_val = ctx.ld_field(addr_calc, metadata);
-                    // `from_end` slice tail-patterns (e.g. `let [.., x] = ..`) index
-                    // relative to the slice length: index = len - offset.
-                    let index = if *from_end {
-                        ctx.biop(meta_val, Const::USize(*offset), BinOp::Sub)
-                    } else {
-                        ctx.alloc_node(Const::USize(*offset))
-                    };
-                    let index_us = ctx.int_cast(index, Int::USize, ExtendKind::ZeroExtend);
-                    let mref = ctx.alloc_methodref(mref);
-                    let checked = ctx.call(mref, &[index_us, meta_val], IsPure::NOT);
-
-                    let stride = ctx.size_of(inner_type).into_idx(ctx);
-                    let stride = ctx.int_cast(stride, Int::USize, ExtendKind::ZeroExtend);
-                    let scaled = ctx.biop(checked, stride, BinOp::Mul);
-                    let addr = ctx.biop(base, scaled, BinOp::Add);
-                    ptr_set_op(super::PlaceTy::Ty(inner), ctx, addr, value_calc)
-                }
-                TyKind::Array(element, _length) => {
-                    //println!("WARNING: ConstantIndex has required min_length of {min_length}, but bounds checking on const access not supported yet!");
-                    // Arrays have a static length, so rustc never lowers array
-                    // tail-patterns to `from_end`.
-                    assert!(!from_end, "Can't index array from end!");
-                    let index = ctx.alloc_node(Const::USize(*offset));
-                    let element = ctx.monomorphize(*element);
-                    let element = ctx.type_from_cache(element);
-                    let array_type = ctx.type_from_cache(curr_ty);
-                    let array_dotnet = array_type.as_class_ref().expect("Non array type");
-                    let arr_ref = ctx.nref(array_type);
-                    let mref = MethodRef::new(
-                        array_dotnet,
-                        ctx.alloc_string("set_Item"),
-                        ctx.sig([arr_ref, Type::Int(Int::USize), element], Type::Void),
-                        MethodKind::Instance,
-                        vec![].into(),
-                    );
-                    let mref = ctx.alloc_methodref(mref);
-                    let index_us = ctx.int_cast(index, Int::USize, ExtendKind::ZeroExtend);
-                    ctx.call_root(mref, &[addr_calc, index_us, value_calc], IsPure::NOT)
-                }
-                _ => {
-                    rustc_middle::ty::print::with_no_trimmed_paths! { todo!("Can't index into {curr_ty}!")}
-                }
-            }
-        }
-        _ => todo!("Can't handle porojection {place_elem:?} in set"),
     }
 }
-/// Returns a set of instructons to set a pointer to a `pointed_type` to a value from the stack.
+
+/// Stores a value through a pointer to a Rust place type.
 pub fn ptr_set_op<'tcx>(
     pointed_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
@@ -294,10 +116,7 @@ pub fn ptr_set_op<'tcx>(
                     ctx.st_ind(addr_calc, value_calc, Type::Float(cilly::Float::F16), false)
                 }
             },
-            // Both Rust bool and a managed bool are 1 byte wide. .NET bools are 4 byte wide only in the context of Marshaling/PInvoke,
-            // due to historic reasons(BOOL was an alias for int in early Windows, and it stayed this way.) - FractalFir
             TyKind::Bool => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I8), false),
-            // always 4 bytes wide: https://doc.rust-lang.org/std/primitive.char.html#representation
             TyKind::Char => ctx.st_ind(addr_calc, value_calc, Type::Int(Int::I32), false),
             TyKind::Adt(_, _)
             | TyKind::Tuple(_)
@@ -327,18 +146,13 @@ pub fn ptr_set_op<'tcx>(
                     ctx.st_ind(addr_calc, value_calc, ptr, false)
                 }
             }
-            // A fn-ptr is a by-VALUE pointer-sized scalar whose cached `Type` is already
-            // `Type::FnPtr(sig)` — the value-type to store, exactly like an Adt. Mirror the
-            // Adt/Tuple/Closure/Coroutine arm (`type_from_cache` + `st_ind`), NOT the Ref/RawPtr
-            // arms (which rebuild an `nptr(inner)` for a pointer-to lowering). `st_ind` emits
-            // `stind.i`, which the exporters + typechecker already accept for `Type::FnPtr`.
             TyKind::FnPtr(..) => {
                 let pointed_type = ctx.type_from_cache(pointed_type);
                 ctx.st_ind(addr_calc, value_calc, pointed_type, false)
             }
-            _ => todo!(" can't deref type {pointed_type:?} yet"),
+            _ => todo!("cannot store through pointer to {pointed_type:?}"),
         }
     } else {
-        todo!("Can't set the value behind a poitner to an enum variant!");
+        todo!("cannot store through a pointer to an enum-variant marker");
     }
 }

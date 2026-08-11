@@ -45,9 +45,11 @@
 //! wrappers use these handles for `List<T>.Sort(Comparison<T>)` and
 //! `List<T>.ForEach(Action<T>)`. See `cargo_tests/cd_collections` for the end-to-end proof.
 
+use crate::ManagedRootableType;
 use crate::intrinsics::{
     RustcCLRInteropManagedGeneric, RustcCLRInteropTypeGeneric, rustc_clr_interop_delegate,
 };
+use crate::managed_option::ManagedRef;
 
 // Delegates live in the core implementation assembly (a ref assembly forwards + throws at JIT).
 const CORELIB: &str = "System.Private.CoreLib";
@@ -66,6 +68,7 @@ const INVOKE: &str = "Invoke";
 /// callbacks. Capturing closures follow the same process-lifetime rule as the generic wrappers;
 /// APIs that can prove unregistration (such as `CancellationRegistration`) own and reclaim the
 /// environment separately.
+#[repr(transparent)]
 pub struct Action0 {
     h: crate::bindings::System::Action,
 }
@@ -152,6 +155,7 @@ macro_rules! delegate_wrapper {
             invoke ( $($ia:ident : $iaty:ident),* ) -> $iret:ty
     ) => {
         $(#[$meta])*
+        #[repr(transparent)]
         pub struct $name< $($garg),+ > {
             h: RustcCLRInteropManagedGeneric<{ CORELIB }, { $class }, ( $($genarg,)+ )>,
         }
@@ -230,6 +234,7 @@ macro_rules! delegate_wrapper {
 /// used by many BCL and third-party events. Unlike [`Action2`], this is a non-generic CLR delegate
 /// type, so its handle can be passed directly to generated `add_*`/`remove_*` methods that accept
 /// `System.EventHandler`.
+#[repr(transparent)]
 pub struct EventHandler {
     h: crate::bindings::System::EventHandler,
 }
@@ -318,14 +323,33 @@ impl EventHandler {
 /// Generated bindings expose event accessors as ordinary functions taking `(owner, delegate)`.
 /// Pass those small adapters to [`subscribe`](Self::subscribe); the guard retains both managed
 /// handles so removal cannot accidentally use a different delegate instance.
-pub struct EventSubscription<Owner: Copy, Delegate: Copy> {
-    owner: Owner,
-    delegate: Delegate,
+pub struct EventSubscription<
+    Owner: ManagedRootableType + Copy,
+    Delegate: ManagedRootableType + Copy,
+> {
+    owner: ManagedRef<Owner>,
+    delegate: ManagedRef<Delegate>,
     remove: fn(Owner, Delegate),
+    state: SubscriptionState,
+}
+
+#[derive(Clone, Copy)]
+struct SubscriptionState {
     active: bool,
 }
 
-impl<Owner: Copy, Delegate: Copy> EventSubscription<Owner, Delegate> {
+impl SubscriptionState {
+    fn detach(&mut self, remove: impl FnOnce()) {
+        if self.active {
+            remove();
+            self.active = false;
+        }
+    }
+}
+
+impl<Owner: ManagedRootableType + Copy, Delegate: ManagedRootableType + Copy>
+    EventSubscription<Owner, Delegate>
+{
     /// Register `delegate` with `add` and return an active unsubscription guard.
     #[inline]
     pub fn subscribe(
@@ -336,17 +360,17 @@ impl<Owner: Copy, Delegate: Copy> EventSubscription<Owner, Delegate> {
     ) -> Self {
         add(owner, delegate);
         Self {
-            owner,
-            delegate,
+            owner: ManagedRef::from_raw(owner),
+            delegate: ManagedRef::from_raw(delegate),
             remove,
-            active: true,
+            state: SubscriptionState { active: true },
         }
     }
 
     /// Whether this guard still owns an active event registration.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.active
+        self.state.active
     }
 
     /// Remove the handler now. Drop observes the inactive state and does not remove twice.
@@ -356,14 +380,17 @@ impl<Owner: Copy, Delegate: Copy> EventSubscription<Owner, Delegate> {
     }
 
     fn detach(&mut self) {
-        if self.active {
-            (self.remove)(self.owner, self.delegate);
-            self.active = false;
-        }
+        let owner = &self.owner;
+        let delegate = &self.delegate;
+        let remove = self.remove;
+        self.state
+            .detach(|| remove(owner.copy_raw(), delegate.copy_raw()));
     }
 }
 
-impl<Owner: Copy, Delegate: Copy> Drop for EventSubscription<Owner, Delegate> {
+impl<Owner: ManagedRootableType + Copy, Delegate: ManagedRootableType + Copy> Drop
+    for EventSubscription<Owner, Delegate>
+{
     fn drop(&mut self) {
         self.detach();
     }
@@ -587,38 +614,22 @@ impl<T0, T1, T2, R> Func3<T0, T1, T2, R> {
 
 #[cfg(test)]
 mod tests {
-    use super::EventSubscription;
+    use super::SubscriptionState;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static ADDS: AtomicUsize = AtomicUsize::new(0);
     static REMOVES: AtomicUsize = AtomicUsize::new(0);
 
-    fn add(owner: u8, delegate: u16) {
-        assert_eq!((owner, delegate), (7, 42));
-        ADDS.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn remove(owner: u8, delegate: u16) {
-        assert_eq!((owner, delegate), (7, 42));
-        REMOVES.fetch_add(1, Ordering::SeqCst);
-    }
-
     #[test]
-    fn event_subscription_removes_exactly_once_explicitly_or_on_drop() {
-        ADDS.store(0, Ordering::SeqCst);
+    fn event_subscription_state_removes_exactly_once() {
         REMOVES.store(0, Ordering::SeqCst);
-
-        let subscription = EventSubscription::subscribe(7, 42, add, remove);
-        assert!(subscription.is_active());
-        subscription.unsubscribe();
+        let mut state = SubscriptionState { active: true };
+        state.detach(|| {
+            REMOVES.fetch_add(1, Ordering::SeqCst);
+        });
+        state.detach(|| {
+            REMOVES.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(!state.active);
         assert_eq!(REMOVES.load(Ordering::SeqCst), 1);
-
-        {
-            let subscription = EventSubscription::subscribe(7, 42, add, remove);
-            assert!(subscription.is_active());
-        }
-
-        assert_eq!(ADDS.load(Ordering::SeqCst), 2);
-        assert_eq!(REMOVES.load(Ordering::SeqCst), 2);
     }
 }

@@ -101,6 +101,11 @@ pub fn run(args: &PackArgs) -> Result<i32> {
 
     // ---- build the cdylib via the SAME native pipeline ----
     let _build_lock = crate::build_lock::BuildLock::acquire_crate(&ctx)?;
+    // A fresh clone has only the checked-in dependency record. Restore its ignored assets first,
+    // then retain one coherent read lease through the build and complete package assembly so an
+    // overlapping add-nuget transaction cannot splice two dependency revisions into one nupkg.
+    nuget::ensure_staged(&ctx)?;
+    let nuget_lease = nuget::acquire_project_lease(&ctx.crate_dir)?;
     xmldoc::prepare(&ctx)?;
     let private_sysroot = crate::private_sysroot::prepare(&ctx)?;
     overlays::apply(&ctx)?;
@@ -166,7 +171,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
 
     // Real transitive NuGet dependencies for anything this crate pulled in via `add-nuget` — see
     // the module doc for why this is a `<dependency>` and not a bundled dll.
-    let dependencies = nuget::recorded_dependencies(&ctx.crate_dir)?;
+    let dependencies = nuget_lease.recorded_dependencies()?;
     for (id, ver) in &dependencies {
         eprintln!("== cargo dotnet pack: declaring NuGet dependency {id} {ver} ==");
     }
@@ -184,10 +189,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     // `add-nuget` owns a complete SDK-selected graph under the crate.  Package it under its
     // original NuGet paths: `copy_assets` flattens for CLR probing beside an executable, but a
     // `.nupkg` must retain RID/native/culture directories for the consumer SDK to select.
-    // Re-stage first (see `nuget::ensure_staged`'s doc) — a fresh clone's gitignored assets dir
-    // would otherwise silently pack an incomplete/empty asset set with no error.
-    nuget::ensure_staged(&ctx)?;
-    let staged_assets = nuget::staged_package_assets(&ctx.crate_dir)?;
+    let staged_assets = nuget_lease.staged_package_assets()?;
     if !staged_assets.is_empty() {
         eprintln!(
             "== cargo dotnet pack: preserving {} staged runtime/native/resource NuGet assets ==",

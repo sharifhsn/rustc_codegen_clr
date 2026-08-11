@@ -34,6 +34,7 @@ use crate::system::DotNetString;
 /// This is a move/`Copy` handle to a managed object; the .NET GC owns the underlying `System.Uri`,
 /// so there is no `Drop`.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Uri {
     h: MUri,
 }

@@ -51,6 +51,7 @@ use crate::intrinsics::{
     rustc_clr_interop_managed_checked_cast as cast, rustc_clr_interop_managed_new_arr as new_arr,
     rustc_clr_interop_managed_set_elem as set_elem,
 };
+use crate::managed_option::ManagedRef;
 use crate::system::{DotNetString, MString};
 use std::marker::PhantomData;
 
@@ -159,14 +160,23 @@ fn to_rust(s: MString) -> std::string::String {
 
 /// A node in an expression tree (`System.Linq.Expressions.Expression`).
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Expr {
     inner: CExpr,
 }
 
 /// A typed lambda parameter (`ParameterExpression`).
-#[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Param {
-    inner: CParam,
+    inner: ManagedRef<CParam>,
+}
+
+impl Clone for Param {
+    fn clone(&self) -> Self {
+        Self {
+            inner: ManagedRef::from_raw(self.inner.copy_raw()),
+        }
+    }
 }
 
 impl Param {
@@ -177,14 +187,16 @@ impl Param {
         // `Type.GetType(string, bool throwOnError=false)`.
         let ty = CType::static2::<"GetType", MString, bool, CType>(mstr(type_name), false);
         let inner = CExpr::static2::<"Parameter", CType, MString, CParam>(ty, mstr(name));
-        Param { inner }
+        Param {
+            inner: ManagedRef::from_raw(inner),
+        }
     }
 
     /// Use this parameter as an operand (upcast `ParameterExpression` -> `Expression`).
     #[must_use]
-    pub fn expr(self) -> Expr {
+    pub fn expr(&self) -> Expr {
         Expr {
-            inner: cast::<CExpr, CParam>(self.inner),
+            inner: cast::<CExpr, CParam>(self.inner.copy_raw()),
         }
     }
 
@@ -195,12 +207,12 @@ impl Param {
     /// nameable from outside this module.
     #[must_use]
     pub fn raw(
-        self,
+        &self,
     ) -> crate::intrinsics::RustcCLRInteropManagedClass<
         "System.Linq.Expressions",
         "System.Linq.Expressions.ParameterExpression",
     > {
-        self.inner
+        self.inner.copy_raw()
     }
 }
 
@@ -591,7 +603,7 @@ impl Expr {
         let arr: RustcCLRInteropManagedArray<CParam, 1> = new_arr::<CParam>(params.len() as i32);
         let mut i = 0i32;
         for p in params {
-            set_elem::<CParam>(arr, i, p.inner);
+            set_elem::<CParam>(arr, i, p.inner.copy_raw());
             i += 1;
         }
         let inner =
@@ -610,7 +622,7 @@ impl Expr {
     #[must_use]
     pub fn typed_pred(self, p: &Param) -> Predicate {
         let arr: CParamArr = new_arr::<CParam>(1);
-        set_elem::<CParam>(arr, 0, p.inner);
+        set_elem::<CParam>(arr, 0, p.inner.copy_raw());
         // Expression.Lambda<Func<int,bool>>(body: Expression, prms: ParameterExpression[])
         //   KIND=0 (static), ClassGenerics=() (Expression is a non-generic declaring class),
         //   MethodGenerics=(Func<int,bool>,), Sig = (ret: Expression<!!0>, body: Expression, prms[]).
@@ -634,6 +646,7 @@ impl Expr {
 /// A strongly-typed predicate — `Expression<Func<int,bool>>`, the exact type EF Core's
 /// `IQueryable<int>.Where(Expression<Func<int,bool>>)` consumes.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Predicate {
     inner: CExprFuncIB,
 }
@@ -714,7 +727,7 @@ pub const PARAMETER_REBINDER_CLASS: &str = "Mycorrhiza.Linq.ParameterRebinder";
 /// Rewrite every occurrence of `from` inside `body` to `to` — `ParameterRebinder.Rebind(body, from, to)`.
 /// This is the one place parameter-identity is reconciled; everything above just needs to call it before
 /// combining two independently-built trees.
-fn rebind_param(body: Expr, from: Param, to: Param) -> Expr {
+fn rebind_param(body: Expr, from: &Param, to: &Param) -> Expr {
     use crate::intrinsics::rustc_clr_interop_managed_call3_ as call3;
     let inner: CExpr = call3::<
         "Mycorrhiza.Interop.Helpers",
@@ -726,7 +739,7 @@ fn rebind_param(body: Expr, from: Param, to: Param) -> Expr {
         CExpr,
         CParam,
         CParam,
-    >(body.inner, from.inner, to.inner);
+    >(body.inner, from.inner.copy_raw(), to.inner.copy_raw());
     Expr { inner }
 }
 
@@ -741,19 +754,19 @@ fn rebind_param(body: Expr, from: Param, to: Param) -> Expr {
 /// references to the left-hand side's parameter (see `rebind_param`) before combining — this is the
 /// actual, LINQKit-equivalent fix for the "two `ParameterExpression` instances" problem, not a shortcut.
 pub struct TypedPredicate<T> {
-    body: Expr,
+    body: ManagedRef<CExpr>,
     param: Param,
     _marker: PhantomData<fn() -> T>,
 }
 
-// Manual `Clone`/`Copy` impls (not `#[derive]`d): `derive` would wrongly require `T: Clone + Copy`,
-// but `T` is a phantom marker only — the actual payload (`Expr`, `Param`) is `Copy` regardless of `T`.
+// Cloning creates independent GCHandle roots for the two managed expression-tree objects. The
+// predicate is intentionally not `Copy`: ordinary Rust aggregate copies may not duplicate naked
+// CLR references, and token ownership must remain explicit.
 impl<T> Clone for TypedPredicate<T> {
     fn clone(&self) -> Self {
-        *self
+        Self::new(self.param(), self.body())
     }
 }
-impl<T> Copy for TypedPredicate<T> {}
 
 /// Cosmetic alias: `Filter<Person>` reads a little more like the thing it is (a reusable filter over an
 /// entity) than `TypedPredicate<Person>` — purely a naming convenience, identical type either way.
@@ -765,7 +778,7 @@ impl<T> TypedPredicate<T> {
     #[must_use]
     pub fn new(param: Param, body: Expr) -> Self {
         TypedPredicate {
-            body,
+            body: ManagedRef::from_raw(body.inner),
             param,
             _marker: PhantomData,
         }
@@ -773,8 +786,8 @@ impl<T> TypedPredicate<T> {
 
     /// The parameter this predicate's body is expressed in terms of.
     #[must_use]
-    pub fn param(self) -> Param {
-        self.param
+    pub fn param(&self) -> Param {
+        self.param.clone()
     }
 
     /// A trivially-true predicate (`1 == 1`) over entity type `T` — e.g. for a "no filter applied"
@@ -805,39 +818,39 @@ impl<T> TypedPredicate<T> {
     /// (mirrors [`Expr::typed_pred`]'s int-specialized version, generalized to the caller's own entity
     /// type — see the module-level doc for why that final typing step is deliberately NOT done here).
     #[must_use]
-    pub fn body(self) -> Expr {
-        self.body
+    pub fn body(&self) -> Expr {
+        Expr {
+            inner: self.body.copy_raw(),
+        }
     }
 
     /// The provider-visible rendering of the body (`Expression.ToString()`).
     #[must_use]
-    pub fn text(self) -> std::string::String {
-        self.body.text()
+    pub fn text(&self) -> std::string::String {
+        self.body().text()
     }
 
     /// Reference-compare two `ParameterExpression`s — `object.ReferenceEquals`. `Param::new` allocates a
     /// fresh `ParameterExpression` on every call, so two predicates built independently (even with
     /// identical `type_name`/`name` arguments) almost always have DISTINCT parameter identity; this is
     /// exactly the condition `BitAnd`/`BitOr` must detect and correct for.
-    fn same_param(a: Param, b: Param) -> bool {
-        let a_obj = cast::<CObject, CParam>(a.inner);
-        let b_obj = cast::<CObject, CParam>(b.inner);
+    fn same_param(a: &Param, b: &Param) -> bool {
+        let a_obj = cast::<CObject, CParam>(a.inner.copy_raw());
+        let b_obj = cast::<CObject, CParam>(b.inner.copy_raw());
         CObject::static2::<"ReferenceEquals", CObject, CObject, bool>(a_obj, b_obj)
     }
 
     /// Combine two predicates' bodies with `op`, first rewriting `rhs` onto `self`'s parameter if the two
     /// were built against different `ParameterExpression` instances (the ParameterRebinder fix).
     fn combine<const OP: &'static str>(self, rhs: Self) -> Self {
-        let rhs_body = if Self::same_param(self.param, rhs.param) {
-            rhs.body
+        let self_param = self.param();
+        let rhs_param = rhs.param();
+        let rhs_body = if Self::same_param(&self_param, &rhs_param) {
+            rhs.body()
         } else {
-            rebind_param(rhs.body, rhs.param, self.param)
+            rebind_param(rhs.body(), &rhs_param, &self_param)
         };
-        TypedPredicate {
-            body: binop::<OP>(self.body, rhs_body),
-            param: self.param,
-            _marker: PhantomData,
-        }
+        TypedPredicate::new(self_param, binop::<OP>(self.body(), rhs_body))
     }
 }
 
@@ -861,11 +874,7 @@ impl<T> std::ops::Not for TypedPredicate<T> {
     type Output = TypedPredicate<T>;
     /// `!self` — negates the body in place; no parameter rebinding needed (only one operand).
     fn not(self) -> Self::Output {
-        TypedPredicate {
-            body: self.body.not(),
-            param: self.param,
-            _marker: PhantomData,
-        }
+        TypedPredicate::new(self.param(), self.body().not())
     }
 }
 
@@ -874,6 +883,7 @@ impl<T> std::ops::Not for TypedPredicate<T> {
 /// the actual `IQueryable.Where(Expression<Func>)` handoff — the whole point of building expression
 /// trees. All three operators are generic methods on `System.Linq.Queryable` (`!!0 = int`).
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct IntQuery {
     inner: CIQueryInt,
 }
@@ -941,6 +951,7 @@ impl IntQuery {
 
 /// A compiled-or-uncompiled lambda expression (`LambdaExpression`).
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Lambda {
     inner: CLambda,
 }
@@ -976,6 +987,7 @@ impl Lambda {
 /// arguments cross as a boxed `object[]` and the boolean result unboxes via `Convert.ToBoolean`, so
 /// this executes the tree end-to-end and returns the real answer (not just "it compiled").
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Compiled {
     del: CDelegate,
 }
@@ -1107,7 +1119,7 @@ pub fn typed_lambda<TDelegate, TExprDelegate>(body: Expr, params: &[&Param]) -> 
     let arr: CParamArr = new_arr::<CParam>(params.len() as i32);
     let mut i = 0i32;
     for p in params {
-        set_elem::<CParam>(arr, i, p.inner);
+        set_elem::<CParam>(arr, i, p.inner.copy_raw());
         i += 1;
     }
     gmethod2::<

@@ -9,6 +9,7 @@ use rustc_middle::mir::Place;
 mod address;
 mod body;
 mod get;
+mod projection;
 mod set;
 pub use address::*;
 pub use body::*;
@@ -16,11 +17,6 @@ pub use get::*;
 use rustc_middle::ty::{Ty, TyKind};
 pub use set::*;
 
-fn slice_head<T>(slice: &[T]) -> (&T, &[T]) {
-    assert!(!slice.is_empty());
-    let last = &slice[slice.len() - 1];
-    (last, &slice[..(slice.len() - 1)])
-}
 fn pointed_type(ty: PlaceTy) -> Ty {
     if let PlaceTy::Ty(ty) = ty {
         if let TyKind::Ref(_region, inner, _mut) = ty.kind() {
@@ -57,6 +53,12 @@ fn body_ty_is_by_address<'tcx>(last_ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tc
         | TyKind::Char
         | TyKind::FnPtr(..) => false,
         TyKind::Ref(_, ty, _) | TyKind::RawPtr(ty, _) => ptr_is_fat(ty, ctx.tcx(), ctx.instance()),
+        TyKind::UnsafeBinder(bound_ty) => {
+            let inner = ctx
+                .tcx()
+                .instantiate_bound_regions_with_erased(bound_ty.into());
+            body_ty_is_by_address(inner, ctx)
+        }
         _ => todo!(
             "TODO: body_ty_is_by_address does not support type {last_ty:?} kind:{kind:?}",
             kind = last_ty.kind()
@@ -169,8 +171,8 @@ pub fn place_address<'a>(
     place: &Place<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
 ) -> Interned<cilly::ir::CILNode> {
-    let place_ty = place.ty(ctx.body(), ctx.tcx());
-    let place_ty = ctx.monomorphize(place_ty).ty;
+    let lowered = projection::LoweredPlace::new(place, ctx);
+    let place_ty = lowered.result_ty;
 
     let layout = ctx.layout_of(place_ty);
     // A *free-standing* ZST place (a ZST local with no projection) has no storage, so a dangling
@@ -182,7 +184,7 @@ pub fn place_address<'a>(
     // projected ZST place to a dangling sentinel made `Arc<ZST>`/`Waker::from(Arc<W>)`
     // AccessViolate. Projected places fall through to the projection machinery below (the final
     // ZST field is handled by `field_address`, which computes `base + offset`).
-    if place.projection.is_empty() {
+    if lowered.projection.is_none() {
         if layout.is_zst() {
             let place_type = ctx.type_from_cache(place_ty);
             let node = ctx.alloc_node(Const::USize(layout.align.abi.bytes()));
@@ -190,9 +192,9 @@ pub fn place_address<'a>(
         }
         let loc_ty = ctx.monomorphize(ctx.body().local_decls[place.local].ty);
         if ptr_is_fat(loc_ty, ctx.tcx(), ctx.instance()) {
-            local_get(place.local.as_usize(), ctx.body(), ctx)
+            local_get(lowered.local, ctx.body(), ctx)
         } else {
-            local_address(place.local.as_usize(), ctx.body(), ctx)
+            local_address(lowered.local, ctx.body(), ctx)
         }
     } else {
         // Every projected place, including a ZST, derives its address from its container. ZST
@@ -202,18 +204,16 @@ pub fn place_address<'a>(
         // `projected_field_address` handle missing physical CLR fields without manufacturing a
         // fresh sentinel. Only a genuinely storage-less local uses the aligned dangling base
         // (seeded above for the final local or by `local_body` before further projections).
-        let (mut addr_calc, mut ty) = local_body(place.local.as_usize(), ctx);
-
-        ty = ctx.monomorphize(ty);
-        let mut ty = ty.into();
-
-        let (head, body) = slice_head(place.projection);
-        for elem in body {
-            let (curr_ty, curr_ops) = place_elem_body(elem, ty, ctx, addr_calc);
-            ty = curr_ty.monomorphize(ctx);
-            addr_calc = curr_ops;
-        }
-        address::place_elem_address(head, ty, ctx, place_ty, addr_calc)
+        let projection = lowered
+            .projection
+            .expect("projected place lost its projection");
+        address::place_elem_address(
+            &projection.elem,
+            projection.owner_ty,
+            ctx,
+            place_ty,
+            projection.base,
+        )
     }
 }
 /// Should be only used in certain builit-in features. For unsized types, returns the address of the fat pointer, not the address contained within it.
@@ -221,19 +221,18 @@ pub fn place_address_raw<'a>(
     place: &Place<'a>,
     ctx: &mut MethodCompileCtx<'a, '_>,
 ) -> Interned<cilly::ir::CILNode> {
-    let place_ty = place.ty(ctx.body(), ctx.tcx());
-    let place_ty = ctx.monomorphize(place_ty).ty;
+    let place_ty = ctx.monomorphize(place.ty(ctx.body(), ctx.tcx())).ty;
 
     let layout = ctx.layout_of(place_ty);
-    if layout.is_zst() {
+    if layout.is_zst() && place.projection.is_empty() {
         return ctx.alloc_node(Const::USize(layout.align.abi.bytes()));
     }
     if place.projection.is_empty() {
         local_address(place.local.as_usize(), ctx.body(), ctx)
     } else if place.projection.len() == 1
         && matches!(
-            slice_head(place.projection).0,
-            rustc_middle::mir::PlaceElem::Deref
+            place.projection.last(),
+            Some(rustc_middle::mir::PlaceElem::Deref)
         )
         && ptr_is_fat(place_ty, ctx.tcx(), ctx.instance())
     {
@@ -242,18 +241,17 @@ pub fn place_address_raw<'a>(
         // storage in that case, which is exactly the address of the local being deref'd.
         return local_address(place.local.as_usize(), ctx.body(), ctx);
     } else {
-        let (mut addr_calc, mut ty) = local_body(place.local.as_usize(), ctx);
-
-        ty = ctx.monomorphize(ty);
-        let mut ty = ty.into();
-
-        let (head, body) = slice_head(place.projection);
-        for elem in body {
-            let (curr_ty, curr_ops) = place_elem_body(elem, ty, ctx, addr_calc);
-            ty = curr_ty.monomorphize(ctx);
-            addr_calc = curr_ops;
-        }
-        address::place_elem_address(head, ty, ctx, place_ty, addr_calc)
+        let lowered = projection::LoweredPlace::new(place, ctx);
+        let projection = lowered
+            .projection
+            .expect("projected place lost its projection");
+        address::place_elem_address(
+            &projection.elem,
+            projection.owner_ty,
+            ctx,
+            place_ty,
+            projection.base,
+        )
     }
 }
 pub fn place_set<'tcx>(
@@ -261,23 +259,20 @@ pub fn place_set<'tcx>(
     value_calc: Interned<cilly::ir::CILNode>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Interned<cilly::ir::CILRoot> {
-    if place.projection.is_empty() {
-        set::local_set(place.local.as_usize(), ctx.body(), value_calc, ctx)
+    let lowered = projection::LoweredPlace::new(place, ctx);
+    if lowered.projection.is_none() {
+        set::local_set(lowered.local, ctx.body(), value_calc, ctx)
     } else {
-        let (mut addr_calc, ty) = local_body(place.local.as_usize(), ctx);
-
-        let mut ty: PlaceTy = ty.into();
-        ty = ty.monomorphize(ctx);
-
-        let (head, body) = slice_head(place.projection);
-        for elem in body {
-            let (curr_ty, curr_ops) = place_elem_body(elem, ty, ctx, addr_calc);
-            ty = curr_ty.monomorphize(ctx);
-            addr_calc = curr_ops;
-        }
-        //
-        ty = ty.monomorphize(ctx);
-        place_elem_set(head, ty, ctx, addr_calc, value_calc)
+        let projection = lowered
+            .projection
+            .expect("projected place lost its projection");
+        place_elem_set(
+            &projection.elem,
+            projection.owner_ty,
+            ctx,
+            projection.base,
+            value_calc,
+        )
     }
 }
 /// The type of a place mid-projection-chain-walk. `EnumVariant` is not a general "this place

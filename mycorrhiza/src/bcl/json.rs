@@ -39,6 +39,7 @@ use crate::error::try_managed;
 use crate::intrinsics::{
     RustcCLRInteropManagedClass, RustcCLRInteropManagedGenericStruct, RustcCLRInteropManagedStruct,
 };
+use crate::managed_option::ManagedRef;
 use crate::system::{DotNetString, MObject, MString};
 
 const ASM: &str = "System.Text.Json";
@@ -129,13 +130,14 @@ fn node_is_null(h: NodeHandle) -> bool {
     MObject::static2::<"ReferenceEquals", MObject, MObject, bool>(obj, MObject::null())
 }
 
-/// A parsed, navigable JSON document — a handle to a managed `JsonNode`.
+/// A parsed, navigable JSON document — a rooted handle to a managed `JsonNode`.
 ///
-/// A move-only handle; the .NET GC owns the underlying object (no `Drop`). Obtain the root with
-/// [`Json::parse`], then walk it with [`get`](Json::get) / [`index`](Json::index) and read leaves
-/// with [`as_str`](Json::as_str) / [`as_i64`](Json::as_i64) / [`as_bool`](Json::as_bool).
+/// A move-only `GCHandle` owner. Its Rust storage contains only the opaque native token; a naked CLR
+/// reference is recovered into a direct managed local for each member call. Obtain the root with
+/// [`Json::parse`], then walk it with [`get`](Json::get) / [`index`](Json::index) and read leaves with
+/// [`as_str`](Json::as_str) / [`as_i64`](Json::as_i64) / [`as_bool`](Json::as_bool).
 pub struct Json {
-    h: NodeHandle,
+    h: ManagedRef<NodeHandle>,
 }
 
 impl Json {
@@ -144,21 +146,22 @@ impl Json {
     /// literal `null` parses to a managed-`null` node and is surfaced as `None`; malformed input
     /// throws a `JsonException` on the .NET side, which is caught and also surfaced as `None`.
     pub fn parse(text: &str) -> Option<Json> {
-        let node_opts: NodeOptsHandle = unsafe { core::mem::zeroed() };
-        let doc_opts: DocOptsHandle = unsafe { core::mem::zeroed() };
-        let net_text = net(text);
+        let net_text = ManagedRef::from_raw(net(text));
         // `JsonNode.Parse` is a 3-arg static (the two option params have C# defaults but the IL method
         // takes all three). No `static3` on the class wrapper, so call the raw call3 intrinsic with
         // IS_STATIC = true.
         //
-        // The managed `JsonNode` reference is written into `out` via the closure's captured `&mut`,
-        // NOT returned through `try_managed` — a `Result<NodeHandle, _>` would place the object
-        // reference inside a Rust enum niche, which the CLR layout rejects (a managed ref cannot be
-        // overlapped by a discriminant). The closure returns `()`, so nothing managed crosses the
-        // `try/catch` boundary; on a `JsonException` (malformed input) `out` stays null → `None`.
-        let mut out = NodeHandle::null();
-        let ran = try_managed(|| {
-            out = crate::intrinsics::rustc_clr_interop_managed_call3_::<
+        // `TryState` is ordinary Rust storage, so both its closure and its result contain only
+        // `ManagedRef` tokens. The callback copies the rooted string into a direct CLR local,
+        // constructs the two zero/default CLR value-type options as direct locals, and immediately
+        // roots the returned node. On a `JsonException`, the outer string root is dropped normally
+        // after `try_managed` returns.
+        let out = try_managed(|| {
+            let node_opts =
+                unsafe { crate::intrinsics::rustc_clr_interop_managed_default::<NodeOptsHandle>() };
+            let doc_opts =
+                unsafe { crate::intrinsics::rustc_clr_interop_managed_default::<DocOptsHandle>() };
+            ManagedRef::from_raw(crate::intrinsics::rustc_clr_interop_managed_call3_::<
                 { ASM },
                 { JSON_NODE },
                 false,
@@ -168,12 +171,10 @@ impl Json {
                 MString,
                 NodeOptsHandle,
                 DocOptsHandle,
-            >(net_text, node_opts, doc_opts);
-        });
-        if ran.is_err() {
-            return None;
-        }
-        Self::wrap(out)
+            >(net_text.copy_raw(), node_opts, doc_opts))
+        })
+        .ok()?;
+        Self::wrap(out.into_raw())
     }
 
     #[inline(always)]
@@ -181,7 +182,9 @@ impl Json {
         if node_is_null(h) {
             None
         } else {
-            Some(Json { h })
+            Some(Json {
+                h: ManagedRef::from_raw(h),
+            })
         }
     }
 
@@ -189,8 +192,13 @@ impl Json {
     pub fn kind(&self) -> Kind {
         // `GetValueKind` returns the `JsonValueKind` enum value type; read it as its 4-byte `int32`
         // payload (a .NET enum is exactly its underlying integer).
-        let vk = self.h.instance0::<"GetValueKind", ValueKindHandle>();
-        let raw = unsafe { core::mem::transmute::<ValueKindHandle, i32>(vk) };
+        let vk = self
+            .h
+            .copy_raw()
+            .instance0::<"GetValueKind", ValueKindHandle>();
+        let raw = unsafe {
+            crate::enums::rustc_clr_interop_enum_to_repr::<{ ASM }, { JSON_VALUE_KIND }, 4, i32>(vk)
+        };
         Kind::from_i32(raw)
     }
 
@@ -202,6 +210,7 @@ impl Json {
         }
         Self::wrap(
             self.h
+                .copy_raw()
                 .instance1::<"get_Item", MString, NodeHandle>(net(name)),
         )
     }
@@ -212,7 +221,11 @@ impl Json {
         if self.kind() != Kind::Array || idx < 0 || idx >= self.len() {
             return None;
         }
-        Self::wrap(self.h.instance1::<"get_Item", i32, NodeHandle>(idx))
+        Self::wrap(
+            self.h
+                .copy_raw()
+                .instance1::<"get_Item", i32, NodeHandle>(idx),
+        )
     }
 
     /// The number of elements for an **array** node (`JsonArray.Count`); `0` for anything else.
@@ -226,7 +239,7 @@ impl Json {
         let arr = crate::intrinsics::rustc_clr_interop_managed_checked_cast::<
             ArrayHandle,
             NodeHandle,
-        >(self.h);
+        >(self.h.copy_raw());
         arr.instance0::<"get_Count", i32>()
     }
 
@@ -293,13 +306,14 @@ impl Json {
 
     /// The raw managed `JsonNode` handle, for lower-level BCL calls.
     pub fn handle(&self) -> NodeHandle {
-        self.h
+        self.h.copy_raw()
     }
 
     /// `JsonNode.ToString()` — for a string value node, its raw (unescaped) content.
     #[inline(always)]
     fn text(&self) -> std::string::String {
-        DotNetString::from_handle(self.h.instance0::<"ToString", MString>()).to_rust_string()
+        DotNetString::from_handle(self.h.copy_raw().instance0::<"ToString", MString>())
+            .to_rust_string()
     }
 
     /// `JsonNode.ToJsonString(JsonSerializerOptions?)` — the node's compact JSON representation. The
@@ -310,6 +324,7 @@ impl Json {
         let opts = SerializerOptsHandle::null();
         DotNetString::from_handle(
             self.h
+                .copy_raw()
                 .instance1::<"ToJsonString", SerializerOptsHandle, MString>(opts),
         )
         .to_rust_string()

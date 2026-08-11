@@ -43,11 +43,15 @@ smoke() {
   if [ -f "$out.exe" ]; then dotnet "$out.exe"; else dotnet "$out"; fi
 }
 
-# Run the project's own stable test suite (mirrors CI's skip list).
+# Run the current compiler/linker invariant gates. Product-shaped scripts outside this legacy
+# container harness own build-std/runtime acceptance; the historical direct-host `::stable` corpus
+# is not silently baseline-suppressed here.
 test_suite() {
-  echo "==> cargo test ::stable (CI subset)…"
-  cargo test --release ::stable -- \
-      --skip f128 --skip num_test --skip simd --skip fuzz87
+  echo "==> compiler/linker invariant gates…"
+  cargo check --workspace --all-targets --locked
+  cargo test -p cilly --locked
+  cargo test -p rustc_codegen_clr --lib \
+      managed_references_are_rejected_from_rust_byte_storage -- --nocapture
 }
 
 # Interop demo: a tiny Rust function compiled to a .NET assembly + a C# caller.

@@ -1,7 +1,7 @@
 # Product acceptance
 
-This directory describes the user journeys exercised by CI and release builds. The public 0.0.2
-contract is intentionally small:
+This directory describes the user journeys exercised by CI and release builds. The unpublished
+0.0.2 release-candidate contract is intentionally small:
 
 - .NET 10
 - Linux x64, macOS Apple Silicon, and Windows x64

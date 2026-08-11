@@ -9,8 +9,9 @@
 
 use mycorrhiza::r#gen;
 use mycorrhiza::intrinsics::{
+    RustcCLRInteropByRef, RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
     rustc_clr_interop_generic_call1, rustc_clr_interop_generic_call2,
-    rustc_clr_interop_generic_ctor2, RustcCLRInteropByRef, RustcCLRInteropManagedGenericStruct, RustcCLRInteropTypeGeneric,
+    rustc_clr_interop_generic_ctor2,
 };
 use mycorrhiza::system::console::Console;
 
@@ -24,36 +25,65 @@ type SpanI32 = RustcCLRInteropManagedGenericStruct<CORELIB, SPAN, 16, (i32,)>;
 // (void*, int32), NOT generic. We pass a Rust slice pointer, so the Span views Rust memory.
 fn span_from_ptr(ptr: *mut i32, len: i32) -> SpanI32 {
     rustc_clr_interop_generic_ctor2::<
-        CORELIB, SPAN, true, (i32,),
+        CORELIB,
+        SPAN,
+        true,
+        (i32,),
         ((), *mut (), i32),
-        SpanI32, *mut (), i32,
+        SpanI32,
+        *mut (),
+        i32,
     >(ptr as *mut (), len)
 }
 // Span<T>.get_Length() -> int32 (concrete return; value-type instance method, receiver by &).
 fn span_len(s: &SpanI32) -> i32 {
     rustc_clr_interop_generic_call1::<
-        CORELIB, SPAN, true, "get_Length", 1, (i32,), (i32,), i32, &SpanI32,
+        CORELIB,
+        SPAN,
+        true,
+        "get_Length",
+        1,
+        (i32,),
+        (i32,),
+        i32,
+        &SpanI32,
     >(s)
 }
 // Span<T>.Fill(T value) -> void — value-type instance method taking `!0`.
 fn span_fill(s: &SpanI32, value: i32) {
     rustc_clr_interop_generic_call2::<
-        CORELIB, SPAN, true, "Fill", 1, (i32,), ((), r#gen!(0)), (), &SpanI32, i32,
+        CORELIB,
+        SPAN,
+        true,
+        "Fill",
+        1,
+        (i32,),
+        ((), r#gen!(0)),
+        (),
+        &SpanI32,
+        i32,
     >(s, value)
 }
 // Span<T>.Clear() -> void — zero every element.
 fn span_clear(s: &SpanI32) {
-    rustc_clr_interop_generic_call1::<
-        CORELIB, SPAN, true, "Clear", 1, (i32,), ((),), (), &SpanI32,
-    >(s)
+    rustc_clr_interop_generic_call1::<CORELIB, SPAN, true, "Clear", 1, (i32,), ((),), (), &SpanI32>(
+        s,
+    )
 }
 // Span<T>.get_Item(int) -> ref T (the byref indexer). Returns a managed byref `!0&`; we take it as a
 // raw pointer and read through it. (For a Rust-backed span the byref is a plain native pointer.)
 fn span_get_ref(s: &SpanI32, idx: i32) -> *mut i32 {
     rustc_clr_interop_generic_call2::<
-        CORELIB, SPAN, true, "get_Item", 1, (i32,),
+        CORELIB,
+        SPAN,
+        true,
+        "get_Item",
+        1,
+        (i32,),
         (RustcCLRInteropByRef<RustcCLRInteropTypeGeneric<0>>, i32), // Sig: ref !0 get_Item(int32)
-        *mut i32, &SpanI32, i32,
+        *mut i32,
+        &SpanI32,
+        i32,
     >(s, idx)
 }
 fn span_get(s: &SpanI32, idx: i32) -> i32 {
@@ -128,7 +158,7 @@ fn main() -> std::process::ExitCode {
 
         // Span<T>.Slice(int,int): a real .NET call, zero-copy over the same Rust buffer.
         let mut data = [10i32, 20, 30, 40, 50];
-        let mut sp = Span::from_slice(&mut data);
+        let sp = Span::from_slice(&mut data);
         let mut mid = sp.slice(1, 3);
         chk(17, mid.len() as i64, 3);
         chk(18, mid.get(0).unwrap() as i64, 20);
@@ -219,7 +249,7 @@ fn main() -> std::process::ExitCode {
         use mycorrhiza::span::Span;
 
         let mut data = [1i32, 2, 3, 4, 5];
-        let mut sp = Span::from_slice(&mut data);
+        let sp = Span::from_slice(&mut data);
         // get_unchecked must match get() for every valid index.
         for i in 0..sp.len() {
             let checked = sp.get(i).unwrap();
@@ -245,6 +275,7 @@ fn main() -> std::process::ExitCode {
 
     // ---- GC-owned Memory<T> / ReadOnlyMemory<T>: async-safe managed-array storage ----
     {
+        use mycorrhiza::error::try_managed;
         use mycorrhiza::memory::{Memory, ReadOnlyMemory};
 
         let mut memory = Memory::from_slice(&[10i32, 20, 30, 40]);
@@ -275,6 +306,25 @@ fn main() -> std::process::ExitCode {
         chk(66, copied.get(0).unwrap() as i64, 3);
         chk(67, copied.get(2).unwrap() as i64, 4);
         chk(68, copied.to_vec()[1] as i64, 1);
+
+        // Borrowed Memory/ReadOnlyMemory calls must leave their GCHandle roots live even when the
+        // managed member throws. Slice(-1, ..) and CopyTo into a short destination are deterministic
+        // BCL exceptions; catch them, then immediately reuse every involved wrapper.
+        let memory_slice_error = try_managed(|| drop(memory.slice(-1, 1)));
+        chk(69, memory_slice_error.is_err() as i64, 1);
+        chk(70, memory.len() as i64, 4);
+        chk(71, memory.get(0).unwrap() as i64, 10);
+
+        let readonly_slice_error = try_managed(|| drop(ro.slice(-1, 1)));
+        chk(72, readonly_slice_error.is_err() as i64, 1);
+        chk(73, ro.len() as i64, 3);
+
+        let mut too_short = Memory::from_slice(&[9i32]);
+        let copy_error = try_managed(|| ro.copy_to(&mut too_short));
+        chk(74, copy_error.is_err() as i64, 1);
+        chk(75, ro.len() as i64, 3);
+        chk(76, too_short.len() as i64, 1);
+        chk(77, too_short.get(0).unwrap() as i64, 9);
     }
 
     unsafe {

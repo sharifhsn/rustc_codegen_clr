@@ -18,6 +18,10 @@ use crate::intrinsics::{
     rustc_clr_interop_generic_call3, rustc_clr_interop_generic_ctor1,
     rustc_clr_interop_managed_new_arr, rustc_clr_interop_managed_set_elem,
 };
+use crate::managed_option::{
+    rustc_clr_interop_managed_box_free, rustc_clr_interop_managed_box_get,
+    rustc_clr_interop_managed_box_new, rustc_clr_interop_managed_box_take,
+};
 use crate::span::{RawRoSpan, RawSpan, span_fill, span_get_ref};
 use core::cell::Cell;
 use core::marker::PhantomData;
@@ -33,20 +37,6 @@ pub type ReadOnlyMemoryHandle<T> =
 
 type ManagedArray<T> = RustcCLRInteropManagedArray<T, 1>;
 type GenericArray = RustcCLRInteropManagedArray<RustcCLRInteropTypeGeneric<0>, 1>;
-
-#[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
-#[inline(never)]
-fn rustc_clr_interop_managed_box_new<T>(value: T) -> *mut u8 {
-    core::intrinsics::abort()
-}
-
-#[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
-#[inline(never)]
-unsafe fn rustc_clr_interop_managed_box_take<T>(handle: *mut u8) -> T {
-    core::intrinsics::abort()
-}
 
 fn copy_to_managed_array<T: Copy + ManagedSafe>(slice: &[T]) -> ManagedArray<T> {
     let len = i32::try_from(slice.len()).expect("memory length exceeds i32");
@@ -206,7 +196,9 @@ impl<T> Memory<T> {
     #[inline]
     pub fn from_handle(raw: MemoryHandle<T>) -> Self {
         Self {
-            rooted: Cell::new(rustc_clr_interop_managed_box_new(raw)),
+            // SAFETY: `MemoryHandle<T>` is a CLR value type and this wrapper owns the returned
+            // opaque GCHandle until it is taken or freed.
+            rooted: Cell::new(unsafe { rustc_clr_interop_managed_box_new(raw) }),
             _element: PhantomData,
         }
     }
@@ -221,14 +213,10 @@ impl<T> Memory<T> {
     }
 
     #[inline(never)]
-    fn take_handle(&self) -> MemoryHandle<T> {
-        let rooted = self.rooted.replace(core::ptr::null_mut());
-        unsafe { rustc_clr_interop_managed_box_take(rooted) }
-    }
-
-    #[inline(never)]
-    fn restore_handle(&self, raw: MemoryHandle<T>) {
-        self.rooted.set(rustc_clr_interop_managed_box_new(raw));
+    fn copy_handle(&self) -> MemoryHandle<T> {
+        // SAFETY: this is a borrowed, non-consuming access. ManagedBoxGet leaves the GCHandle live,
+        // so an exception in the managed operation that follows cannot invalidate this owner.
+        unsafe { rustc_clr_interop_managed_box_get(self.rooted.get()) }
     }
 }
 
@@ -240,10 +228,7 @@ impl<T: Copy + ManagedSafe> Memory<T> {
 
     /// Element count, read from the real managed `Memory<T>` value.
     pub fn len(&self) -> i32 {
-        let raw = self.take_handle();
-        let result = memory_len(&raw);
-        self.restore_handle(raw);
-        result
+        memory_len(&self.copy_handle())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -252,10 +237,7 @@ impl<T: Copy + ManagedSafe> Memory<T> {
 
     /// Cheap view over the same managed array. Bounds are checked by `Memory<T>.Slice`.
     pub fn slice(&self, start: i32, len: i32) -> Self {
-        let raw = self.take_handle();
-        let slice = memory_slice(&raw, start, len);
-        self.restore_handle(raw);
-        Self::from_handle(slice)
+        Self::from_handle(memory_slice(&self.copy_handle(), start, len))
     }
 
     /// Read one element through the managed memory's `Span<T>` view.
@@ -263,11 +245,9 @@ impl<T: Copy + ManagedSafe> Memory<T> {
         if index < 0 || index >= self.len() {
             return None;
         }
-        let raw = self.take_handle();
+        let raw = self.copy_handle();
         let span = memory_span(&raw);
-        let result = Some(unsafe { *span_get_ref(&span, index) });
-        self.restore_handle(raw);
-        result
+        Some(unsafe { *span_get_ref(&span, index) })
     }
 
     /// Write one element through the managed memory's `Span<T>` view.
@@ -275,18 +255,16 @@ impl<T: Copy + ManagedSafe> Memory<T> {
         if index < 0 || index >= self.len() {
             return false;
         }
-        let raw = self.take_handle();
+        let raw = self.copy_handle();
         let span = memory_span(&raw);
         unsafe { *span_get_ref(&span, index) = value };
-        self.restore_handle(raw);
         true
     }
 
     /// Fill the view through the real `Span<T>.Fill` implementation.
     pub fn fill(&mut self, value: T) {
-        let raw = self.take_handle();
+        let raw = self.copy_handle();
         span_fill(&memory_span(&raw), value);
-        self.restore_handle(raw);
     }
 
     /// Copy the current managed contents back into an ordinary Rust vector.
@@ -300,7 +278,7 @@ impl<T> Drop for Memory<T> {
     fn drop(&mut self) {
         let rooted = self.rooted.replace(core::ptr::null_mut());
         if !rooted.is_null() {
-            let _ = unsafe { rustc_clr_interop_managed_box_take::<MemoryHandle<T>>(rooted) };
+            unsafe { rustc_clr_interop_managed_box_free(rooted) };
         }
     }
 }
@@ -319,7 +297,9 @@ impl<T> ReadOnlyMemory<T> {
     #[inline]
     pub fn from_handle(raw: ReadOnlyMemoryHandle<T>) -> Self {
         Self {
-            rooted: Cell::new(rustc_clr_interop_managed_box_new(raw)),
+            // SAFETY: `ReadOnlyMemoryHandle<T>` is a CLR value type and this wrapper owns the
+            // returned opaque GCHandle until it is taken or freed.
+            rooted: Cell::new(unsafe { rustc_clr_interop_managed_box_new(raw) }),
             _element: PhantomData,
         }
     }
@@ -334,14 +314,9 @@ impl<T> ReadOnlyMemory<T> {
     }
 
     #[inline(never)]
-    fn take_handle(&self) -> ReadOnlyMemoryHandle<T> {
-        let rooted = self.rooted.replace(core::ptr::null_mut());
-        unsafe { rustc_clr_interop_managed_box_take(rooted) }
-    }
-
-    #[inline(never)]
-    fn restore_handle(&self, raw: ReadOnlyMemoryHandle<T>) {
-        self.rooted.set(rustc_clr_interop_managed_box_new(raw));
+    fn copy_handle(&self) -> ReadOnlyMemoryHandle<T> {
+        // SAFETY: borrowed operations retain the original GCHandle for their entire duration.
+        unsafe { rustc_clr_interop_managed_box_get(self.rooted.get()) }
     }
 }
 
@@ -352,10 +327,7 @@ impl<T: Copy + ManagedSafe> ReadOnlyMemory<T> {
     }
 
     pub fn len(&self) -> i32 {
-        let raw = self.take_handle();
-        let result = readonly_memory_len(&raw);
-        self.restore_handle(raw);
-        result
+        readonly_memory_len(&self.copy_handle())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -364,27 +336,17 @@ impl<T: Copy + ManagedSafe> ReadOnlyMemory<T> {
 
     /// Cheap read-only view over the same managed array, bounds-checked by .NET.
     pub fn slice(&self, start: i32, len: i32) -> Self {
-        let raw = self.take_handle();
-        let slice = readonly_memory_slice(&raw, start, len);
-        self.restore_handle(raw);
-        Self::from_handle(slice)
+        Self::from_handle(readonly_memory_slice(&self.copy_handle(), start, len))
     }
 
     /// Copy into an existing mutable managed buffer via `ReadOnlyMemory<T>.CopyTo`.
     pub fn copy_to(&self, destination: &mut Memory<T>) {
-        let source = self.take_handle();
-        let target = destination.take_handle();
-        readonly_copy_to(&source, target);
-        destination.restore_handle(target);
-        self.restore_handle(source);
+        readonly_copy_to(&self.copy_handle(), destination.copy_handle());
     }
 
     /// Materialise the real `ReadOnlySpan<T>` view for passing to a synchronous .NET API.
     pub fn span_handle(&self) -> RawRoSpan<T> {
-        let raw = self.take_handle();
-        let span = readonly_memory_span(&raw);
-        self.restore_handle(raw);
-        span
+        readonly_memory_span(&self.copy_handle())
     }
 }
 
@@ -393,8 +355,7 @@ impl<T> Drop for ReadOnlyMemory<T> {
     fn drop(&mut self) {
         let rooted = self.rooted.replace(core::ptr::null_mut());
         if !rooted.is_null() {
-            let _ =
-                unsafe { rustc_clr_interop_managed_box_take::<ReadOnlyMemoryHandle<T>>(rooted) };
+            unsafe { rustc_clr_interop_managed_box_free(rooted) };
         }
     }
 }

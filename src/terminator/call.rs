@@ -1,7 +1,7 @@
-use crate::call_info::CallInfo;
-use crate::fn_ctx::fn_name;
+use crate::abi::AbiPlan;
+use crate::fn_ctx::fn_name_for_instance;
 use crate::operand::{handle_operand, operand_address};
-use crate::place::place_set;
+use crate::place::{place_address, place_set};
 use crate::r#type::{
     GetTypeExt,
     utilis::{garg_to_string, garg_to_usize},
@@ -16,8 +16,7 @@ use crate::{
 };
 use cilly::tpe::GenericKind;
 use cilly::{
-    BinOp, CILNode, CILRoot, ClassRef, Const, FieldDesc, FnSig, IString, Int, Interned,
-    IntoAsmIndex,
+    BinOp, CILNode, CILRoot, ClassRef, Const, FieldDesc, IString, Int, Interned, IntoAsmIndex,
     cilnode::{ExtendKind, IsPure, MethodKind, PtrCastRes},
 };
 use cilly::{MethodRef, Type};
@@ -89,8 +88,7 @@ fn call_managed<'tcx>(
     let tpe = ClassRef::new(class_name, asm, is_valuetype, [].into());
 
     //eprintln!("tpe:{tpe:?}");
-    let signature = crate::function_sig::sig_from_instance_(fn_instance, ctx)
-        .expect("Can't get the function signature");
+    let signature = AbiPlan::from_instance(fn_instance, ctx).signature().clone();
 
     if argc == 0 {
         // Use the REAL return type, not Void. A zero-arg managed getter (e.g. a static `get_Default`
@@ -208,8 +206,7 @@ fn callvirt_managed<'tcx>(
     let managed_fn_name = garg_to_string(managed_fn_garg, ctx.tcx());
 
     let tpe = ClassRef::new(class_name, asm, is_valuetype, [].into());
-    let signature = crate::function_sig::sig_from_instance_(fn_instance, ctx)
-        .expect("Can't get the function signature");
+    let signature = AbiPlan::from_instance(fn_instance, ctx).signature().clone();
     if argc == 0 {
         // Use the REAL return type, not Void (see `call_managed`'s 0-arg branch) — a zero-arg managed
         // getter returning a managed reference was being typed Void, failing the destination store.
@@ -406,6 +403,20 @@ fn garg_ty_to_type<'tcx>(garg: GenericArg<'tcx>, ctx: &mut MethodCompileCtx<'tcx
             .expect("WF-9 generic interop: expected a type parameter"),
     );
     ctx.type_from_cache(ty)
+}
+
+/// Whether `tpe` is represented by a direct CLR object reference rather than a boxed value.
+///
+/// `ManagedBox*` stores the value behind a `GCHandle`. CLR arrays, strings, and `System.Object`
+/// are references just like non-value `ClassRef`s: applying `box`/`unbox.any` to them is invalid
+/// IL. Keep this exact instead of using `Type::is_gcref`, whose conservative generic-parameter
+/// case is intentionally allowed to report false positives.
+fn is_direct_managed_reference(tpe: Type, ctx: &MethodCompileCtx<'_, '_>) -> bool {
+    match tpe {
+        Type::ClassRef(class) => !ctx[class].is_valuetype(),
+        Type::PlatformArray { .. } | Type::PlatformObject | Type::PlatformString => true,
+        _ => false,
+    }
 }
 /// WF-9 — calls a method on a *generic* .NET instantiation (e.g. `List<i32>::Add`). The target class
 /// carries concrete generic arguments (so the `ClassRef` renders `` List`1<int32> ``) and the method
@@ -1162,88 +1173,6 @@ fn call_ctor<'tcx>(
         place_set(destination, node, ctx)
     }
 }
-pub fn call_closure<'tcx>(
-    args: &[Spanned<Operand<'tcx>>],
-    destination: &Place<'tcx>,
-    sig: FnSig,
-    function_name: &str,
-    requires_caller_location: bool,
-    source_info: rustc_middle::mir::SourceInfo,
-    ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> Root {
-    let last_arg = args
-        .last()
-        .expect("Closure must be called with at least 2 arguments(closure + arg tuple)");
-
-    let other_args = &args[..args.len() - 1];
-    let mut call_args = Vec::new();
-    for arg in other_args {
-        call_args.push(handle_operand(&arg.node, ctx));
-    }
-    // "Rust call" is wierd, and not at all optimized for .NET. Passing all the arguments in a tuple is bad for performance and simplicty. Thus, unpacking this tuple and forcing "Rust call" to be
-    // "normal" is far easier and better for performance.
-    let last_arg_type = ctx.monomorphize(last_arg.node.ty(ctx.body(), ctx.tcx()));
-    match last_arg_type.kind() {
-        TyKind::Tuple(elements) => {
-            if elements.is_empty() {
-            } else {
-                let tuple_type = ctx.type_from_cache(last_arg_type);
-
-                for (index, element) in elements.iter().enumerate() {
-                    let element_type = ctx.type_from_cache(element);
-                    if element_type == Type::Void {
-                        let u = ctx.uninit_val(Type::Void);
-                        call_args.push(u);
-                        continue;
-                    }
-                    let tuple_element_name = format!("Item{}", index + 1);
-                    let field_descriptor = FieldDesc::new(
-                        tuple_type.as_class_ref().expect("Invalid tuple type"),
-                        ctx.alloc_string(tuple_element_name),
-                        element_type,
-                    );
-                    let desc = ctx.alloc_field(field_descriptor);
-                    let obj = handle_operand(&last_arg.node, ctx);
-                    let fld = ctx.ld_field(obj, desc);
-                    call_args.push(fld);
-                }
-
-                //todo!("Can't unbox tupels yet!")
-            }
-        }
-        _ => panic!("Can't unbox type {last_arg_type:?}!"),
-    }
-    if requires_caller_location {
-        assert_eq!(
-            call_args.len() + 1,
-            sig.inputs().len(),
-            "a track_caller rust-call target must add exactly one implicit caller-location slot"
-        );
-        call_args.push(crate::terminator::get_caller_location(ctx, source_info));
-    }
-    assert_eq!(
-        call_args.len(),
-        sig.inputs().len(),
-        "rust-call argument count does not match the callee ABI"
-    );
-    let is_void = matches!(sig.output(), cilly::Type::Void);
-
-    let call = MethodRef::new(
-        *ctx.main_module(),
-        ctx.alloc_string(function_name),
-        ctx.alloc_sig(sig),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    // Hande the call itself
-    let call = ctx.alloc_methodref(call);
-    if is_void {
-        ctx.call_root(call, &call_args, IsPure::NOT)
-    } else {
-        let node = ctx.call(call, &call_args, IsPure::NOT);
-        place_set(destination, node, ctx)
-    }
-}
 /// Dispatches a resolved MIR call: vtable calls for `InstanceKind::Virtual`, no-ops for drop
 /// glue on types with nothing to drop, then plain function calls — except when `instance` is one of
 /// the magic interop fns [`classify_magic_fn`] recognizes, each of which is a distinct hand-written
@@ -1251,7 +1180,7 @@ pub fn call_closure<'tcx>(
 /// exact `DefId`, not by matching the mangled call-site name, so (unlike the old substring-based
 /// dispatch) branch order here no longer matters.
 pub fn call_inner<'tcx>(
-    fn_type: Ty<'tcx>,
+    _fn_type: Ty<'tcx>,
     instance: Instance<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     args: &[Spanned<Operand<'tcx>>],
@@ -1300,56 +1229,12 @@ pub fn call_inner<'tcx>(
         let obj_ptr_field_desc = ctx.alloc_field(obj_ptr_field_desc);
         let obj_ptr = ctx.ld_field(fat_ptr_address, obj_ptr_field_desc);
         // Get the call info
-        let call_info = CallInfo::sig_from_instance_(instance, ctx);
+        let abi = AbiPlan::from_instance(instance, ctx);
 
-        let mut signature = call_info.sig().clone();
+        let mut signature = abi.signature().clone();
         signature.inputs_mut()[0] = ctx.nptr(Type::Void);
-        let mut call_args = [obj_ptr].to_vec();
-        if call_info.split_last_tuple() {
-            let last_arg = args
-                .last()
-                .expect("Closure must be called with at least 2 arguments(closure + arg tuple)");
-
-            let other_args = &args[..args.len() - 1];
-            for arg in other_args.iter().skip(1) {
-                call_args.push(handle_operand(&arg.node, ctx));
-            }
-            // "Rust call" is weird, and not at all optimized for .NET. Passing all the arguments in a tuple is bad for performance and simplicty. Thus, unpacking this tuple and forcing "Rust call" to be
-            // "normal" is far easier and better for performance.
-            let last_arg_type = ctx.monomorphize(last_arg.node.ty(ctx.body(), ctx.tcx()));
-            match last_arg_type.kind() {
-                TyKind::Tuple(elements) => {
-                    if elements.is_empty() {
-                    } else {
-                        let tuple_type = ctx.type_from_cache(last_arg_type);
-
-                        for (index, element) in elements.iter().enumerate() {
-                            let element_type = ctx.type_from_cache(element);
-                            if element_type == Type::Void {
-                                let u = ctx.uninit_val(Type::Void);
-                                call_args.push(u);
-                                continue;
-                            }
-                            let tuple_element_name = format!("Item{}", index + 1);
-                            let field_descriptor = FieldDesc::new(
-                                tuple_type.as_class_ref().expect("Invalid tuple type"),
-                                ctx.alloc_string(tuple_element_name),
-                                element_type,
-                            );
-                            let desc = ctx.alloc_field(field_descriptor);
-                            let obj = handle_operand(&last_arg.node, ctx);
-                            let fld = ctx.ld_field(obj, desc);
-                            call_args.push(fld);
-                        }
-                    }
-                }
-                _ => panic!("Can't unbox type {last_arg_type:?}!"),
-            }
-        } else {
-            for arg in args.iter().skip(1) {
-                call_args.push(handle_operand(&arg.node, ctx));
-            }
-        }
+        let mut call_args = abi.lower_call_args(args, source_info, ctx);
+        call_args[0] = obj_ptr;
         let sig = ctx.alloc_sig(signature.clone());
         let fn_ptr_addr = ctx.biop(vtable_ptr, vtable_offset, BinOp::Add);
         // `fn_ptr_addr` is the address of the vtable slot holding the function pointer, so it must
@@ -1372,9 +1257,9 @@ pub fn call_inner<'tcx>(
             vec![place_set(destination, call, ctx)]
         };
     }
-    let call_info = CallInfo::sig_from_instance_(instance, ctx);
+    let abi = AbiPlan::from_instance(instance, ctx);
 
-    let function_name = fn_name(ctx.tcx().symbol_name(instance));
+    let function_name = fn_name_for_instance(ctx.tcx(), instance);
     if matches!(instance.def, InstanceKind::Intrinsic(_)) {
         return super::intrinsics::handle_intrinsic(
             &function_name,
@@ -1385,7 +1270,7 @@ pub fn call_inner<'tcx>(
             ctx,
         );
     }
-    let mut signature = call_info.sig().clone();
+    let mut signature = abi.signature().clone();
     // Checks if function is "magic" — classified by exact `DefId`, not by matching the mangled
     // `function_name`; see `classify_magic_fn`'s doc comment for why that's the safer mechanism.
     // `function_name` is still threaded into several arms below (`call_ctor`, `callvirt_managed`,
@@ -1396,7 +1281,7 @@ pub fn call_inner<'tcx>(
         match magic {
             MagicFn::GenericCtor => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Generic constructors may not use the `rust_call` calling convention!"
                 );
                 // WF-9: `new List<i32>()` and friends.
@@ -1404,7 +1289,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::GenericMethodCall => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Generic method calls may not use the `rust_call` calling convention!"
                 );
                 // WF-9: `Activator.CreateInstance<T>()`, `Deserialize<T>(…)`, `GetService<T>()` and friends.
@@ -1412,7 +1297,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::GenericCall => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Generic managed calls may not use the `rust_call` calling convention!"
                 );
                 // WF-9: `List<i32>::Add(…)` and friends.
@@ -1420,14 +1305,14 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::DelegateClosure => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Closure delegate construction may not use the `rust_call` calling convention!"
                 );
                 return vec![delegate_from_closure(instance.args, args, destination, ctx)];
             }
             MagicFn::Delegate => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Delegate construction may not use the `rust_call` calling convention!"
                 );
                 // Delegates & callbacks: wrap a Rust `extern` fn pointer into a managed `Action`/`Func`.
@@ -1442,9 +1327,45 @@ pub fn call_inner<'tcx>(
                 let msg = garg_to_string(instance.args[0], ctx.tcx());
                 return vec![ctx.throw_msg(&msg)];
             }
+            MagicFn::EnumReprTransmute => {
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "enum representation conversion must have exactly one value argument"
+                );
+                let source_ty = ctx.monomorphize(args[0].node.ty(ctx.body(), ctx.tcx()));
+                let destination_ty = ctx.monomorphize(destination.ty(ctx.body(), ctx.tcx()).ty);
+                let source_is_int = matches!(
+                    source_ty.kind(),
+                    rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_)
+                );
+                let destination_is_int = matches!(
+                    destination_ty.kind(),
+                    rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_)
+                );
+                let source_is_managed =
+                    crate::managed_storage::is_raw_managed_struct(source_ty, ctx);
+                let destination_is_managed =
+                    crate::managed_storage::is_raw_managed_struct(destination_ty, ctx);
+                assert!(
+                    (source_is_int && destination_is_managed)
+                        || (source_is_managed && destination_is_int),
+                    "enum representation conversion requires exactly one integer and one raw managed-struct marker; got {source_ty:?} -> {destination_ty:?}"
+                );
+                assert_eq!(
+                    ctx.layout_of(source_ty).size.bytes(),
+                    ctx.layout_of(destination_ty).size.bytes(),
+                    "enum representation conversion must preserve byte width"
+                );
+                let source_type = ctx.type_from_cache(source_ty);
+                let destination_type = ctx.type_from_cache(destination_ty);
+                let value = handle_operand(&args[0].node, ctx);
+                let converted = ctx.transmute_on_stack(source_type, destination_type, value);
+                return vec![place_set(destination, converted, ctx)];
+            }
             MagicFn::Ctor => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Constructors may not use the `rust_call` calling convention!"
                 );
                 // Constructor
@@ -1458,7 +1379,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::ManagedCallVirt => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed virtual calls may not use the `rust_call` calling convention!"
                 );
                 // Virtual (for interop)
@@ -1473,7 +1394,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::ManagedCall => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed calls may not use the `rust_call` calling convention!"
                 );
                 // Not-Virtual (for interop)
@@ -1488,14 +1409,14 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::ManagedGetField => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed field reads may not use the `rust_call` calling convention!"
                 );
                 return vec![managed_get_field(instance.args, args, destination, ctx)];
             }
             MagicFn::LdLen => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed calls may not use the `rust_call` calling convention!"
                 );
                 // Not-Virtual (for interop)
@@ -1505,7 +1426,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::LdNull => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed calls may not use the `rust_call` calling convention!"
                 );
                 // Not-Virtual (for interop)
@@ -1519,7 +1440,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::IsNull => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed calls may not use the `rust_call` calling convention!"
                 );
                 let tpe = ctx
@@ -1567,12 +1488,11 @@ pub fn call_inner<'tcx>(
             MagicFn::ManagedBoxNew => {
                 let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
                 let value = handle_operand(&args[0].node, ctx);
-                let object = match tpe {
-                    Type::ClassRef(class) if !ctx[class].is_valuetype() => value,
-                    _ => {
-                        let tpe = ctx.alloc_type(tpe);
-                        ctx.box_value(value, tpe)
-                    }
+                let object = if is_direct_managed_reference(tpe, ctx) {
+                    value
+                } else {
+                    let tpe = ctx.alloc_type(tpe);
+                    ctx.box_value(value, tpe)
                 };
                 let handle = ctx[object].clone().ref_to_handle(ctx);
                 let handle = ctx.alloc_node(handle);
@@ -1581,7 +1501,8 @@ pub fn call_inner<'tcx>(
                     ctx.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::Ptr(void))));
                 return vec![place_set(destination, handle, ctx)];
             }
-            MagicFn::ManagedBoxTake => {
+            MagicFn::ManagedBoxGet | MagicFn::ManagedBoxTake => {
+                let take = matches!(magic, MagicFn::ManagedBoxTake);
                 let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
                 let handle = handle_operand(&args[0].node, ctx);
                 let handle = ctx.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
@@ -1594,16 +1515,18 @@ pub fn call_inner<'tcx>(
                     ctx,
                 );
                 let object = ctx.alloc_node(CILNode::call(handle_to_obj, [handle]));
-                let value = match tpe {
-                    Type::ClassRef(class) if !ctx[class].is_valuetype() => {
-                        ctx.checked_cast(object, class)
-                    }
-                    _ => {
-                        let tpe = ctx.alloc_type(tpe);
-                        ctx.unbox_any(object, tpe)
-                    }
+                let value = if is_direct_managed_reference(tpe, ctx) {
+                    let tpe = ctx.alloc_type(tpe);
+                    ctx.alloc_node(CILNode::CheckedCast(object, tpe))
+                } else {
+                    let tpe = ctx.alloc_type(tpe);
+                    ctx.unbox_any(object, tpe)
                 };
                 let store = place_set(destination, value, ctx);
+
+                if !take {
+                    return vec![store];
+                }
 
                 let handle_free_name = ctx.alloc_string("handle_free");
                 let handle_free = ctx.class_ref(main_module).clone().static_mref(
@@ -1615,9 +1538,28 @@ pub fn call_inner<'tcx>(
                 let free = ctx.alloc_root(CILRoot::call(handle_free, [handle]));
                 return vec![store, free];
             }
+            MagicFn::ManagedBoxFree => {
+                let handle = handle_operand(&args[0].node, ctx);
+                let handle = ctx.alloc_node(CILNode::PtrCast(handle, Box::new(PtrCastRes::ISize)));
+                let main_module = *ctx.main_module();
+                let handle_free_name = ctx.alloc_string("handle_free");
+                let handle_free = ctx.class_ref(main_module).clone().static_mref(
+                    &[Type::Int(Int::ISize)],
+                    Type::Void,
+                    handle_free_name,
+                    ctx,
+                );
+                return vec![ctx.alloc_root(CILRoot::call(handle_free, [handle]))];
+            }
+            MagicFn::ManagedDefault => {
+                let tpe = ctx.type_from_cache(instance.args[0].as_type().unwrap());
+                let tpe = ctx.alloc_type(tpe);
+                let destination = place_address(destination, ctx);
+                return vec![ctx.init_obj(destination, tpe)];
+            }
             MagicFn::LdElemRef => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed calls may not use the `rust_call` calling convention!"
                 );
                 // Not-Virtual (for interop)
@@ -1628,7 +1570,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::LdElem => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed calls may not use the `rust_call` calling convention!"
                 );
                 let elem = ctx.type_from_cache(instance.args[0].as_type().unwrap());
@@ -1640,7 +1582,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::NewArr => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed calls may not use the `rust_call` calling convention!"
                 );
                 // Allocates a managed 1-D array of the (primitive) element type `T` with `len` elements.
@@ -1653,7 +1595,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::SetElem => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed calls may not use the `rust_call` calling convention!"
                 );
                 // Stores `val` into managed array `arr` at `idx`. Side-effecting; destination is unit.
@@ -1668,7 +1610,7 @@ pub fn call_inner<'tcx>(
             }
             MagicFn::TryCatch => {
                 assert!(
-                    !call_info.split_last_tuple(),
+                    !abi.is_rust_call(),
                     "Managed calls may not use the `rust_call` calling convention!"
                 );
                 // `try_catch(try_fn, data, catch_fn) -> i32`: run `try_fn(data)` inside a CIL
@@ -1697,53 +1639,19 @@ pub fn call_inner<'tcx>(
             }
         }
     }
-    if call_info.split_last_tuple() {
-        let requires_caller_location = instance.def.requires_caller_location(ctx.tcx());
-        return vec![call_closure(
-            args,
-            destination,
-            signature,
-            &function_name,
-            requires_caller_location,
-            source_info,
-            ctx,
-        )];
+    let call_args = abi.lower_call_args(args, source_info, ctx);
+    if abi.is_c_variadic() {
+        let mut inputs: Vec<_> = args
+            .iter()
+            .map(|operand| {
+                ctx.type_from_cache(ctx.monomorphize(operand.node.ty(ctx.body(), ctx.tcx())))
+            })
+            .collect();
+        if let Some(slot) = abi.caller_location_slot() {
+            inputs.push(signature.inputs()[slot]);
+        }
+        signature.set_inputs(inputs);
     }
-
-    let mut call_args = Vec::new();
-    for arg in args {
-        let res_calc = handle_operand(&arg.node, ctx);
-        call_args.push(res_calc);
-    }
-    if crate::function_sig::is_fn_variadic(fn_type, ctx.tcx()) {
-        signature.set_inputs(
-            args.iter()
-                .map(|operand| {
-                    ctx.type_from_cache(ctx.monomorphize(operand.node.ty(ctx.body(), ctx.tcx())))
-                })
-                .collect::<Box<_>>(),
-        );
-    }
-    if instance.def.requires_caller_location(ctx.tcx()) {
-        // The callee is `#[track_caller]`: rustc appends an implicit `&core::panic::Location` param
-        // that the *call site* must supply (this is why `FnSig` ≠ `FnAbi` for track_caller fns).
-        // Supply the correct caller location: if *we* are also track_caller, forward our own implicit
-        // arg (so the location propagates up the chain to the real user site); otherwise, and after
-        // accounting for any MIR-inlined track_caller frames, materialize it from the call-site span.
-        // Previously this unconditionally materialized the local span, which both lost the propagation
-        // and (under MIR inlining) reported the inlined body's span instead of the user's.
-        assert_eq!(
-            call_args.len() + 1,
-            signature.inputs().len(),
-            "a track_caller callee must add exactly one implicit caller-location slot"
-        );
-        call_args.push(crate::terminator::get_caller_location(ctx, source_info));
-    }
-    assert_eq!(
-        call_args.len(),
-        signature.inputs().len(),
-        "MIR call argument count does not match the callee ABI"
-    );
     let is_void = matches!(signature.output(), cilly::Type::Void);
     //rustc_middle::ty::print::with_no_trimmed_paths! {call.push(CILOp::Comment(format!("Calling {instance:?}").into()))};
     if let InstanceKind::DropGlue(_def, None) = instance.def {

@@ -1,4 +1,4 @@
-use cilly::Assembly;
+use cilly::{Assembly, AssemblyLinkError};
 
 /// Builds an isolated shard without touching its eventual parent.
 ///
@@ -15,13 +15,20 @@ pub(crate) fn build_assembly_shard<T, E>(
 
 /// Commits a successfully built shard.
 ///
-/// `Assembly::link` consumes the old parent. Therefore a link panic cannot be rolled back through
-/// this API; it must propagate and fail codegen. In particular, never put this call inside the
-/// best-effort item-lowering `catch_unwind`, because doing so would resume with an empty parent and
-/// lose every item committed earlier in the CGU.
+/// Expected cross-shard conflicts are detected before the consuming relocation begins, so every
+/// returned error leaves `parent` unchanged without cloning it. Unexpected relocation invariant
+/// panics remain fail-stop.
+pub(crate) fn try_commit_assembly_shard(
+    parent: &mut Assembly,
+    shard: Assembly,
+) -> Result<(), AssemblyLinkError> {
+    parent.try_link_in_place(shard).map(|_| ())
+}
+
 pub(crate) fn commit_assembly_shard(parent: &mut Assembly, shard: Assembly) {
-    let base = std::mem::take(parent);
-    *parent = base.link(shard);
+    if let Err(error) = try_commit_assembly_shard(parent, shard) {
+        panic!("assembly shard commit failed: {error}");
+    }
 }
 
 /// Builds an isolated assembly shard and links it into `parent` only after `build` succeeds.
@@ -39,8 +46,11 @@ pub(crate) fn assembly_transaction<T, E>(
 
 #[cfg(test)]
 mod tests {
-    use super::assembly_transaction;
-    use cilly::{Access, Assembly, ClassDef, Int, Type};
+    use super::{assembly_transaction, try_commit_assembly_shard};
+    use cilly::{
+        Access, Assembly, AssemblyLinkError, ClassDef, ClassRef, Int, MethodDef, MethodImpl,
+        NativeImport, PInvokeCallConv, Type, cilnode::MethodKind,
+    };
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn encoded(assembly: &Assembly) -> Vec<u8> {
@@ -70,6 +80,83 @@ mod tests {
                 true,
             ))
             .unwrap();
+    }
+
+    fn add_class_with_base(assembly: &mut Assembly, base_name: &str) {
+        let base_name = assembly.alloc_string(base_name);
+        let base = assembly.alloc_class_ref(ClassRef::new(base_name, None, false, vec![].into()));
+        let name = assembly.alloc_string("TransactionBaseCollision");
+        assembly
+            .class_def(ClassDef::new(
+                name,
+                false,
+                0,
+                Some(base),
+                vec![],
+                vec![],
+                Access::Private,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+    }
+
+    fn add_collision_method(assembly: &mut Assembly, access: Access) {
+        let name = assembly.alloc_string("TransactionMethodCollision");
+        let class = assembly
+            .class_def(ClassDef::new(
+                name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                Access::Private,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+        let signature = assembly.sig([Type::Int(Int::I32)], Type::Void);
+        let method_name = assembly.alloc_string("conflict");
+        assembly.new_method(MethodDef::new(
+            access,
+            class,
+            method_name,
+            signature,
+            MethodKind::Static,
+            MethodImpl::Missing,
+            vec![None],
+        ));
+    }
+
+    fn add_class_with_access(assembly: &mut Assembly, access: Access) {
+        let name = assembly.alloc_string("TransactionDefinitionCollision");
+        assembly
+            .class_def(ClassDef::new(
+                name,
+                false,
+                0,
+                None,
+                vec![],
+                vec![],
+                access,
+                None,
+                None,
+                true,
+            ))
+            .unwrap();
+    }
+
+    fn native_import(library: &str) -> NativeImport {
+        NativeImport {
+            rust_symbol: "transaction_native".into(),
+            entry_point: "transaction_native".into(),
+            library: library.into(),
+            call_conv: PInvokeCallConv::Cdecl,
+            preserve_errno: false,
+        }
     }
 
     #[test]
@@ -124,25 +211,117 @@ mod tests {
     }
 
     #[test]
-    fn commit_panic_propagates_instead_of_becoming_recoverable_success() {
+    fn failed_field_commit_preserves_parent_counts_and_serialization() {
         let mut parent = seeded_parent();
         add_collision_class(&mut parent, Type::Int(Int::I32));
+        let counts = parent.arena_counts();
+        let bytes = encoded(&parent);
+
+        let mut shard = Assembly::default();
+        add_collision_class(&mut shard, Type::Int(Int::I64));
+        let result = try_commit_assembly_shard(&mut parent, shard);
+
+        assert!(matches!(
+            result,
+            Err(AssemblyLinkError::ClassFieldConflict { .. })
+        ));
+        assert_eq!(parent.arena_counts(), counts);
+        assert_eq!(encoded(&parent), bytes);
+    }
+
+    #[test]
+    fn failed_base_commit_preserves_parent_counts_and_serialization() {
+        let mut parent = seeded_parent();
+        add_class_with_base(&mut parent, "BaseOne");
+        let counts = parent.arena_counts();
+        let bytes = encoded(&parent);
+
+        let mut shard = Assembly::default();
+        add_class_with_base(&mut shard, "BaseTwo");
+        let result = try_commit_assembly_shard(&mut parent, shard);
+
+        assert!(matches!(
+            result,
+            Err(AssemblyLinkError::ClassBaseConflict { .. })
+        ));
+        assert_eq!(parent.arena_counts(), counts);
+        assert_eq!(encoded(&parent), bytes);
+    }
+
+    #[test]
+    fn failed_method_commit_preserves_parent_counts_and_serialization() {
+        let mut parent = seeded_parent();
+        add_collision_method(&mut parent, Access::Public);
+        let counts = parent.arena_counts();
+        let bytes = encoded(&parent);
+
+        let mut shard = Assembly::default();
+        add_collision_method(&mut shard, Access::Private);
+        let result = try_commit_assembly_shard(&mut parent, shard);
+
+        assert!(matches!(
+            result,
+            Err(AssemblyLinkError::MethodConflict { .. })
+        ));
+        assert_eq!(parent.arena_counts(), counts);
+        assert_eq!(encoded(&parent), bytes);
+    }
+
+    #[test]
+    fn failed_class_definition_commit_preserves_parent_counts_and_serialization() {
+        let mut parent = seeded_parent();
+        add_class_with_access(&mut parent, Access::Public);
+        let counts = parent.arena_counts();
+        let bytes = encoded(&parent);
+
+        let mut shard = Assembly::default();
+        add_class_with_access(&mut shard, Access::Private);
+        let result = try_commit_assembly_shard(&mut parent, shard);
+
+        assert!(matches!(
+            result,
+            Err(AssemblyLinkError::ClassDefinitionConflict { .. })
+        ));
+        assert_eq!(parent.arena_counts(), counts);
+        assert_eq!(encoded(&parent), bytes);
+    }
+
+    #[test]
+    fn failed_native_import_commit_preserves_parent_counts_and_serialization() {
+        let mut parent = seeded_parent();
+        parent.add_native_import(native_import("library-one"));
+        let counts = parent.arena_counts();
+        let bytes = encoded(&parent);
+
+        let mut shard = Assembly::default();
+        shard.add_native_import(native_import("library-two"));
+        let result = try_commit_assembly_shard(&mut parent, shard);
+
+        assert!(matches!(
+            result,
+            Err(AssemblyLinkError::NativeImportConflict { .. })
+        ));
+        assert_eq!(parent.arena_counts(), counts);
+        assert_eq!(encoded(&parent), bytes);
+    }
+
+    #[test]
+    fn assembly_transaction_panics_on_link_error_without_losing_parent() {
+        let mut parent = seeded_parent();
+        add_collision_class(&mut parent, Type::Int(Int::I32));
+        let counts = parent.arena_counts();
+        let bytes = encoded(&parent);
 
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _: Result<(), ()> = assembly_transaction(&mut parent, |shard| {
-                // Same managed identity, incompatible definition: relocation must reject the
-                // commit. The caller observes that panic; production code deliberately does not
-                // catch this consuming commit boundary and therefore cannot continue after losing
-                // the taken parent assembly.
                 add_collision_class(shard, Type::Int(Int::I64));
                 Ok(())
             });
         }));
 
-        assert!(
-            result.is_err(),
-            "a failing link commit must propagate its panic"
-        );
+        assert!(result.is_err());
+        assert_eq!(parent.arena_counts(), counts);
+        assert_eq!(encoded(&parent), bytes);
     }
 
     #[test]

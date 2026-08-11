@@ -1,30 +1,22 @@
 use super::{PlaceTy, pointed_type};
 use crate::fn_ctx::MethodCompileCtx;
 use crate::place::{body_ty_is_by_address, deref_op};
-use crate::r#type::{
-    GetTypeExt,
-    adt::{FieldOffsetIterator, field_descrptor, variant_field_desc},
-    fat_ptr_to,
-    utilis::ptr_is_fat,
-};
-use cilly::{BinOp, Const, FieldDesc, Int, Interned, Type};
+use crate::r#type::GetTypeExt;
+use cilly::{Const, Interned};
 use rustc_middle::mir::{Local, PlaceElem};
-use rustc_middle::ty::{Ty, TyKind};
+
+/// Seeds a projection walk with the local's value or address according to its MIR representation.
 pub fn local_body<'tcx>(
     local: usize,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
-) -> (Interned<cilly::ir::CILNode>, Ty<'tcx>) {
-    let ty = ctx.body().local_decls[Local::from_usize(local)].ty;
-    let ty = ctx.monomorphize(ty);
-    // A storage-less local has no CLR slot whose address can carry its Rust provenance. Use the
-    // same correctly aligned dangling base as `place_address` does for the unprojected local; any
-    // following ZST field/index projection then preserves or layout-adjusts that container base.
-    // This is especially important for `[Zst; N]`: every element address equals the array base.
+) -> (Interned<cilly::ir::CILNode>, rustc_middle::ty::Ty<'tcx>) {
+    let ty = ctx.monomorphize(ctx.body().local_decls[Local::from_usize(local)].ty);
     let layout = ctx.layout_of(ty);
     if layout.is_zst() {
-        let align = layout.align.abi.bytes();
+        // Storage-less locals use the correctly aligned dangling base. Shared field/sequence plans
+        // preserve or layout-adjust this base for every following projected ZST.
         let lowered_ty = ctx.type_from_cache(ty);
-        let base = ctx.alloc_node(Const::USize(align));
+        let base = ctx.alloc_node(Const::USize(layout.align.abi.bytes()));
         return (ctx.cast_ptr(base, lowered_ty), ty);
     }
     if body_ty_is_by_address(ty, ctx) {
@@ -33,289 +25,50 @@ pub fn local_body<'tcx>(
         (super::get::local_get(local, ctx.body(), ctx), ty)
     }
 }
-fn body_field<'a>(
-    curr_type: super::PlaceTy<'a>,
-    ctx: &mut MethodCompileCtx<'a, '_>,
-    field_idx: u32,
-    field_ty: Ty<'a>,
-    node: Interned<cilly::ir::CILNode>,
-) -> (PlaceTy<'a>, Interned<cilly::ir::CILNode>) {
-    match curr_type {
-        super::PlaceTy::Ty(curr_type) => {
-            let curr_type = ctx.monomorphize(curr_type);
-            let field_type = ctx.monomorphize(field_ty);
-            match (
-                ptr_is_fat(curr_type, ctx.tcx(), ctx.instance()),
-                ptr_is_fat(field_type, ctx.tcx(), ctx.instance()),
-            ) {
-                (false, false) => {
-                    // A ZST owner/field has no physical CIL ClassDef/field. This can occur in the
-                    // middle of a projection, e.g. `Dim<[usize; 0]>.0[index]`: preserve the place as
-                    // its layout-derived address so the following projection can continue without
-                    // asking `field_descrptor` to turn `Type::Void` into a class owner.
-                    let owner_type = ctx.type_from_cache(curr_type);
-                    let lowered_field = ctx.type_from_cache(field_type);
-                    if owner_type == Type::Void || lowered_field == Type::Void {
-                        let addr = super::projected_field_address(
-                            curr_type, field_type, field_idx, node, ctx,
-                        );
-                        return (field_type.into(), addr);
-                    }
-                    let field_desc = field_descrptor(curr_type, field_idx, ctx);
-                    if body_ty_is_by_address(field_type, ctx) {
-                        ((field_type).into(), ctx.ld_field_addr(node, field_desc))
-                    } else {
-                        ((field_type).into(), ctx.ld_field(node, field_desc))
-                    }
-                }
-                (false, true) => panic!(
-                    "Sized type {curr_type:?} contains an unsized field of type {field_type}. This is a bug."
-                ),
-                (true, false) => {
-                    let mut explicit_offset_iter =
-                        FieldOffsetIterator::fields(ctx.layout_of(curr_type).layout.0.0.clone());
-                    let offset = explicit_offset_iter
-                        .nth(field_idx as usize)
-                        .expect("Field index not in field offset iterator");
-                    let curr_type_fat_ptr = ctx.type_from_cache(Ty::new_ptr(
-                        ctx.tcx(),
-                        curr_type,
-                        rustc_middle::ty::Mutability::Mut,
-                    ));
-                    let addr_descr = FieldDesc::new(
-                        curr_type_fat_ptr.as_class_ref().unwrap(),
-                        ctx.alloc_string(cilly::DATA_PTR),
-                        ctx.nptr(Type::Void),
-                    );
-                    // Get the address of the unsized object.
-                    let obj_addr = ctx.ld_field(node, addr_descr);
-                    let obj = ctx.type_from_cache(field_type);
-                    // Add the offset to the object.
-                    let field_addr =
-                        ctx.biop(obj_addr, Const::USize(u64::from(offset)), BinOp::Add);
-                    let field_addr = ctx.cast_ptr(field_addr, obj);
-                    if body_ty_is_by_address(field_type, ctx) {
-                        (field_type.into(), field_addr)
-                    } else {
-                        (field_type.into(), ctx.load(field_addr, obj))
-                    }
-                }
-                (true, true) => {
-                    // The unsized tail field of a DST (e.g. `data: [MaybeUninit<T>]` in
-                    // `core::array::IntoIter`'s `PolymorphicIter<DATA> { alive, data }`). Its
-                    // address is itself a fat pointer:
-                    //   data     = parent.DATA_PTR + offset_of(field)
-                    //   metadata = parent.METADATA   (the tail shares the enclosing DST's metadata)
-                    // The previous code only handled an unsized field at field index 0 (offset 0)
-                    // via `assert_eq!(field_idx, 0)`, which rejected every DST with a sized
-                    // prefix before the tail.
-                    let offset =
-                        FieldOffsetIterator::fields(ctx.layout_of(curr_type).layout.0.0.clone())
-                            .nth(field_idx as usize)
-                            .expect("Field index not in field offset iterator");
-                    let curr_type_fat_ptr = ctx
-                        .type_from_cache(Ty::new_ptr(
-                            ctx.tcx(),
-                            curr_type,
-                            rustc_middle::ty::Mutability::Mut,
-                        ))
-                        .as_class_ref()
-                        .unwrap();
-                    let void_ptr = ctx.nptr(Type::Void);
-                    let data_descr = FieldDesc::new(
-                        curr_type_fat_ptr,
-                        ctx.alloc_string(cilly::DATA_PTR),
-                        void_ptr,
-                    );
-                    let metadata_descr = FieldDesc::new(
-                        curr_type_fat_ptr,
-                        ctx.alloc_string(cilly::METADATA),
-                        Type::Int(Int::USize),
-                    );
-                    let metadata = ctx.ld_field(node, metadata_descr);
-                    let data = ctx.ld_field(node, data_descr);
-                    let data = if offset == 0 {
-                        data
-                    } else {
-                        ctx.biop(data, Const::USize(u64::from(offset)), BinOp::Add)
-                    };
-                    let field_fat_ptr = fat_ptr_to(field_type, ctx);
-                    (
-                        field_ty.into(),
-                        ctx.create_slice(field_fat_ptr, data, metadata),
-                    )
-                }
-            }
-        }
-        super::PlaceTy::EnumVariant(enm, var_idx) => {
-            let owner = ctx.monomorphize(enm);
-            let field_type = ctx.monomorphize(field_ty);
-            if ctx.type_from_cache(field_type) == Type::Void {
-                let addr = super::projected_variant_field_address(
-                    owner, field_type, field_idx, var_idx, node, ctx,
-                );
-                return (field_ty.into(), addr);
-            }
-            let field_desc = variant_field_desc(owner, field_idx, var_idx, ctx);
-            (field_ty.into(), ctx.ld_field_addr(node, field_desc))
-        }
-    }
-}
-pub fn place_elem_body_index<'tcx>(
-    curr_ty: Ty<'tcx>,
-    ctx: &mut MethodCompileCtx<'tcx, '_>,
-    node: Interned<cilly::ir::CILNode>,
-    index: rustc_middle::mir::Local,
-) -> (PlaceTy<'tcx>, Interned<cilly::ir::CILNode>) {
-    let index = crate::place::local_get(index.as_usize(), ctx.body(), ctx);
-    match curr_ty.kind() {
-        TyKind::Slice(inner) => {
-            let inner = ctx.monomorphize(*inner);
-            let inner_type = ctx.type_from_cache(inner);
-            let slice = fat_ptr_to(Ty::new_slice(ctx.tcx(), inner), ctx);
-            let desc = FieldDesc::new(
-                slice,
-                ctx.alloc_string(cilly::DATA_PTR),
-                ctx.nptr(Type::Void),
-            );
-            let addr = ctx.ld_field(node, desc);
-            let addr = super::indexed_element_address(addr, index, inner_type, ctx);
 
-            if body_ty_is_by_address(inner, ctx) {
-                (inner.into(), addr)
-            } else {
-                (
-                    inner.into(),
-                    super::deref_op(super::PlaceTy::Ty(inner), ctx, addr),
-                )
-            }
-        }
-        TyKind::Array(element, _length) => {
-            let index = ctx.alloc_node(cilly::CILNode::IntCast {
-                input: index,
-                target: Int::USize,
-                extend: cilly::cilnode::ExtendKind::ZeroExtend,
-            });
-            let element_tpe = ctx.type_from_cache(*element);
-            let addr = super::indexed_element_address(node, index, element_tpe, ctx);
-            if body_ty_is_by_address(*element, ctx) {
-                ((*element).into(), addr)
-            } else {
-                ((*element).into(), ctx.load(addr, element_tpe))
-            }
-        }
-        _ => {
-            rustc_middle::ty::print::with_no_trimmed_paths! {todo!("Can't index into {curr_ty}!")}
-        }
-    }
-}
+/// Lowers one non-final projection while retaining the representation required by the next step.
 pub fn place_elem_body<'tcx>(
     place_elem: &PlaceElem<'tcx>,
     curr_type: PlaceTy<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     node: Interned<cilly::ir::CILNode>,
 ) -> (PlaceTy<'tcx>, Interned<cilly::ir::CILNode>) {
-    let curr_ty = match curr_type {
-        PlaceTy::Ty(ty) => PlaceTy::Ty(ctx.monomorphize(ty)),
-        PlaceTy::EnumVariant(enm, idx) => PlaceTy::EnumVariant(ctx.monomorphize(enm), idx),
-    };
+    let curr_type = curr_type.monomorphize(ctx);
+    if let Some(field) = super::projection::FieldProjection::lower(place_elem, curr_type, node, ctx)
+    {
+        return field.body(node, ctx);
+    }
+    if let Some(sequence) =
+        super::projection::SequenceProjection::lower(place_elem, curr_type, node, ctx)
+    {
+        return sequence.body(ctx);
+    }
+    if let Some(subslice) =
+        super::projection::SubsliceProjection::lower(place_elem, curr_type, node, ctx)
+    {
+        return (subslice.result_ty.into(), subslice.address);
+    }
+
     match place_elem {
         PlaceElem::Deref => {
-            let pointed = pointed_type(curr_ty);
+            let pointed = pointed_type(curr_type);
             if body_ty_is_by_address(pointed, ctx) {
                 (pointed.into(), node)
             } else {
                 (pointed.into(), deref_op(pointed.into(), ctx, node))
             }
         }
-        PlaceElem::Field(field_idx, field_ty) => {
-            body_field(curr_type, ctx, field_idx.as_u32(), *field_ty, node)
-        }
         PlaceElem::Downcast(_, variant) => {
-            let curr_type = curr_ty
+            let owner = curr_type
                 .as_ty()
-                .expect("Can't get enum variant of an enum varaint!");
-            let curr_type = ctx.monomorphize(curr_type);
-            // Coroutines are enum-like (`Variants::Multiple`): a Downcast selects a variant
-            // (a suspend point or one of the reserved Unresumed/Returned/Panicked variants),
-            // exactly like an enum Downcast. Re-tag the place as an `EnumVariant` so the
-            // following `Field` projection resolves through the variant-field path. This is a
-            // pure type-level re-tag — no CIL is emitted, `node` passes through.
-            let variant_type = PlaceTy::EnumVariant(curr_type, variant.as_u32());
-
-            (variant_type, node)
+                .expect("cannot downcast an enum-variant marker twice");
+            (PlaceTy::EnumVariant(owner, variant.as_u32()), node)
         }
-        PlaceElem::Index(index) => place_elem_body_index(
-            curr_type
-                .as_ty()
-                .expect("INVALID PLACE: Indexing into enum variant???"),
-            ctx,
-            node,
-            *index,
-        ),
-
-        PlaceElem::ConstantIndex {
-            offset,
-            min_length: _,
-            from_end,
-        } => {
-            let curr_ty = curr_ty
-                .as_ty()
-                .expect("INVALID PLACE: Indexing into enum variant???");
-            match curr_ty.kind() {
-                TyKind::Slice(inner) => {
-                    let inner = ctx.monomorphize(*inner);
-                    let inner_type = ctx.type_from_cache(inner);
-                    let slice = fat_ptr_to(Ty::new_slice(ctx.tcx(), inner), ctx);
-                    let desc = FieldDesc::new(
-                        slice,
-                        ctx.alloc_string(cilly::DATA_PTR),
-                        ctx.nptr(Type::Void),
-                    );
-                    let metadata = FieldDesc::new(
-                        slice,
-                        ctx.alloc_string(cilly::METADATA),
-                        Type::Int(Int::USize),
-                    );
-                    // `from_end` slice tail-patterns (e.g. `let [.., x] = ..`) index
-                    // relative to the slice length: index = len - offset.
-                    let index = if *from_end {
-                        let len_fld = ctx.ld_field(node, metadata);
-                        ctx.biop(len_fld, Const::USize(*offset), BinOp::Sub)
-                    } else {
-                        ctx.alloc_node(Const::USize(*offset))
-                    };
-
-                    let addr = ctx.ld_field(node, desc);
-                    let addr = super::indexed_element_address(addr, index, inner_type, ctx);
-
-                    if body_ty_is_by_address(inner, ctx) {
-                        (inner.into(), addr)
-                    } else {
-                        (
-                            inner.into(),
-                            super::deref_op(super::PlaceTy::Ty(inner), ctx, addr),
-                        )
-                    }
-                }
-                TyKind::Array(element, _length) => {
-                    // Arrays have a static length, so rustc never lowers array
-                    // tail-patterns to `from_end`.
-                    assert!(!from_end, "Can't index array from end!");
-                    let index = ctx.alloc_node(Const::USize(*offset));
-                    let element_tpe = ctx.type_from_cache(*element);
-                    let addr = super::indexed_element_address(node, index, element_tpe, ctx);
-                    if body_ty_is_by_address(*element, ctx) {
-                        ((*element).into(), addr)
-                    } else {
-                        ((*element).into(), ctx.load(addr, element_tpe))
-                    }
-                }
-                _ => {
-                    rustc_middle::ty::print::with_no_trimmed_paths! { todo!("Can't index into {curr_ty}!")}
-                }
-            }
+        PlaceElem::OpaqueCast(ty) | PlaceElem::UnwrapUnsafeBinder(ty) => {
+            (ctx.monomorphize(*ty).into(), node)
         }
-        _ => todo!("Can't handle porojection {place_elem:?} in body"),
+        _ => rustc_middle::ty::print::with_no_trimmed_paths! {
+            todo!("cannot lower intermediate projection {place_elem:?}")
+        },
     }
 }

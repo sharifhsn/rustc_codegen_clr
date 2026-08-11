@@ -33,6 +33,7 @@
 //! member, with no added behaviour. The large formatting/parsing/`DateTimeOffset` surface is out of
 //! scope — reach for the raw handle via [`DateTime::handle`] for anything not surfaced here.
 
+use crate::NativeStorageSafe;
 use crate::intrinsics::RustcCLRInteropManagedStruct;
 use crate::system::MString;
 
@@ -53,6 +54,8 @@ const DATETIME_SIZE: usize = core::mem::size_of::<i64>();
 /// properties retain the genuine CLR `System.DateTime` identity.
 /// See the [module docs](self) for the full member map.
 pub type DateTime = RustcCLRInteropManagedStruct<{ CORELIB }, { DATETIME }, DATETIME_SIZE>;
+// SAFETY: `System.DateTime` is one packed 64-bit scalar and contains no GC references.
+unsafe impl NativeStorageSafe for DateTime {}
 
 impl DateTime {
     // --- constructors -----------------------------------------------------------------------------

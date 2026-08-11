@@ -23,11 +23,14 @@ and acceptance tests are authoritative when implementation and prose differ.
    back to exactly one MIR statement. A separate optimization pass then applies many small
    behavior-preserving micro-ops that together roughly halve instruction count. *(v0.0.1, v0.0.3)*
    → When debugging a miscompilation, set `OPTIMIZE_CIL=0` to keep the 1:1 mapping.
-2. **Pure / functional translation.** Each MIR element is handled by a pure function over immutable
-   inputs, which makes panic-recovery trivial (the backend *expects* to hit unsupported code). The
-   mutable assembly boundary is transactional: every mono item builds in an isolated shard, and a
-   failed or panicking item is discarded without changing its parent CGU; CGUs then commit in rustc's
-   deterministic order. *(see `src/assembly_transaction.rs`)*
+2. **Isolated, transactional translation.** Lowering mutates a per-item `MethodCompileCtx` and its
+   interned assembly, but never the parent CGU directly. Every mono item first builds in an isolated
+   assembly shard; an unsupported item fails the
+   compilation instead of leaving a throwing placeholder or a partially mutated parent CGU. Before
+   a completed shard commits, the linker performs a read-only semantic-conflict preflight. Expected
+   conflicts return a structured error without changing the parent, while broken internal relocation
+   invariants remain fail-stop. CGUs commit in rustc's deterministic order. *(see
+   `src/assembly_transaction.rs` and `cilly/src/ir/asm_link.rs`)*
 
 > Why optimize MIR at all? Not for faster output — to make *compilation* faster: optimizing a
 > generic function once (pre-monomorphization) saves re-optimizing every monomorphized instance.
@@ -51,7 +54,19 @@ and acceptance tests are authoritative when implementation and prose differ.
   earlier V1→V2 two-generation design was collapsed into this one IR); optimization (`ir/opt/`), the
   typechecker (`ir/typecheck.rs`) and all exporters operate on it directly, and it's what gets
   serialized (postcard) into the `.bc`/`.rlib`. (See `join_codegen` in `src/lib.rs`: build → `opt` →
-  `typecheck`.)
+  `typecheck`.) The current envelope is schema 11 with the distinct `CILLYAR11` prefix. Schema 10
+  is rejected before positional root decoding because initializer-fragment boundaries became
+  serialized; schema 9 is likewise rejected because `ClassDef` gained positional
+  value-kind-authority metadata.
+- **Effects are explicit and conservative.** The optimizer uses an `EffectSummary` lattice rather
+  than treating “does not write” as “safe to delete”: a load, cast, division, static access, or call
+  can throw or trigger type initialization even when it has no write effect. Only total, pure trees
+  may be discarded. CIL-level call inlining is deliberately absent; rustc's typed MIR inliner is the
+  supported inlining layer.
+- **Verification is a fatal boundary.** Local/argument/result/call/calli/block/static-field shapes
+  are checked exhaustively before serialization and again after final reachability and runtime
+  resolution. `MethodImpl::Missing` is allowed as an intermediate link placeholder, never in the
+  retained executable graph.
 
 ## 4. The custom linker does the heavy lifting
 
@@ -61,7 +76,16 @@ through the direct PE emitter. Things that live here rather than in the compiler
 
 - **Cross-crate dead-code elimination** (a copying-GC-style reachability pass) — rustc's frontend DCE
   can't see across crates and must keep all public `std` functions. DCE roughly halved assembly size;
-  the remainder is mostly *types* and *static data*. *(v0.1.1)*
+  the remainder is mostly *types* and *static data*. Reachability includes constructed generic types,
+  external method signatures, accessors, overrides, and metadata ownership. Before call-graph DCE,
+  mandatory CFG canonicalization removes roots after unconditional transfers and walks blocks from
+  the real entry (including exception-region edges), so a const-pruned MIR branch cannot resurrect a
+  missing mono item. *(v0.1.1)*
+- **Indexed transactional shard linking.** The first preflight of an arbitrary or deserialized
+  destination validates and indexes all class identities, class-kind authority, methods, and native
+  imports. Successful mono-item commits carry that non-serialized index forward, so later disjoint
+  shards probe only their own identities instead of repeatedly sorting the accumulated program.
+  Identity overlaps still receive the complete structural field/base/member/method-body audit.
 - **Command-line arguments** — the single hardest GSoC task; Rust uses the GNU `.init` section to grab
   argv, emulated via .NET static constructors (`.cctor`) on the `RustModule` class. *(v0.1.2, v0.2.0)*
 - **Native-library P/Invoke** — the backend records ordinary Rust `#[link]` foreign functions as
@@ -72,13 +96,33 @@ through the direct PE emitter. Things that live here rather than in the compiler
   sides are Rust, its `native_export` and `native_import!` macros generate matching private C ABI
   shims from safe scalar, borrowed string/slice, and owned string/vector signatures. Generated
   deallocators keep cross-library memory ownership correct. None of these layers changes the
-  compiler contract. The older `native_passtrough.rs` GCC/`nm` experiment is separate and not the
+  compiler contract. The older `native_pastrough.rs` GCC/`nm` experiment is separate and not the
   public path.
+- **Runtime services are capabilities, not name-shaped stubs.** The linker recognizes a finite set
+  of exact allocator, pinned-native-core panic, UB-precondition, and managed-unwind symbols. Real
+  linked definitions always win; a known missing service must have a registered capability or
+  linking fails. Managed CIL has no DWARF frame-description entries, so four exact pinned
+  libunwind capabilities describe that absence: `_Unwind_FindEnclosingFunction(c_void*) ->
+  c_void*` preserves its input program counter, `_Unwind_GetIP(*void) -> usize` and
+  `_Unwind_GetCFA(*void) -> usize` report zero because no native unwind context exists, and
+  `_Unwind_Backtrace` returns
+  `_URC_END_OF_STACK`. The first matches Rust's own fallback where native symbol lookup is
+  unavailable or unreliable; the latter services avoid inventing a native stack or returning
+  uninitialized data. The exact pinned `llvm.x86.xgetbv(u32) -> i64` service also has a typed
+  managed capability: because managed CIL cannot read native XCR0, it returns zero so `std_detect`
+  conservatively reports no OS-enabled extended register state. Adjacent libunwind symbols and
+  neighboring `llvm.x86.*` intrinsics are not guessed. Unknown dead symbols may disappear in DCE,
+  but an unknown retained symbol is fatal. Direct-PE capability checks run on the compacted retained
+  graph before emission.
 
 ## 5. How Rust constructs map to .NET (and the gotchas)
 
 - **Functions** → static .NET methods; **Rust name mangling is preserved** in symbols
-  (`_ZN…E`, with `$u7b$`/`$u7d$` escapes). `ASCII_IDENTS` forces ASCII-only C identifiers for stricter compilers. *(v0.0.1, v0.2.1)*
+  (`_ZN…E`, with `$u7b$`/`$u7d$` escapes). Internal Rust `Instance` names use rustc's complete
+  defining-crate mangling identity, so the same upstream monomorphization emitted by two downstream
+  crates receives one program-wide name instead of two incidental instantiating-crate suffixes.
+  Explicit export/no-mangle names remain unchanged. `ASCII_IDENTS` forces ASCII-only C identifiers
+  for stricter compilers. *(v0.0.1, v0.2.1)*
 - **Generics are monomorphized.** rustc gives a `subst` (concrete type args, indexed `G0,G1,…` — MIR
   stores them by index, not name) + a `DefID` recipe. Mapping Rust generics onto *real* .NET generics
   was **tried and abandoned**: .NET forbids `LayoutKind.Explicit` on generic types (the GC can't tell
@@ -97,11 +141,34 @@ through the direct PE emitter. Things that live here rather than in the compiler
   code paths almost for free. *(v0.2.0)*
 - **`#[track_caller]`** injects a hidden `&'static Location` argument invisible in MIR — which is why
   **`FnSig` ≠ `FnAbi`** and their argument *counts* can differ. Must be threaded through everywhere
-  (especially fn pointers). *(v0.1.0, v0.2.2)* This is `src/call_info.rs`'s `CallInfo` territory.
+  (especially fn pointers). *(v0.1.0, v0.2.2)* `src/abi.rs`'s `AbiPlan` is the single source of truth
+  for definition, direct-call, indirect-call, closure-receiver, RustCall tuple, ignored-ZST, and
+  caller-location slots. It asks rustc for the physical `FnAbi`; it does not infer hidden arguments
+  from source arity or from a leading `Type::Void`.
 - **ZSTs:** .NET has no zero-sized types (every type ≥ 1 byte), a recurring bug source — a size-0
-  trailing field can become size-1 and clobber an adjacent byte on copy. *(v0.1.1)* (`Type::Void` is special-cased throughout.)
-- **Atomics** → `System.Threading.Interlocked` + inserted memory fences; **8/16-bit atomics**
-  (no .NET < 9 support) are **emulated with locks**. *(v0.1.4, v0.2.0)*
+  trailing field can become size-1 and clobber an adjacent byte on copy. *(v0.1.1)* (`Type::Void` is
+  special-cased throughout.) `LoweredPlace` walks a MIR projection prefix once, while shared field,
+  sequence, and subslice plans keep layout offsets, DST metadata, enum variants, and zero-stride ZST
+  addresses identical across address/read/write operations.
+- **Unsizing is layout-derived.** `CoerceUnsized` first asks rustc which field is the coercion field,
+  then copies every other non-ZST field at its real source/destination offset and recursively coerces
+  only that field. Custom smart pointers therefore do not need to put their pointer first, and no
+  aggregate-wide `cpblk` may overwrite changed metadata or padding.
+- **Managed references are not Rust bytes.** A naked CLR object/array reference or managed byref may
+  live in a managed evaluation-stack/local/argument slot, but not in Rust-owned arrays, aggregates,
+  statics, allocations, raw-pointer storage, or bulk-memory operations: those locations have neither
+  a CLR GC map nor write barriers. `src/managed_storage.rs` recursively rejects such escapes. Only
+  exact unsafe `ManagedInteropType` identities and audited, region-free `NativeStorageSafe` value
+  wrappers cross the respective boundaries; `GCHandle` remains the explicit rooted token for native
+  storage.
+- **Atomics** → `System.Threading.Interlocked` + explicit memory fences. The .NET 10 public path uses
+  native subword exchange/compare-exchange and one generated operation/type matrix covers every
+  integer RMW width, including signed and unsigned 16-bit operations. Older Unity compatibility
+  fallbacks are isolated from the public runtime path. *(v0.1.4, v0.2.0)*
+- **Target contract:** direct PE currently supports only a 64-bit, little-endian Rust data layout.
+  This matches the public Linux x64, macOS Apple Silicon, and Windows x64 SDK hosts and the AnyCPU
+  native-width CIL process model. Unsupported pointer widths or endianness fail before lowering; the
+  backend does not claim that CLR field layout can emulate a big-endian or forced-32-bit process.
 - **Threads** → emulate the pthreads POSIX API *inside* .NET, keeping changes in the backend rather
   than patching Rust `std`. `std` itself is a POSIX "surrogate" built via P/Invoke (no .NET-native
   `std` target yet — see `target.md` for the upstreaming discussion). *(v0.2.0, v0.1.3)*
@@ -152,9 +219,10 @@ through the direct PE emitter. Things that live here rather than in the compiler
 
 ### Terminology cheat-sheet (appears in the code)
 `CILNode` / `CILRoot` (pure node vs side-effecting root); `Interned`/`BiMap` (hash-consing);
-`TyCache`; `subst` + `DefID`, `Gn` (generics by index); `FnSig` vs `FnAbi`; `_tag`/`v_<Variant>`/`m_<n>`
-(enum layout); `DATA_PTR`/`METADATA`/`ENUM_TAG`; `TyKind::Foreign` (thin-ptr unsized); ZST / `Type::Void`;
-`RustModule` + `.cctor`; `leave` / cleanup-block duplication; `MAX_BASIC_BLOCKS` (JIT inline limit);
-serialized artifact ABI settings `NO_UNWIND`, `DOTNET_VERSION`; linker-local output
-and policy settings; diagnostic controls
+`TyCache`; `subst` + `DefID`, `Gn` (generics by index); `FnSig` vs `FnAbi`; `AbiPlan`;
+`LoweredPlace`; `_tag`/`v_<Variant>`/`m_<n>` (enum layout); `DATA_PTR`/`METADATA`/`ENUM_TAG`;
+`TyKind::Foreign` (thin-ptr unsized); ZST / `Type::Void`; `ManagedInteropType` /
+`NativeStorageSafe`; `RuntimeService` / `RuntimeCapability`; `RustModule` + `.cctor`; `leave` /
+cleanup-block duplication; `MAX_BASIC_BLOCKS` (JIT inline limit); serialized artifact ABI settings
+`NO_UNWIND`, `DOTNET_VERSION`; linker-local output and policy settings; diagnostic controls
 `OPTIMIZE_CIL`, `OPT_FUEL`, `ASCII_IDENTS`.

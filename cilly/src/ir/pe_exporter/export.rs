@@ -1303,13 +1303,12 @@ fn ref_assembly_name(name: &str) -> &str {
 /// Local port of `il_exporter::ref_assembly_name_for_type` (same duplication convention as
 /// [`ref_assembly_name`] above). A blanket CoreLib -> `System.Runtime` substitution is wrong for
 /// types that aren't actually forwarded through the `System.Runtime` umbrella facade: confirmed by
-/// scanning the real net8.0 ref-pack DLLs, `SemaphoreSlim`/`ManualResetEventSlim`/
-/// `CountdownEvent`/`Barrier` are genuine `TypeDef`s in `System.Threading.dll`, not forwards from
-/// `System.Runtime.dll` — using `System.Runtime` for them fails with `CS7069` ("claims it is
-/// defined in 'System.Runtime', but it could not be found"), not CS0012. This is a small, explicit,
-/// closed table of the types this backend's mycorrhiza bindings actually expose across a
-/// C#-visible signature position today, not a general BCL type-forwarding resolver — extend it if
-/// another such type needs to cross a signature boundary.
+/// scanning the real reference-pack DLLs, `SemaphoreSlim`/`ManualResetEventSlim`/
+/// `CountdownEvent`/`Barrier` are genuine `TypeDef`s in `System.Threading.dll`, while the Thread
+/// family is defined in `System.Threading.Thread.dll`; none are forwarded from `System.Runtime`.
+/// Using the umbrella facade for them produces a load-time `TypeLoadException` (or C# `CS7069`),
+/// not merely a cosmetic assembly-reference difference. This is an explicit closed table of the
+/// reference-pack types the backend exposes across C#-visible signatures.
 fn ref_assembly_name_for_type<'a>(assembly: &'a str, type_name: &str) -> &'a str {
     if matches!(assembly, "System.Private.CoreLib" | "mscorlib") {
         match type_name {
@@ -1317,6 +1316,16 @@ fn ref_assembly_name_for_type<'a>(assembly: &'a str, type_name: &str) -> &'a str
             | "System.Threading.ManualResetEventSlim"
             | "System.Threading.CountdownEvent"
             | "System.Threading.Barrier" => return "System.Threading",
+            "System.Threading.Thread"
+            | "System.Threading.ThreadAbortException"
+            | "System.Threading.ThreadExceptionEventArgs"
+            | "System.Threading.ThreadExceptionEventHandler"
+            | "System.Threading.ThreadInterruptedException"
+            | "System.Threading.ThreadPriority"
+            | "System.Threading.ThreadStart"
+            | "System.Threading.ThreadStartException"
+            | "System.Threading.ThreadState"
+            | "System.Threading.ThreadStateException" => return "System.Threading.Thread",
             // See il_exporter::ref_assembly_name_for_type's twin entry: Task/Task<T> are real
             // TypeDefs in System.Threading.Tasks.dll, not forwarded through System.Runtime.
             "System.Threading.Tasks.Task" => return "System.Threading.Tasks",
@@ -1403,6 +1412,36 @@ mod tests {
     use crate::ir::{Access, BasicBlock, CILNode, CILRoot, Const, MethodImpl, Type};
     use std::io::Write as _;
     use std::process::Command;
+
+    #[test]
+    fn signature_reference_assembly_uses_the_defining_thread_facade() {
+        for type_name in [
+            "System.Threading.Thread",
+            "System.Threading.ThreadAbortException",
+            "System.Threading.ThreadExceptionEventArgs",
+            "System.Threading.ThreadExceptionEventHandler",
+            "System.Threading.ThreadInterruptedException",
+            "System.Threading.ThreadPriority",
+            "System.Threading.ThreadStart",
+            "System.Threading.ThreadStartException",
+            "System.Threading.ThreadState",
+            "System.Threading.ThreadStateException",
+        ] {
+            assert_eq!(
+                ref_assembly_name_for_type("System.Private.CoreLib", type_name),
+                "System.Threading.Thread",
+                "{type_name} must resolve through its real reference assembly"
+            );
+        }
+        assert_eq!(
+            ref_assembly_name_for_type("System.Private.CoreLib", "System.String"),
+            "System.Runtime"
+        );
+        assert_eq!(
+            ref_assembly_name_for_type("System.Private.CoreLib", "System.Threading.Tasks.Task"),
+            "System.Threading.Tasks"
+        );
+    }
 
     #[test]
     fn export_pe_smoke_no_entry_point_produces_a_loadable_shape() {

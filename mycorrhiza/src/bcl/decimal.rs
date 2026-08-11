@@ -11,6 +11,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::ops::{Add, Div, Mul, Neg, Sub};
 
+use crate::NativeStorageSafe;
 use crate::intrinsics::RustcCLRInteropManagedStruct;
 use crate::system::{DotNetString, MString};
 
@@ -21,10 +22,13 @@ const DEC: &str = "System.Decimal";
 /// Use this at interop boundaries (including `#[dotnet_dto]` fields) where the CLR property must
 /// have the exact `System.Decimal` type. [`DotNetDecimal`] is the idiomatic Rust wrapper.
 pub type Decimal = RustcCLRInteropManagedStruct<CORELIB, DEC, 16>;
+// SAFETY: `System.Decimal` is four 32-bit integer fields and contains no GC references.
+unsafe impl NativeStorageSafe for Decimal {}
 type Dec = Decimal;
 
 /// A managed `System.Decimal`. Use it like a number: `a + b`, `a * b`, `a < b`, `a == b`, `println!("{a}")`.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct DotNetDecimal {
     h: Dec,
 }

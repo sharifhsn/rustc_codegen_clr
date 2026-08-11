@@ -13,6 +13,12 @@ use rustc_span::Spanned;
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
 
+/// The public .NET 10 ABI has exact byte/sbyte/short/ushort Interlocked overloads. Only the legacy
+/// Unity ABI needs the masked-word helpers emitted by cilly.
+fn use_legacy_subword_fallback() -> bool {
+    !crate::config::native_subword_atomics()
+}
+
 pub fn xchg<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
@@ -31,23 +37,10 @@ pub fn xchg<'tcx>(
     );
     let src_type = ctx.monomorphize(args[1].node.ty(ctx.body(), ctx.tcx()));
     let src_type = ctx.type_from_cache(src_type);
-    let uint8_ref = ctx.nref(Type::Int(Int::U8));
-    let xchng = MethodRef::new(
-        *ctx.main_module(),
-        ctx.alloc_string("atomic_xchng_u8"),
-        ctx.sig([uint8_ref, Type::Int(Int::U8)], Type::Int(Int::U8)),
-        MethodKind::Static,
-        vec![].into(),
-    );
     match src_type {
-        // On .NET 9 (`config::dotnet9()`), all sub-word ints fall through to the general
+        // On public .NET 10, all sub-word ints fall through to the general
         // `Interlocked.Exchange(ref T, T)` arm below (native byte/sbyte/short/ushort overloads,
-        // no masked-word emulation). U8 otherwise uses the dedicated `atomic_xchng_u8` builtin.
-        Type::Int(Int::U8) if !crate::config::native_subword_atomics() => {
-            let xchng = ctx.alloc_methodref(xchng);
-            let call = ctx.call(xchng, &[dst, new], IsPure::NOT);
-            return place_set(destination, call, ctx);
-        }
+        // no masked-word emulation).
         Type::Ptr(_) => {
             let usize_ref = ctx.nref(Type::Int(Int::USize));
             let call_site = MethodRef::new(
@@ -65,12 +58,11 @@ pub fn xchg<'tcx>(
             let call = ctx.cast_ptr_to(call, src_type);
             return place_set(destination, call, ctx);
         }
-        Type::Int(int @ (Int::I8 | Int::U16 | Int::I16))
-            if !crate::config::native_subword_atomics() =>
+        Type::Int(int @ (Int::U8 | Int::I8 | Int::U16 | Int::I16))
+            if use_legacy_subword_fallback() =>
         {
             // Sub-word exchange via a masked 32-bit CAS loop (see `emulate_subword_xchng`).
-            // U8 keeps its existing `atomic_xchng_u8` builtin (handled above).
-            // (On .NET 9 this arm is skipped → native `Interlocked.Exchange` below.)
+            // (On .NET 10 this arm is skipped -> native `Interlocked.Exchange` below.)
             let width = int.size().expect("sub-word int has a known size");
             let src_ref = ctx.nref(src_type);
             let call = ctx.call_static(
@@ -81,28 +73,29 @@ pub fn xchg<'tcx>(
             );
             return place_set(destination, call, ctx);
         }
-        // `bool` is a 1-byte value; on .NET 8 it can reuse the dedicated `atomic_xchng_u8`
-        // builtin (the U8 arm above). The checker does NOT treat `Bool` as assignable to `U8`,
-        // so bridge the byref/value/result explicitly across the Bool<->U8 boundary.
+        // `bool` is a 1-byte value. The checker does NOT treat `Bool` as assignable to `U8`, so
+        // bridge the byref/value/result explicitly across the Bool<->U8 boundary while using the
+        // same genuinely atomic masked-CAS helper as integer U8.
         // REACHABLE from 100% safe/stable Rust: `AtomicBool::swap`/`AtomicU8::swap` both lower to
         // `core::sync::atomic::atomic_swap` -> `intrinsics::atomic_xchg` (see
-        // library/core/src/sync/atomic.rs). NOTE: `atomic_xchng_u8` (the U8 arm above, reused
-        // here for Bool) is a plain volatile-ld/volatile-st with no CAS — it is NOT atomic against
-        // a racing writer of the same byte on .NET 8 (lost-update race). This is a known, disclosed
-        // residual; see docs/MEMORY_MODEL.md §7/§8. Do not reintroduce an "unreachable" claim here.
-        Type::Bool if !crate::config::native_subword_atomics() => {
-            let xchng = ctx.alloc_methodref(xchng);
+        // library/core/src/sync/atomic.rs).
+        Type::Bool if use_legacy_subword_fallback() => {
             let u8_ref = ctx.nref(Type::Int(Int::U8));
             let dst = ctx.cast_ptr_to(dst, u8_ref);
             let new = ctx.transmute_on_stack(Type::Bool, Type::Int(Int::U8), new);
-            let call = ctx.call(xchng, &[dst, new], IsPure::NOT);
+            let call = ctx.call_static(
+                "atomic_xchng8_correct",
+                [u8_ref, Type::Int(Int::U8)],
+                Type::Int(Int::U8),
+                &[dst, new],
+            );
             // `place_set` of a Bool destination from a U8 result: re-narrow to bool (0/1).
             let call = ctx.transmute_on_stack(Type::Int(Int::U8), Type::Bool, call);
             return place_set(destination, call, ctx);
         }
-        Type::Bool | Type::PlatformChar if crate::config::native_subword_atomics() => {
+        Type::Bool | Type::PlatformChar if !use_legacy_subword_fallback() => {
             // Interlocked exposes byte/ushort overloads, not Bool/Char overloads. Preserve the
-            // exact bits while selecting the native sub-word overload available on .NET 9+.
+            // exact bits while selecting the native sub-word overload available on .NET 10.
             let backing = match src_type {
                 Type::Bool => Type::Int(Int::U8),
                 Type::PlatformChar => Type::Int(Int::U16),
@@ -124,14 +117,14 @@ pub fn xchg<'tcx>(
             return place_set(destination, call, ctx);
         }
         // `PlatformChar` is a 2-byte interop char with no native sub-word `Interlocked.Exchange`
-        // overload before .NET 9 and no width-correct emulation wired for it; routing it through
-        // the 1-byte `atomic_xchng_u8` builtin would truncate it (a miscompile), so refuse loudly.
+        // overload in the legacy Unity ABI and no width-correct emulation wired for it; routing it through
+        // the 1-byte fallback would truncate it (a miscompile), so refuse loudly.
         // Unreachable from safe-stable Rust (there is no `AtomicChar`; the only producer is the
         // interop `dotnet::char` type) — kept as a documented wall per the I3 invariant.
         Type::Bool | Type::PlatformChar => rustc_middle::span_bug!(
             ctx.span(),
             "atomic exchange (`atomic_xchg`) of `{src_type:?}` is unsupported on this .NET target: \
-             there is no native sub-word `Interlocked.Exchange` overload before .NET 9 and no \
+             there is no native sub-word `Interlocked.Exchange` overload in the legacy Unity ABI and no \
              width-correct emulation is wired for this type. (Not produced by any stable atomic API.)"
         ),
         _ => (),
@@ -193,18 +186,18 @@ pub fn cxchg<'tcx>(
             let call = ctx.call(call_site, &[dst, value, comparand], IsPure::NOT);
             ctx.cast_ptr_to(call, src_type)
         }
-        // .NET 9 has a native sub-word `Interlocked.CompareExchange(ref T, T, T)`; on that runtime
+        // .NET 10 has a native sub-word `Interlocked.CompareExchange(ref T, T, T)`; on that runtime
         // set, the sub-word ints fall through to the general arm below, which emits exactly that
         // (no masking, no pointer arithmetic on the managed byref → none of the emulation's
         // page-boundary hazard).
         //
-        // On .NET 8 (the default) there is no such overload, so 8/16-bit CAS is emulated with a
+        // On the legacy Unity ABI there is no such overload, so 8/16-bit CAS is emulated with a
         // masked 32-bit CAS loop. The `atomic_cmpxchng{8,16}_correct` builtins
         // (cilly::ir::builtins::atomics) check the comparand *inside* the loop and never write on a
         // mismatch, returning the real old sub-word — so `cxchng_res_val`'s `old == expected` is exact.
         // LE-only + page-boundary caveats documented on the builtin.
         Type::Int(int @ (Int::U8 | Int::I8 | Int::U16 | Int::I16))
-            if !crate::config::native_subword_atomics() =>
+            if use_legacy_subword_fallback() =>
         {
             let width = int.size().expect("sub-word int has a known size");
             let src_ref = ctx.nref(src_type);
@@ -216,7 +209,7 @@ pub fn cxchg<'tcx>(
             // builtin arg order: (addr, comparand, new)
             ctx.call(call_site, &[dst, comparand, value], IsPure::NOT)
         }
-        Type::Bool | Type::PlatformChar if crate::config::native_subword_atomics() => {
+        Type::Bool | Type::PlatformChar if !use_legacy_subword_fallback() => {
             let backing = match src_type {
                 Type::Bool => Type::Int(Int::U8),
                 Type::PlatformChar => Type::Int(Int::U16),
