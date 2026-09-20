@@ -5,7 +5,7 @@ use crate::place::{place_address, place_get};
 use crate::r#type::GetTypeExt;
 use cilly::Type;
 use cilly::{Interned, ir::CILNode};
-use rustc_middle::mir::interpret::Scalar;
+use rustc_middle::mir::interpret::{Allocation, Scalar};
 use rustc_middle::mir::{ConstValue, Operand};
 pub fn handle_operand<'tcx>(
     operand: &Operand<'tcx>,
@@ -46,12 +46,25 @@ pub fn operand_address<'tcx>(
         }
     }
 }
+
+fn allocation_is_fully_uninitialized(data: &Allocation) -> bool {
+    let mut chunks =
+        data.init_mask()
+            .range_as_init_chunks(rustc_const_eval::interpret::AllocRange {
+                start: rustc_abi::Size::ZERO,
+                size: data.size(),
+            });
+    let Some(only) = chunks.next() else {
+        return false;
+    };
+    chunks.next().is_none() && !only.is_init()
+}
+
 /// Checks if this operand is uninitialzed, and assigements using it can safely be skipped.
 pub fn is_uninit<'tcx>(operand: &Operand<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> bool {
     match operand {
-        Operand::Copy(_) | Operand::Move(_) => false,
         // A runtime-check flag is a concrete compile-time bool: always initialized.
-        Operand::RuntimeChecks(_) => false,
+        Operand::Copy(_) | Operand::Move(_) | Operand::RuntimeChecks(_) => false,
         Operand::Constant(const_val) => {
             let constant = const_val.const_;
             let constant = ctx.monomorphize(constant);
@@ -69,42 +82,15 @@ pub fn is_uninit<'tcx>(operand: &Operand<'tcx>, ctx: &mut MethodCompileCtx<'tcx,
                     true
                 }
                 ConstValue::Slice { alloc_id, meta: _ } => {
-                    // SUS
                     let data = ctx.tcx().global_alloc(alloc_id).unwrap_memory();
-                    let mask = data.inner().init_mask();
-                    let mut chunks =
-                        mask.range_as_init_chunks(rustc_const_eval::interpret::AllocRange {
-                            start: rustc_abi::Size::ZERO,
-                            size: data.0.size(),
-                        });
-                    let Some(only) = chunks.next() else {
-                        return false;
-                    };
-                    // If this is not the only chunk, then the init mask must not be fully uninitialized
-                    if chunks.next().is_some() {
-                        return false;
-                    }
-                    !only.is_init()
+                    allocation_is_fully_uninitialized(data.inner())
                 }
                 ConstValue::Indirect { alloc_id, .. } => {
                     let data = ctx.tcx().global_alloc(alloc_id);
                     let rustc_middle::mir::interpret::GlobalAlloc::Memory(data) = data else {
                         return false;
                     };
-                    let mask = data.0.init_mask();
-                    let mut chunks =
-                        mask.range_as_init_chunks(rustc_const_eval::interpret::AllocRange {
-                            start: rustc_abi::Size::ZERO,
-                            size: data.0.size(),
-                        });
-                    let Some(only) = chunks.next() else {
-                        return false;
-                    };
-                    // If this is not the only chunk, then the init mask must not be fully uninitialized
-                    if chunks.next().is_some() {
-                        return false;
-                    }
-                    !only.is_init()
+                    allocation_is_fully_uninitialized(&data.0)
                 }
             }
         }

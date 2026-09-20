@@ -1,12 +1,54 @@
 use std::num::NonZeroU8;
 
 use crate::{
-    Access, BasicBlock, CILNode, CILRoot, ClassRef, Const, MethodDef, MethodDefIdx, MethodImpl,
-    Type,
+    Access, BasicBlock, CILNode, CILRoot, ClassRef, Const, FnSig, IString, Interned, MethodDef,
+    MethodDefIdx, MethodImpl, Type,
     cilnode::ExtendKind,
     cilroot::BranchCond,
     {Assembly, Int, MethodRef, cilnode::MethodKind},
 };
+
+fn runtime_initializers(asm: &mut Assembly) -> (Interned<MethodRef>, Interned<MethodRef>) {
+    asm.user_init();
+    let owner = *asm.main_module();
+    let void_sig = asm.sig([], Type::Void);
+    let tcctor_name = asm.alloc_string(".tcctor");
+    let tcctor = asm.alloc_methodref(MethodRef::new(
+        owner,
+        tcctor_name,
+        void_sig,
+        MethodKind::Static,
+        vec![].into(),
+    ));
+    let static_init_name = asm.alloc_string("static_init");
+    let static_init = asm.alloc_methodref(MethodRef::new(
+        owner,
+        static_init_name,
+        void_sig,
+        MethodKind::Static,
+        vec![].into(),
+    ));
+    (tcctor, static_init)
+}
+
+fn new_entrypoint_method(
+    asm: &mut Assembly,
+    sig: Interned<FnSig>,
+    blocks: Vec<BasicBlock>,
+    locals: Vec<crate::ir::method::LocalDef>,
+    arg_names: Vec<Option<Interned<IString>>>,
+) -> MethodDefIdx {
+    let method = MethodDef::new(
+        Access::Extern,
+        asm.main_module(),
+        asm.alloc_string("entrypoint"),
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody { blocks, locals },
+        arg_names,
+    );
+    asm.new_method(method)
+}
 
 /// Entry wrapper for a `fn main() -> T where T: Termination` (e.g. `-> Result<_, _>` / `-> ExitCode`).
 ///
@@ -26,10 +68,7 @@ pub fn wrapper_lang_start(
     sigpipe: u8,
     asm: &mut Assembly,
 ) -> MethodDefIdx {
-    let main_module = asm.main_module();
-    let entrypoint_name = asm.alloc_string("entrypoint");
-    // Force `user_init`/`static_init` to exist (see `wrapper`).
-    asm.user_init();
+    let (tcctor, static_init) = runtime_initializers(asm);
 
     // lang_start's CIL params are `[fn() -> T, isize, *const *const u8, u8]`; we need the exact argv
     // pointer type to materialize the null `argv`.
@@ -38,23 +77,6 @@ pub fn wrapper_lang_start(
 
     let user_main = asm.alloc_methodref(user_main);
     let lang_start = asm.alloc_methodref(lang_start);
-
-    let tcctor = MethodRef::new(
-        *asm.main_module(),
-        asm.alloc_string(".tcctor"),
-        asm.sig([], Type::Void),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let tcctor = asm.alloc_methodref(tcctor);
-    let static_init = MethodRef::new(
-        *asm.main_module(),
-        asm.alloc_string("static_init"),
-        asm.sig([], Type::Void),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let static_init = asm.alloc_methodref(static_init);
 
     // lang_start(ldftn user_main, 0isize, (argv*)null, sigpipe) -> isize
     let main_ptr = asm.ld_ftn(user_main);
@@ -94,19 +116,7 @@ pub fn wrapper_lang_start(
         0,
         None,
     )];
-    let method = MethodDef::new(
-        Access::Extern,
-        main_module,
-        entrypoint_name,
-        sig,
-        MethodKind::Static,
-        MethodImpl::MethodBody {
-            blocks,
-            locals: vec![],
-        },
-        vec![],
-    );
-    asm.new_method(method)
+    new_entrypoint_method(asm, sig, blocks, vec![], vec![])
 }
 
 /// Entry wrapper for a plain `fn main()` (zero args, `Void` return).
@@ -137,29 +147,9 @@ pub fn wrapper_lang_start(
 /// std's runtime init, so panic messages may show the default `<unnamed>` thread name instead.
 /// This is intentional and strictly better than the alternative (an unhandled-exception crash).
 pub fn wrapper_catch_and_exit(entrypoint: MethodRef, asm: &mut Assembly) -> MethodDefIdx {
-    let main_module = asm.main_module();
-    let entrypoint_name = asm.alloc_string("entrypoint");
-    // Force `user_init`/`static_init` to exist (see `wrapper`).
-    asm.user_init();
+    let (tcctor, static_init) = runtime_initializers(asm);
 
     let entrypoint = asm.alloc_methodref(entrypoint);
-
-    let tcctor = MethodRef::new(
-        *asm.main_module(),
-        asm.alloc_string(".tcctor"),
-        asm.sig([], Type::Void),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let tcctor = asm.alloc_methodref(tcctor);
-    let static_init = MethodRef::new(
-        *asm.main_module(),
-        asm.alloc_string("static_init"),
-        asm.sig([], Type::Void),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let static_init = asm.alloc_methodref(static_init);
 
     let tcctor_call = asm.alloc_root(CILRoot::call(tcctor, []));
     let static_init_call = asm.alloc_root(CILRoot::call(static_init, []));
@@ -225,20 +215,14 @@ pub fn wrapper_catch_and_exit(entrypoint: MethodRef, asm: &mut Assembly) -> Meth
         BasicBlock::new(vec![ret_ok], 2, None),
         BasicBlock::new(vec![ret_caught], 3, None),
     ];
-    let method = MethodDef::new(
-        Access::Extern,
-        main_module,
-        entrypoint_name,
+    let exception_name = asm.alloc_string("exception");
+    new_entrypoint_method(
+        asm,
         sig,
-        MethodKind::Static,
-        MethodImpl::MethodBody {
-            blocks,
-            locals: vec![(Some(asm.alloc_string("exception")), exception)],
-        },
+        blocks,
+        vec![(Some(exception_name), exception)],
         vec![],
-    );
-
-    asm.new_method(method)
+    )
 }
 
 /// Creates a wrapper method around entypoint represented by `Interned<MethodRef>`
@@ -248,12 +232,8 @@ pub fn wrapper(entrypoint: MethodRef, asm: &mut Assembly) -> MethodDefIdx {
     let uint8_ptr_ptr = asm.nptr(uint8_ptr);
 
     let entry_sig = asm[entrypoint.sig()].clone();
-    let main_module = asm.main_module();
-    let entrypoint_name = asm.alloc_string("entrypoint");
     let entrypoint = asm.alloc_methodref(entrypoint);
-    // TODO: check if user_init is used, and only call that method in wrapper if so.
-    // This is just a hack that forces user_init to be always present, even when unneded.
-    asm.user_init();
+    let (tcctor, static_init) = runtime_initializers(asm);
     if entry_sig.inputs() == [Type::Int(Int::ISize), uint8_ptr_ptr]
         && entry_sig.output() == &Type::Int(Int::ISize)
     {
@@ -265,23 +245,6 @@ pub fn wrapper(entrypoint: MethodRef, asm: &mut Assembly) -> MethodDefIdx {
             }],
             Type::Void,
         );
-        let tcctor = MethodRef::new(
-            *asm.main_module(),
-            asm.alloc_string(".tcctor"),
-            asm.sig([], Type::Void),
-            MethodKind::Static,
-            vec![].into(),
-        );
-        let tcctor = asm.alloc_methodref(tcctor);
-        let static_init = MethodRef::new(
-            *asm.main_module(),
-            asm.alloc_string("static_init"),
-            asm.sig([], Type::Void),
-            MethodKind::Static,
-            vec![].into(),
-        );
-
-        let static_init = asm.alloc_methodref(static_init);
         let argv = asm.alloc_node(Const::ISize(0_i64));
         let argv = asm.alloc_node(CILNode::PtrCast(
             argv,
@@ -301,39 +264,10 @@ pub fn wrapper(entrypoint: MethodRef, asm: &mut Assembly) -> MethodDefIdx {
             2,
             None,
         )];
-        let mimpl = MethodImpl::MethodBody {
-            blocks,
-            locals: vec![],
-        };
-        let method = MethodDef::new(
-            Access::Extern,
-            main_module,
-            entrypoint_name,
-            sig,
-            MethodKind::Static,
-            mimpl,
-            vec![Some(asm.alloc_string("args"))],
-        );
-
-        asm.new_method(method)
+        let args_name = asm.alloc_string("args");
+        new_entrypoint_method(asm, sig, blocks, vec![], vec![Some(args_name)])
     } else if entry_sig.inputs().is_empty() && entry_sig.output() == &Type::Void {
         let sig = asm.sig([], Type::Void);
-        let tcctor = MethodRef::new(
-            *asm.main_module(),
-            asm.alloc_string(".tcctor"),
-            asm.sig([], Type::Void),
-            MethodKind::Static,
-            vec![].into(),
-        );
-        let tcctor = asm.alloc_methodref(tcctor);
-        let static_init = MethodRef::new(
-            *asm.main_module(),
-            asm.alloc_string("static_init"),
-            asm.sig([], Type::Void),
-            MethodKind::Static,
-            vec![].into(),
-        );
-        let static_init = asm.alloc_methodref(static_init);
         let blocks = vec![BasicBlock::new(
             vec![
                 asm.alloc_root(CILRoot::call(tcctor, [])),
@@ -345,20 +279,7 @@ pub fn wrapper(entrypoint: MethodRef, asm: &mut Assembly) -> MethodDefIdx {
             0,
             None,
         )];
-        let method = MethodDef::new(
-            Access::Extern,
-            main_module,
-            entrypoint_name,
-            sig,
-            MethodKind::Static,
-            crate::MethodImpl::MethodBody {
-                blocks,
-                locals: vec![],
-            },
-            vec![],
-        );
-
-        asm.new_method(method)
+        new_entrypoint_method(asm, sig, blocks, vec![], vec![])
     } else {
         panic!("Unsuported entrypoint wrapper signature! entrypoint:{entrypoint:?}");
     }

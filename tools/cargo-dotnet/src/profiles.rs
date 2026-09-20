@@ -91,15 +91,6 @@ const PROFILES: &[CompatibilityProfile] = &[
         evidence: "scaffold contract exists; Windows build and runtime fixture remain",
     },
     CompatibilityProfile {
-        name: UNITY,
-        support: Support::Supported,
-        host: "Unity 6000.3.19f1 on macOS Apple Silicon: Editor plus Mono and IL2CPP players",
-        managed_contract: "netstandard2.1-compatible API surface; not net10.0",
-        native_assets: "macOS arm64 Unity plug-in layout",
-        host_rids: &["osx-arm64"],
-        evidence: "clean EditMode calls and launched Mono/IL2CPP players pass for managed Rust and native P/Invoke",
-    },
-    CompatibilityProfile {
         name: MAUI_ANDROID,
         support: Support::Planned,
         host: ".NET MAUI Android (Mono first; CoreCLR separately experimental)",
@@ -133,11 +124,29 @@ const PROFILES: &[CompatibilityProfile] = &[
     },
 ];
 
+// Keep the legacy record available to artifact/doctor validation without exposing it through the
+// public `cargo dotnet profiles` listing. Unity is archived research, not a compatibility profile.
+const ARCHIVED_UNITY_PROFILE: CompatibilityProfile = CompatibilityProfile {
+    name: UNITY,
+    support: Support::Unsupported,
+    host: "Unity 6000.3.19f1 on macOS Apple Silicon: Editor plus Mono and IL2CPP players",
+    managed_contract: "netstandard2.1-compatible API surface; not net10.0",
+    native_assets: "macOS arm64 Unity plug-in layout",
+    host_rids: &["osx-arm64"],
+    evidence: "archived internal fixture; no public release or acceptance gate",
+};
+
 pub(crate) fn is_known(name: &str) -> bool {
-    PROFILES.iter().any(|profile| profile.name == name)
+    name == UNITY || PROFILES.iter().any(|profile| profile.name == name)
 }
 
 pub(crate) fn package_contract(name: &str) -> Option<(&'static str, &'static [&'static str])> {
+    if name == UNITY {
+        return Some((
+            ARCHIVED_UNITY_PROFILE.support.label(),
+            ARCHIVED_UNITY_PROFILE.host_rids,
+        ));
+    }
     PROFILES
         .iter()
         .find(|profile| profile.name == name)
@@ -193,6 +202,6 @@ mod tests {
             .filter(|profile| matches!(profile.support, Support::Supported))
             .map(|profile| profile.name)
             .collect();
-        assert_eq!(supported, ["net10-coreclr", "unity-netstandard2.1"]);
+        assert_eq!(supported, ["net10-coreclr"]);
     }
 }

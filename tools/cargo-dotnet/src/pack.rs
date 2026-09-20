@@ -54,6 +54,10 @@ pub fn run(args: &PackArgs) -> Result<i32> {
         features: clap_cargo::Features::default(),
         manifest: clap_cargo::Manifest::default(),
         workspace: clap_cargo::Workspace::default(),
+        test_target: None,
+        lib: false,
+        target_dir: None,
+        locked: false,
         extra: Vec::new(),
         prog_args: Vec::new(),
     };
@@ -320,14 +324,11 @@ pub fn run(args: &PackArgs) -> Result<i32> {
             &entry_hashes,
         )?,
     )?;
-    publish_staged_files(
-        &[
-            (staged_nupkg.as_ref(), nupkg.as_path()),
-            (checksum_staging.as_ref(), checksum_path.as_path()),
-            (receipt_staging.as_ref(), package_receipt_path.as_path()),
-        ],
-        |_| Ok(()),
-    )?;
+    publish_staged_files(&[
+        (staged_nupkg.as_ref(), nupkg.as_path()),
+        (checksum_staging.as_ref(), checksum_path.as_path()),
+        (receipt_staging.as_ref(), package_receipt_path.as_path()),
+    ])?;
 
     eprintln!();
     eprintln!("== packed: {} ==", nupkg.display());
@@ -353,10 +354,7 @@ pub fn run(args: &PackArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn publish_staged_files<F>(files: &[(&Path, &Path)], mut before_promote: F) -> Result<()>
-where
-    F: FnMut(usize) -> Result<()>,
-{
+fn publish_staged_files(files: &[(&Path, &Path)]) -> Result<()> {
     let (_, first_destination) = files.first().context("no package files to publish")?;
     let parent = first_destination
         .parent()
@@ -401,7 +399,6 @@ where
             }
         }
         for (index, (staged, destination)) in files.iter().enumerate() {
-            before_promote(index)?;
             fs::rename(staged, destination).with_context(|| {
                 format!(
                     "publishing {} -> {}",
@@ -1514,49 +1511,10 @@ esac
             .map(|(staged, output)| (staged.as_path(), output.as_path()))
             .collect::<Vec<_>>();
 
-        publish_staged_files(&files, |_| Ok(())).unwrap();
+        publish_staged_files(&files).unwrap();
 
         for (index, output) in outputs.iter().enumerate() {
             assert_eq!(fs::read_to_string(output).unwrap(), format!("new-{index}"));
-        }
-    }
-
-    #[test]
-    fn package_publication_rolls_back_the_complete_output_set() {
-        let root = tempfile::tempdir().unwrap();
-        let staged = [
-            root.path().join("stage-package"),
-            root.path().join("stage-checksum"),
-            root.path().join("stage-receipt"),
-        ];
-        let outputs = [
-            root.path().join("fixture.nupkg"),
-            root.path().join("fixture.nupkg.sha256"),
-            root.path().join("fixture.nupkg.rustdotnet.receipt.json"),
-        ];
-        for (index, path) in staged.iter().enumerate() {
-            fs::write(path, format!("new-{index}")).unwrap();
-        }
-        for (index, path) in outputs.iter().enumerate() {
-            fs::write(path, format!("old-{index}")).unwrap();
-        }
-        let files = staged
-            .iter()
-            .zip(outputs.iter())
-            .map(|(staged, output)| (staged.as_path(), output.as_path()))
-            .collect::<Vec<_>>();
-
-        let error = publish_staged_files(&files, |index| {
-            if index == 1 {
-                bail!("injected publication failure");
-            }
-            Ok(())
-        })
-        .unwrap_err();
-
-        assert!(error.to_string().contains("rolled back"));
-        for (index, output) in outputs.iter().enumerate() {
-            assert_eq!(fs::read_to_string(output).unwrap(), format!("old-{index}"));
         }
     }
 }

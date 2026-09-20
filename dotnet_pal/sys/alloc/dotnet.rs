@@ -21,7 +21,7 @@
 //! mirroring the canonical minimal non-unix PALs (see `sys/alloc/zkvm.rs`).
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use crate::alloc::{GlobalAlloc, Layout, System};
+use crate::alloc::Layout;
 use crate::ptr;
 
 // Allocation hooks -> System.Runtime.InteropServices.NativeMemory.
@@ -37,40 +37,36 @@ unsafe extern "C" {
     fn rcl_dotnet_free(ptr: *mut u8, size: usize, align: usize);
 }
 
-#[stable(feature = "alloc_system_type", since = "1.28.0")]
-unsafe impl GlobalAlloc for System {
-    #[inline]
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: caller upholds the `GlobalAlloc::alloc` preconditions (non-zero
-        // layout); `rcl_dotnet_alloc` forwards directly to `NativeMemory.AlignedAlloc`.
-        unsafe { rcl_dotnet_alloc(layout.size(), layout.align()) }
-    }
+#[inline]
+pub unsafe fn alloc(layout: Layout) -> *mut u8 {
+    // SAFETY: callers uphold the allocator preconditions; the hook forwards directly to
+    // `NativeMemory.AlignedAlloc` and returns a pointer with the requested alignment.
+    unsafe { rcl_dotnet_alloc(layout.size(), layout.align()) }
+}
 
-    #[inline]
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size();
-        // SAFETY: same preconditions as `alloc`.
-        let ptr = unsafe { rcl_dotnet_alloc(size, layout.align()) };
-        if !ptr.is_null() {
-            // SAFETY: `ptr` points to `size` freshly allocated, writable bytes.
-            unsafe { ptr::write_bytes(ptr, 0, size) };
-        }
-        ptr
+#[inline]
+pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
+    let size = layout.size();
+    // SAFETY: same preconditions as `alloc`.
+    let ptr = unsafe { alloc(layout) };
+    if !ptr.is_null() {
+        // SAFETY: `ptr` points to `size` freshly allocated, writable bytes.
+        unsafe { ptr::write_bytes(ptr, 0, size) };
     }
+    ptr
+}
 
-    #[inline]
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: caller upholds the `GlobalAlloc::dealloc` preconditions; direct
-        // `NativeMemory` only needs the pointer, while the optional pool uses the
-        // original layout to select the free-list class.
-        unsafe { rcl_dotnet_free(ptr, layout.size(), layout.align()) }
-    }
+#[inline]
+pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
+    // SAFETY: caller upholds the deallocation preconditions; direct `NativeMemory` only needs
+    // the pointer, while the optional pool uses the original size+alignment for its free list.
+    unsafe { rcl_dotnet_free(ptr, layout.size(), layout.align()) }
+}
 
-    #[inline]
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // `NativeMemory` has no aligned-realloc, so use the shared alloc+copy+free
-        // fallback that preserves the original alignment.
-        // SAFETY: caller upholds the `GlobalAlloc::realloc` preconditions.
-        unsafe { super::realloc_fallback(self, ptr, layout, new_size) }
-    }
+#[inline]
+pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    // `NativeMemory` has no aligned-realloc, so use the shared alloc+copy+free fallback that
+    // preserves the original alignment.
+    // SAFETY: caller upholds the allocator reallocation preconditions.
+    unsafe { super::realloc_fallback(ptr, layout, new_size) }
 }

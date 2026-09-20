@@ -1,12 +1,71 @@
 use crate::fn_ctx::MethodCompileCtx;
 use crate::r#type::{get_type, utilis::is_fat_ptr};
 use cilly::{
-    Assembly, BinOp, ClassRef, Float, Int, Interned, MethodRef, Type,
+    Assembly, BinOp, ClassRef, Const, Float, Int, Interned, MethodRef, Type,
     cilnode::{IsPure, MethodKind},
 };
 use rustc_middle::ty::{FloatTy, IntTy, Ty, TyKind, UintTy};
 
 type Node = Interned<cilly::ir::CILNode>;
+
+/// Compares f32/f64 values through their raw IEEE fields instead of CIL `ceq`. The CLR is allowed
+/// to quiet a signaling NaN while evaluating a floating-point comparison, while Rust requires
+/// `to_bits`/`from_bits` to preserve the payload and requires every comparison with a NaN to be
+/// false. Bitwise equality plus an explicit signed-zero case gives Rust's equality semantics for
+/// all operands without touching their floating representation.
+fn float_eq<'tcx>(
+    float: FloatTy,
+    operand_a: Node,
+    operand_b: Node,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Node {
+    let (float, int, exponent_mask, mantissa_mask, value_mask) = match float {
+        FloatTy::F32 => (
+            Float::F32,
+            Int::U32,
+            Const::U32(0x7f80_0000),
+            Const::U32(0x007f_ffff),
+            Const::U32(0x7fff_ffff),
+        ),
+        FloatTy::F64 => (
+            Float::F64,
+            Int::U64,
+            Const::U64(0x7ff0_0000_0000_0000),
+            Const::U64(0x000f_ffff_ffff_ffff),
+            Const::U64(0x7fff_ffff_ffff_ffff),
+        ),
+        _ => unreachable!("float_eq only handles f32 and f64"),
+    };
+    let bits_a = ctx.transmute_on_stack(Type::Float(float), Type::Int(int), operand_a);
+    let bits_b = ctx.transmute_on_stack(Type::Float(float), Type::Int(int), operand_b);
+    let exponent_mask = ctx.alloc_node(exponent_mask);
+    let mantissa_mask = ctx.alloc_node(mantissa_mask);
+    let zero = ctx.alloc_node(int.zero());
+    let exponent_a = ctx.biop(bits_a, exponent_mask, BinOp::And);
+    let exponent_b = ctx.biop(bits_b, exponent_mask, BinOp::And);
+    let exponent_a_all_ones = ctx.biop(exponent_a, exponent_mask, BinOp::Eq);
+    let exponent_b_all_ones = ctx.biop(exponent_b, exponent_mask, BinOp::Eq);
+    let mantissa_a = ctx.biop(bits_a, mantissa_mask, BinOp::And);
+    let mantissa_b = ctx.biop(bits_b, mantissa_mask, BinOp::And);
+    let mantissa_a_nonzero = ctx.biop(mantissa_a, zero, BinOp::GtUn);
+    let mantissa_b_nonzero = ctx.biop(mantissa_b, zero, BinOp::GtUn);
+    let nan_a = ctx.biop(exponent_a_all_ones, mantissa_a_nonzero, BinOp::And);
+    let nan_b = ctx.biop(exponent_b_all_ones, mantissa_b_nonzero, BinOp::And);
+    let false_node = ctx.alloc_node(false);
+    let not_nan_a = ctx.biop(nan_a, false_node, BinOp::Eq);
+    let not_nan_b = ctx.biop(nan_b, false_node, BinOp::Eq);
+    let valid = ctx.biop(not_nan_a, not_nan_b, BinOp::And);
+
+    let bits_equal = ctx.biop(bits_a, bits_b, BinOp::Eq);
+    let value_mask = ctx.alloc_node(value_mask);
+    let a_value = ctx.biop(bits_a, value_mask, BinOp::And);
+    let b_value = ctx.biop(bits_b, value_mask, BinOp::And);
+    let a_is_zero = ctx.biop(a_value, zero, BinOp::Eq);
+    let b_is_zero = ctx.biop(b_value, zero, BinOp::Eq);
+    let both_zero = ctx.biop(a_is_zero, b_is_zero, BinOp::And);
+    let equal_or_both_zero = ctx.biop(bits_equal, both_zero, BinOp::Or);
+    ctx.biop(valid, equal_or_both_zero, BinOp::And)
+}
 
 pub fn ne_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
@@ -44,8 +103,9 @@ pub fn eq_unchecked<'tcx>(
             ),
             _ => ctx.biop(operand_a, operand_b, BinOp::Eq),
         },
-        TyKind::Bool | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
-            ctx.biop(operand_a, operand_b, BinOp::Eq)
+        TyKind::Bool | TyKind::Char => ctx.biop(operand_a, operand_b, BinOp::Eq),
+        TyKind::Float(float @ (FloatTy::F32 | FloatTy::F64)) => {
+            float_eq(*float, operand_a, operand_b, ctx)
         }
         TyKind::RawPtr(_, _) | TyKind::FnPtr(_, _) => {
             if is_fat_ptr(ty_a, ctx.tcx(), ctx.instance()) {

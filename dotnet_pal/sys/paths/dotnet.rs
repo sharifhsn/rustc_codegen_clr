@@ -8,7 +8,8 @@
 //!
 //! REAL (BCL-backed) via 4 hooks the cilly linker maps to managed equivalents:
 //!   * `getcwd`      -> `System.IO.Directory.GetCurrentDirectory()`
-//!   * `current_exe` -> `System.Environment.ProcessPath`
+//!   * `current_exe` -> `RUST_DOTNET_APPHOST` (set by the native launcher),
+//!     falling back to `System.Environment.ProcessPath`
 //!   * `chdir`       -> `System.IO.Directory.SetCurrentDirectory(path)`
 //!   * `temp_dir`    -> `System.IO.Path.GetTempPath()`
 //!

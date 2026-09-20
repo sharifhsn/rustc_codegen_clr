@@ -4,7 +4,7 @@ use crate::NativeStorageSafe;
 use crate::bcl::datetime::DateTime;
 use crate::bcl::timespan::DotNetTimeSpan;
 use crate::intrinsics::RustcCLRInteropManagedStruct;
-use crate::system::{DotNetString, MString};
+use crate::system::MString;
 
 const CORELIB: &str = "System.Private.CoreLib";
 const DATETIME_OFFSET: &str = "System.DateTimeOffset";
@@ -78,34 +78,5 @@ impl DateTimeOffset {
     }
 }
 
-impl core::fmt::Display for DateTimeOffset {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let value = DotNetString::from_handle((*self).vt_instance0::<"ToString", MString>());
-        core::fmt::Display::fmt(&value, f)
-    }
-}
-
-impl core::fmt::Debug for DateTimeOffset {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Display::fmt(self, f)
-    }
-}
-
-impl PartialEq for DateTimeOffset {
-    fn eq(&self, other: &Self) -> bool {
-        self.compare_to(*other) == 0
-    }
-}
-impl Eq for DateTimeOffset {}
-
-impl PartialOrd for DateTimeOffset {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DateTimeOffset {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.compare_to(*other).cmp(&0)
-    }
-}
+impl_managed_display_value!(DateTimeOffset);
+impl_managed_ordering!(DateTimeOffset, compare_to);

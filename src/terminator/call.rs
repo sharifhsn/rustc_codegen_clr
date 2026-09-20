@@ -16,7 +16,8 @@ use crate::{
 };
 use cilly::tpe::GenericKind;
 use cilly::{
-    BinOp, CILNode, CILRoot, ClassRef, Const, FieldDesc, IString, Int, Interned, IntoAsmIndex,
+    Access, BasicBlock, BinOp, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, FnSig,
+    IString, Int, Interned, IntoAsmIndex, MethodDef, MethodImpl,
     cilnode::{ExtendKind, IsPure, MethodKind, PtrCastRes},
 };
 use cilly::{MethodRef, Type};
@@ -27,9 +28,163 @@ use rustc_middle::{
 };
 use rustc_span::Spanned;
 
-type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
-const EMPTY_ARGS: &[Node] = &[];
+
+fn emit_call<'tcx>(
+    mref: Interned<MethodRef>,
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    output: Type,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    let call_args: Vec<_> = args
+        .iter()
+        .map(|arg| handle_operand(&arg.node, ctx))
+        .collect();
+    if output == Type::Void {
+        ctx.call_root(mref, &call_args, IsPure::NOT)
+    } else {
+        let node = ctx.call(mref, &call_args, IsPure::NOT);
+        place_set(destination, node, ctx)
+    }
+}
+
+fn emit_constructor_call<'tcx>(
+    class: Interned<ClassRef>,
+    explicit_inputs: Vec<Type>,
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    let mut inputs = Vec::with_capacity(explicit_inputs.len() + 1);
+    inputs.push(Type::ClassRef(class));
+    inputs.extend(explicit_inputs);
+    let sig = ctx.sig(inputs, Type::Void);
+    let ctor = MethodRef::new(
+        class,
+        ctx.alloc_string(".ctor"),
+        sig,
+        MethodKind::Constructor,
+        vec![].into(),
+    );
+    let ctor = ctx.alloc_methodref(ctor);
+    let call_args: Vec<_> = args
+        .iter()
+        .map(|arg| handle_operand(&arg.node, ctx))
+        .collect();
+    let node = ctx.call(ctor, &call_args, IsPure::NOT);
+    place_set(destination, node, ctx)
+}
+
+/// Emit the shared managed `Invoke` method used by the function-pointer and closure delegate
+/// shims. The callers only differ in which fields they load and which arguments they prepend;
+/// method signature, return handling, and argument metadata are identical.
+fn emit_delegate_invoke<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    shim_def: cilly::ir::class::ClassDefIdx,
+    shim_cref: Interned<ClassRef>,
+    inputs: &[Type],
+    output: Type,
+    call_sig: Interned<FnSig>,
+    fnptr_val: Interned<CILNode>,
+    invoke_call_args: Vec<Interned<CILNode>>,
+) {
+    let invoke_name = ctx.alloc_string("Invoke");
+    let mut invoke_sig_inputs = Vec::with_capacity(inputs.len() + 1);
+    invoke_sig_inputs.push(Type::ClassRef(shim_cref));
+    invoke_sig_inputs.extend(inputs.iter().copied());
+    let invoke_sig = ctx.sig(invoke_sig_inputs, output);
+    let invoke_body = if output == Type::Void {
+        let call = ctx.call_indirect_root(call_sig, fnptr_val, invoke_call_args);
+        let ret = ctx.alloc_root(CILRoot::VoidRet);
+        vec![call, ret]
+    } else {
+        let call = ctx.call_indirect(call_sig, fnptr_val, invoke_call_args);
+        let ret = ctx.alloc_root(CILRoot::Ret(call));
+        vec![ret]
+    };
+    let mut invoke_arg_names = vec![None];
+    invoke_arg_names.extend((0..inputs.len()).map(|_| None));
+    ctx.new_method(MethodDef::new(
+        Access::Public,
+        shim_def,
+        invoke_name,
+        invoke_sig,
+        MethodKind::Instance,
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(invoke_body, 0, None)],
+            locals: vec![],
+        },
+        invoke_arg_names,
+    ));
+}
+
+fn finish_delegate<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    asm: Option<Interned<IString>>,
+    class_name: Interned<IString>,
+    is_valuetype: bool,
+    class_generics: Vec<Type>,
+    shim_cref: Interned<ClassRef>,
+    shim_ctor_inputs: Vec<Type>,
+    shim_ctor_args: Vec<Interned<CILNode>>,
+    inputs: &[Type],
+    output: Type,
+    destination: &Place<'tcx>,
+) -> Root {
+    let mut shim_sig_inputs = Vec::with_capacity(shim_ctor_inputs.len() + 1);
+    shim_sig_inputs.push(Type::ClassRef(shim_cref));
+    shim_sig_inputs.extend(shim_ctor_inputs);
+    let shim_ctor = MethodRef::new(
+        shim_cref,
+        ctx.alloc_string(".ctor"),
+        ctx.sig(shim_sig_inputs, Type::Void),
+        MethodKind::Constructor,
+        vec![].into(),
+    );
+    let shim_ctor = ctx.alloc_methodref(shim_ctor);
+    let shim_obj = ctx.call(shim_ctor, &shim_ctor_args, IsPure::NOT);
+
+    let mut invoke_sig_inputs = Vec::with_capacity(inputs.len() + 1);
+    invoke_sig_inputs.push(Type::ClassRef(shim_cref));
+    invoke_sig_inputs.extend(inputs.iter().copied());
+    let invoke_sig = ctx.sig(invoke_sig_inputs, output);
+    let shim_invoke = MethodRef::new(
+        shim_cref,
+        ctx.alloc_string("Invoke"),
+        invoke_sig,
+        MethodKind::Instance,
+        vec![].into(),
+    );
+    let shim_invoke = ctx.alloc_methodref(shim_invoke);
+    let invoke_ftn = ctx.ld_ftn(shim_invoke);
+    let invoke_ftn = ctx.alloc_node(CILNode::PtrCast(invoke_ftn, Box::new(PtrCastRes::ISize)));
+
+    let delegate_cref = ctx.alloc_class_ref(ClassRef::new(
+        class_name,
+        asm,
+        is_valuetype,
+        class_generics.into(),
+    ));
+    let delegate_ctor_sig = ctx.sig(
+        [
+            Type::ClassRef(delegate_cref),
+            Type::PlatformObject,
+            Type::Int(Int::ISize),
+        ],
+        Type::Void,
+    );
+    let delegate_ctor = MethodRef::new(
+        delegate_cref,
+        ctx.alloc_string(".ctor"),
+        delegate_ctor_sig,
+        MethodKind::Constructor,
+        vec![].into(),
+    );
+    let delegate_ctor = ctx.alloc_methodref(delegate_ctor);
+    let delegate = ctx.call(delegate_ctor, &[shim_obj, invoke_ftn], IsPure::NOT);
+    place_set(destination, delegate, ctx)
+}
 
 fn argc_from_fn_name(function_name: &str, prefix: &str) -> u32 {
     let argc_start = function_name.find(prefix).unwrap() + (prefix.len());
@@ -66,7 +221,54 @@ impl InteropHeader {
         }
     }
 }
-/// Calls a non-virtual managed function(used for interop)
+/// Shared lowering for the two managed-call magic-fn families. Their only semantic difference is
+/// how a non-static reference-type receiver is dispatched (`instance` for `managedN`, `virtual`
+/// for `managed_virtN`); argument decoding and result placement are identical.
+fn emit_managed_call<'tcx>(
+    header: InteropHeader,
+    managed_fn_name: Interned<IString>,
+    argc: u32,
+    is_static: bool,
+    virtual_path: bool,
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    fn_instance: Instance<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Root {
+    let InteropHeader {
+        asm,
+        class_name,
+        is_vt: is_valuetype,
+    } = header;
+    let signature = AbiPlan::from_instance(fn_instance, ctx).signature().clone();
+    let output = *signature.output();
+    let (sig, kind) = if argc == 0 {
+        // Keep the ABI's real return type for zero-argument getters; using Void loses managed
+        // references before they reach the destination.
+        (ctx.sig([], output), MethodKind::Static)
+    } else {
+        let kind = if is_static {
+            MethodKind::Static
+        } else if virtual_path || !is_valuetype {
+            // Reference receivers use callvirt; unboxed value types require a plain instance call.
+            MethodKind::Virtual
+        } else {
+            MethodKind::Instance
+        };
+        (ctx.alloc_sig(signature), kind)
+    };
+    let owner = ctx.alloc_class_ref(ClassRef::new(class_name, asm, is_valuetype, [].into()));
+    let mref = ctx.alloc_methodref(MethodRef::new(
+        owner,
+        managed_fn_name,
+        sig,
+        kind,
+        vec![].into(),
+    ));
+    emit_call(mref, args, destination, output, ctx)
+}
+
+/// Calls a non-virtual managed function (used for interop).
 fn call_managed<'tcx>(
     subst_ref: &[GenericArg<'tcx>],
     function_name: &str,
@@ -76,79 +278,22 @@ fn call_managed<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
     let argc = argc_from_fn_name(function_name, MANAGED_CALL_FN_NAME);
-    //FIXME: figure out the proper argc.
-    //assert!(subst_ref.len() as u32 == argc + 3 || subst_ref.len() as u32 == argc + 4);
     assert!(args.len() == argc as usize);
-    let InteropHeader {
-        asm,
-        class_name,
-        is_vt: is_valuetype,
-    } = InteropHeader::decode(subst_ref, ctx);
+    let header = InteropHeader::decode(subst_ref, ctx);
     let managed_fn_name = garg_to_string(subst_ref[3], ctx.tcx());
-    let tpe = ClassRef::new(class_name, asm, is_valuetype, [].into());
-
-    //eprintln!("tpe:{tpe:?}");
-    let signature = AbiPlan::from_instance(fn_instance, ctx).signature().clone();
-
-    if argc == 0 {
-        // Use the REAL return type, not Void. A zero-arg managed getter (e.g. a static `get_Default`
-        // returning a managed reference) must produce a value of its declared type; hardcoding Void
-        // here made the call node Void, so storing it into the (correctly-typed) destination failed
-        // typecheck (`LocalAssigementWrong got "v"`). (A zero explicit-arg call is always `static0` —
-        // an instance receiver would be an explicit arg and take the branch below — so `Static` is
-        // correct here.)
-        let ret = *signature.output();
-        let call_site = MethodRef::new(
-            ctx.alloc_class_ref(tpe),
-            ctx.alloc_string(managed_fn_name),
-            ctx.sig([], ret),
-            MethodKind::Static,
-            vec![].into(),
-        );
-        let call_site = ctx.alloc_methodref(call_site);
-        if *signature.output() == cilly::Type::Void {
-            ctx.call_root(call_site, EMPTY_ARGS, IsPure::NOT)
-        } else {
-            let call = ctx.call(call_site, EMPTY_ARGS, IsPure::NOT);
-            place_set(destination, call, ctx)
-        }
-    } else {
-        let is_static = garg_to_bool(subst_ref[4], ctx.tcx());
-
-        let mut call_args = Vec::new();
-        for arg in args {
-            call_args.push(handle_operand(&arg.node, ctx));
-        }
-        let call = MethodRef::new(
-            ctx.alloc_class_ref(tpe),
-            ctx.alloc_string(managed_fn_name),
-            ctx.alloc_sig(signature.clone()),
-            if is_static {
-                MethodKind::Static
-            } else if is_valuetype {
-                // Value-type instance methods are non-virtual slots and must use `call instance`
-                // (`callvirt` on an unboxed valuetype receiver is invalid IL).
-                MethodKind::Instance
-            } else {
-                // Reference-type instance calls must be emitted as `callvirt`, not `call instance`:
-                // many BCL "instance" methods reached through this non-virtual `instanceN` helper
-                // are actually virtual/abstract slots (e.g. `MethodBase::GetParameters`, which is
-                // abstract). Binding an abstract/virtual slot with a plain `call instance` is
-                // invalid IL and the JIT rejects the whole method with "Bad IL format". `callvirt`
-                // is the correct, universally-valid dispatch for a reference-type receiver (it works
-                // for non-virtual instance methods too), mirroring the `callvirt_managed` path.
-                MethodKind::Virtual
-            },
-            vec![].into(),
-        );
-        let call = ctx.alloc_methodref(call);
-        if *signature.output() == cilly::Type::Void {
-            ctx.call_root(call, &call_args, IsPure::NOT)
-        } else {
-            let node = ctx.call(call, &call_args, IsPure::NOT);
-            place_set(destination, node, ctx)
-        }
-    }
+    let managed_fn_name = ctx.alloc_string(managed_fn_name);
+    let is_static = argc == 0 || garg_to_bool(subst_ref[4], ctx.tcx());
+    emit_managed_call(
+        header,
+        managed_fn_name,
+        argc,
+        is_static,
+        false,
+        args,
+        destination,
+        fn_instance,
+        ctx,
+    )
 }
 
 /// Lowers `rustc_clr_interop_managed_get_field` to a typed `ldfld` without synthesizing or
@@ -183,7 +328,7 @@ fn managed_get_field<'tcx>(
     let value = ctx.ld_field(object, descriptor);
     place_set(destination, value, ctx)
 }
-/// Calls a virtual managed function(used for interop)
+/// Calls a virtual managed function (used for interop).
 fn callvirt_managed<'tcx>(
     subst_ref: &[GenericArg<'tcx>],
     function_name: &str,
@@ -195,66 +340,22 @@ fn callvirt_managed<'tcx>(
     let argc = argc_from_fn_name(function_name, MANAGED_CALL_VIRT_FN_NAME);
     //assert!(subst_ref.len() as u32 == argc + 3 || subst_ref.len() as u32 == argc + 4);
     assert!(u32::try_from(args.len()).expect("More than 2^32 function arguments.") == argc);
-    let InteropHeader {
-        asm,
-        class_name,
-        is_vt: is_valuetype,
-    } = InteropHeader::decode(subst_ref, ctx);
-
-    let managed_fn_garg = &subst_ref[3];
-    let managed_fn_garg = ctx.monomorphize(*managed_fn_garg);
+    let header = InteropHeader::decode(subst_ref, ctx);
+    let managed_fn_garg = ctx.monomorphize(subst_ref[3]);
     let managed_fn_name = garg_to_string(managed_fn_garg, ctx.tcx());
-
-    let tpe = ClassRef::new(class_name, asm, is_valuetype, [].into());
-    let signature = AbiPlan::from_instance(fn_instance, ctx).signature().clone();
-    if argc == 0 {
-        // Use the REAL return type, not Void (see `call_managed`'s 0-arg branch) — a zero-arg managed
-        // getter returning a managed reference was being typed Void, failing the destination store.
-        let ret = *signature.output();
-        let call = MethodRef::new(
-            ctx.alloc_class_ref(tpe),
-            ctx.alloc_string(managed_fn_name),
-            ctx.sig([], ret),
-            MethodKind::Static,
-            vec![].into(),
-        );
-        let call = ctx.alloc_methodref(call);
-        if *signature.output() == cilly::Type::Void {
-            ctx.call_root(call, EMPTY_ARGS, IsPure::NOT)
-        } else {
-            let node = ctx.call(call, EMPTY_ARGS, IsPure::NOT);
-            place_set(destination, node, ctx)
-        }
-    } else {
-        let is_static = garg_to_bool(subst_ref[4], ctx.tcx());
-
-        let mut call_args = Vec::new();
-        for arg in args {
-            call_args.push(handle_operand(&arg.node, ctx));
-        }
-        let call = MethodRef::new(
-            ctx.alloc_class_ref(tpe),
-            ctx.alloc_string(managed_fn_name),
-            ctx.alloc_sig(signature.clone()),
-            // This is the *virtual* managed-call path (`virtN`). A non-static call must therefore
-            // be emitted as `callvirt`, not `call` — calling a virtual/abstract slot (e.g.
-            // `System.Type::get_FullName`) with a plain `call instance` is invalid IL and the JIT
-            // rejects the whole method with "Bad IL format".
-            if is_static {
-                MethodKind::Static
-            } else {
-                MethodKind::Virtual
-            },
-            vec![].into(),
-        );
-        let call = ctx.alloc_methodref(call);
-        if *signature.output() == cilly::Type::Void {
-            ctx.call_root(call, &call_args, IsPure::NOT)
-        } else {
-            let node = ctx.call(call, &call_args, IsPure::NOT);
-            place_set(destination, node, ctx)
-        }
-    }
+    let managed_fn_name = ctx.alloc_string(managed_fn_name);
+    let is_static = argc == 0 || garg_to_bool(subst_ref[4], ctx.tcx());
+    emit_managed_call(
+        header,
+        managed_fn_name,
+        argc,
+        is_static,
+        true,
+        args,
+        destination,
+        fn_instance,
+        ctx,
+    )
 }
 /// WF-9 generic interop bridge — decompose a tuple-typed generic argument into the lowered .NET
 /// types of its elements. Used to pass a class's generic-argument list (`(i32,)` of `List<i32>`) or
@@ -428,82 +529,16 @@ fn call_generic<'tcx>(
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
-    let InteropHeader {
-        asm,
-        class_name,
-        is_vt: is_valuetype,
-    } = InteropHeader::decode(subst_ref, ctx);
-    let managed_fn_name = garg_to_string(subst_ref[3], ctx.tcx());
-    let managed_fn_name = ctx.alloc_string(managed_fn_name);
-    let kind = garg_to_usize(subst_ref[4], ctx.tcx());
-    // Concrete .NET type arguments of the class instantiation (e.g. the `(i32,)` of `List<i32>`).
-    let class_generics = tuple_garg_to_types(subst_ref[5], ctx);
-    // Definition-shape method signature: `(output, explicit-input0, …)` with `!N`/`!!N` markers.
-    let mut sig_types = tuple_garg_to_types(subst_ref[6], ctx);
-    assert!(
-        !sig_types.is_empty(),
-        "WF-9 generic interop: the signature tuple must carry at least a return type"
-    );
-    let output = sig_types.remove(0);
-    let explicit_inputs = sig_types;
-
-    // Loud-fail on an inconsistent binding (see `check_generic_marker`). Runtime types come from the
-    // magic fn's declared `Ret` (subst[7]) and runtime args (subst[8..], receiver-first for
-    // instance/virtual). The Sig excludes the receiver, so explicit input `j` pairs with runtime arg
-    // `recv_offset + j`.
-    let ret_ty = garg_ty_to_type(subst_ref[7], ctx);
-    check_generic_marker(output, ret_ty, &class_generics, &[], "return", ctx);
-    let recv_offset = if kind == 0 { 0 } else { 1 };
-    for (j, &sig_in) in explicit_inputs.iter().enumerate() {
-        let arg_ty = garg_ty_to_type(subst_ref[8 + recv_offset + j], ctx);
-        check_generic_marker(sig_in, arg_ty, &class_generics, &[], "argument", ctx);
-    }
-
-    let this = ctx.alloc_class_ref(ClassRef::new(
-        class_name,
-        asm,
-        is_valuetype,
-        class_generics.into(),
-    ));
-    // Build the methodref signature in the cilly convention (the receiver, if any, is `inputs[0]`).
-    let mut inputs = Vec::with_capacity(explicit_inputs.len() + 1);
-    let mkind = match kind {
-        0 => MethodKind::Static,
-        1 => {
-            // Instance method reached with `call instance` (a non-virtual slot). A **value-type**
-            // receiver's `this` is a *managed pointer* to the unboxed valuetype (`valuetype Foo&`),
-            // exactly as the non-generic `RustcCLRInteropManagedStruct::vt_instance*` path in
-            // `call_managed` passes `&self` — so the wrapper hands us the address and we type the
-            // receiver slot as a ref. A reference-type receiver is the object reference itself.
-            if is_valuetype {
-                let this_ref = ctx.nref(Type::ClassRef(this));
-                inputs.push(this_ref);
-            } else {
-                inputs.push(Type::ClassRef(this));
-            }
-            MethodKind::Instance
-        }
-        2 => {
-            inputs.push(Type::ClassRef(this));
-            MethodKind::Virtual
-        }
-        _ => panic!("WF-9 generic interop: invalid call KIND {kind}"),
-    };
-    inputs.extend(explicit_inputs);
-    let sig = ctx.sig(inputs, output);
-    let mref = MethodRef::new(this, managed_fn_name, sig, mkind, vec![].into());
-    let mref = ctx.alloc_methodref(mref);
-
-    let mut call_args = Vec::new();
-    for arg in args {
-        call_args.push(handle_operand(&arg.node, ctx));
-    }
-    if output == Type::Void {
-        ctx.call_root(mref, &call_args, IsPure::NOT)
-    } else {
-        let node = ctx.call(mref, &call_args, IsPure::NOT);
-        place_set(destination, node, ctx)
-    }
+    call_generic_inner(
+        subst_ref,
+        args,
+        destination,
+        ctx,
+        "generic interop",
+        6,
+        7,
+        vec![],
+    )
 }
 /// WF-9 — calls a *generic method* (`!!N`), i.e. a method that itself takes type arguments, e.g.
 /// `Activator.CreateInstance<T>()`, `JsonSerializer.Deserialize<T>(s)`, `provider.GetService<T>()`.
@@ -519,6 +554,38 @@ fn call_gmethod<'tcx>(
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
+    // The method's own concrete type arguments (e.g. the `(int32,)` of `CreateInstance<int32>`).
+    let method_generics = tuple_garg_to_types(subst_ref[6], ctx);
+    assert!(
+        !method_generics.is_empty(),
+        "WF-9 generic method: a generic method call must carry at least one method type argument"
+    );
+    call_generic_inner(
+        subst_ref,
+        args,
+        destination,
+        ctx,
+        "generic method",
+        7,
+        8,
+        method_generics,
+    )
+}
+
+/// Shared WF-9 lowering for calls whose target is a generic class, with an optional concrete
+/// method-generic argument list. The two magic-fn layouts differ only in the signature/return
+/// tuple offsets; keeping the validation, receiver dispatch, and `MethodRef` construction here
+/// prevents those layouts from drifting apart.
+fn call_generic_inner<'tcx>(
+    subst_ref: &[GenericArg<'tcx>],
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    family: &str,
+    signature_index: usize,
+    runtime_return_index: usize,
+    method_generics: Vec<Type>,
+) -> Root {
     let InteropHeader {
         asm,
         class_name,
@@ -528,22 +595,14 @@ fn call_gmethod<'tcx>(
     let managed_fn_name = ctx.alloc_string(managed_fn_name);
     let kind = garg_to_usize(subst_ref[4], ctx.tcx());
     let class_generics = tuple_garg_to_types(subst_ref[5], ctx);
-    // The method's own concrete type arguments (e.g. the `(int32,)` of `CreateInstance<int32>`).
-    let method_generics = tuple_garg_to_types(subst_ref[6], ctx);
-    assert!(
-        !method_generics.is_empty(),
-        "WF-9 generic method: a generic method call must carry at least one method type argument"
-    );
-    let mut sig_types = tuple_garg_to_types(subst_ref[7], ctx);
+    let mut sig_types = tuple_garg_to_types(subst_ref[signature_index], ctx);
     assert!(
         !sig_types.is_empty(),
-        "WF-9 generic method: the signature tuple must carry at least a return type"
+        "WF-9 {family}: the signature tuple must carry at least a return type"
     );
     let output = sig_types.remove(0);
-    let explicit_inputs = sig_types;
 
-    // Loud-fail on an inconsistent binding — `!N` against class generics, `!!N` against method generics.
-    let ret_ty = garg_ty_to_type(subst_ref[8], ctx);
+    let ret_ty = garg_ty_to_type(subst_ref[runtime_return_index], ctx);
     check_generic_marker(
         output,
         ret_ty,
@@ -552,9 +611,9 @@ fn call_gmethod<'tcx>(
         "return",
         ctx,
     );
-    let recv_offset = if kind == 0 { 0 } else { 1 };
-    for (j, &sig_in) in explicit_inputs.iter().enumerate() {
-        let arg_ty = garg_ty_to_type(subst_ref[9 + recv_offset + j], ctx);
+    let recv_offset = usize::from(kind != 0);
+    for (j, &sig_in) in sig_types.iter().enumerate() {
+        let arg_ty = garg_ty_to_type(subst_ref[runtime_return_index + 1 + recv_offset + j], ctx);
         check_generic_marker(
             sig_in,
             arg_ty,
@@ -571,41 +630,28 @@ fn call_gmethod<'tcx>(
         is_valuetype,
         class_generics.into(),
     ));
-    let mut inputs = Vec::with_capacity(explicit_inputs.len() + 1);
+    let mut inputs = Vec::with_capacity(sig_types.len() + 1);
     let mkind = match kind {
         0 => MethodKind::Static,
         1 => {
-            if is_valuetype {
-                let this_ref = ctx.nref(Type::ClassRef(this));
-                inputs.push(this_ref);
+            inputs.push(if is_valuetype {
+                ctx.nref(Type::ClassRef(this))
             } else {
-                inputs.push(Type::ClassRef(this));
-            }
+                Type::ClassRef(this)
+            });
             MethodKind::Instance
         }
         2 => {
             inputs.push(Type::ClassRef(this));
             MethodKind::Virtual
         }
-        _ => panic!("WF-9 generic method: invalid call KIND {kind}"),
+        _ => panic!("WF-9 {family}: invalid call KIND {kind}"),
     };
-    inputs.extend(explicit_inputs);
+    inputs.extend(sig_types);
     let sig = ctx.sig(inputs, output);
-    // The KEY difference from `call_generic`: the methodref carries the method's concrete type args, so
-    // the exporter emits `Method<..>` and the CLR binds the right instantiation.
     let mref = MethodRef::new(this, managed_fn_name, sig, mkind, method_generics.into());
     let mref = ctx.alloc_methodref(mref);
-
-    let mut call_args = Vec::new();
-    for arg in args {
-        call_args.push(handle_operand(&arg.node, ctx));
-    }
-    if output == Type::Void {
-        ctx.call_root(mref, &call_args, IsPure::NOT)
-    } else {
-        let node = ctx.call(mref, &call_args, IsPure::NOT);
-        place_set(destination, node, ctx)
-    }
+    emit_call(mref, args, destination, output, ctx)
 }
 /// WF-9 — constructs a managed object of a *generic* .NET instantiation (e.g. `new List<i32>()`).
 fn ctor_generic<'tcx>(
@@ -644,23 +690,7 @@ fn ctor_generic<'tcx>(
         is_valuetype,
         class_generics.into(),
     ));
-    let mut inputs = vec![Type::ClassRef(this)];
-    inputs.extend(explicit_inputs);
-    let sig = ctx.sig(inputs, Type::Void);
-    let ctor = MethodRef::new(
-        this,
-        ctx.alloc_string(".ctor"),
-        sig,
-        MethodKind::Constructor,
-        vec![].into(),
-    );
-    let ctor = ctx.alloc_methodref(ctor);
-    let mut call_args = Vec::new();
-    for arg in args {
-        call_args.push(handle_operand(&arg.node, ctx));
-    }
-    let node = ctx.call(ctor, &call_args, IsPure::NOT);
-    place_set(destination, node, ctx)
+    emit_constructor_call(this, explicit_inputs, args, destination, ctx)
 }
 /// Delegates & callbacks — wrap a Rust `extern` fn pointer into a managed .NET delegate instance
 /// (`Action<..>` / `Func<.., R>`), so a Rust callback can be passed to any .NET API that takes a
@@ -693,8 +723,6 @@ fn delegate_from_fnptr<'tcx>(
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
-    use cilly::cilnode::PtrCastRes;
-    use cilly::{Access, BasicBlock, ClassDef, MethodDef, MethodImpl};
     assert_eq!(
         args.len(),
         1,
@@ -775,8 +803,6 @@ fn delegate_from_fnptr<'tcx>(
             vec![None, Some(fnptr_field_name)],
         ));
 
-        // ---- shim `Invoke(this, In0, …) -> Ret` : loads args, loads the field, `calli`s it ----
-        let invoke_name = ctx.alloc_string("Invoke");
         // The `Invoke` receiver is arg 0; the explicit inputs are args 1..=N.
         let mut invoke_call_args = Vec::with_capacity(inputs.len());
         for (i, _in_ty) in inputs.iter().enumerate() {
@@ -789,32 +815,16 @@ fn delegate_from_fnptr<'tcx>(
         let fnptr_val = ctx.ld_field(invoke_this, fnptr_field);
         // The methodref receiver goes at sig position 0 (cilly convention); the shim `calli` sig is the
         // *native* pointer sig (no receiver), so a separate value list is used for the indirect call.
-        let mut invoke_sig_inputs = vec![Type::ClassRef(shim_cref)];
-        invoke_sig_inputs.extend(inputs.iter().copied());
-        let invoke_sig = ctx.sig(invoke_sig_inputs, output);
-        let invoke_body = if output == Type::Void {
-            let call = ctx.call_indirect_root(shim_fn_sig, fnptr_val, invoke_call_args);
-            let ret = ctx.alloc_root(cilly::CILRoot::VoidRet);
-            vec![call, ret]
-        } else {
-            let call = ctx.call_indirect(shim_fn_sig, fnptr_val, invoke_call_args);
-            let ret = ctx.alloc_root(cilly::CILRoot::Ret(call));
-            vec![ret]
-        };
-        let mut invoke_arg_names = vec![None];
-        invoke_arg_names.extend((0..inputs.len()).map(|_| None));
-        ctx.new_method(MethodDef::new(
-            Access::Public,
+        emit_delegate_invoke(
+            ctx,
             shim_def,
-            invoke_name,
-            invoke_sig,
-            MethodKind::Instance,
-            MethodImpl::MethodBody {
-                blocks: vec![BasicBlock::new(invoke_body, 0, None)],
-                locals: vec![],
-            },
-            invoke_arg_names,
-        ));
+            shim_cref,
+            &inputs,
+            output,
+            shim_fn_sig,
+            fnptr_val,
+            invoke_call_args,
+        );
     }
 
     // --- Emit: newobj shim(fnptr) ; ldftn shim::Invoke ; newobj Delegate::.ctor(object, native int) ---
@@ -828,61 +838,19 @@ fn delegate_from_fnptr<'tcx>(
         Box::new(cilly::cilnode::PtrCastRes::FnPtr(shim_fn_sig)),
     ));
 
-    let shim_ctor_sig = ctx.sig([Type::ClassRef(shim_cref), shim_fn_ptr_ty], Type::Void);
-    let shim_ctor = MethodRef::new(
-        shim_cref,
-        ctx.alloc_string(".ctor"),
-        shim_ctor_sig,
-        MethodKind::Constructor,
-        vec![].into(),
-    );
-    let shim_ctor = ctx.alloc_methodref(shim_ctor);
-    let shim_obj = ctx.call(shim_ctor, &[fnptr_arg], IsPure::NOT);
-
-    // ldftn shim::Invoke  (an instance method: methodref receiver is sig position 0)
-    let mut invoke_sig_inputs = vec![Type::ClassRef(shim_cref)];
-    invoke_sig_inputs.extend(inputs.iter().copied());
-    let invoke_sig = ctx.sig(invoke_sig_inputs, output);
-    let shim_invoke = MethodRef::new(
-        shim_cref,
-        ctx.alloc_string("Invoke"),
-        invoke_sig,
-        MethodKind::Instance,
-        vec![].into(),
-    );
-    let shim_invoke = ctx.alloc_methodref(shim_invoke);
-    let invoke_ftn = ctx.ld_ftn(shim_invoke);
-    // `ldftn` yields `native int`; the delegate `.ctor`'s second param is `native int`. Normalise.
-    let invoke_ftn = ctx.alloc_node(cilly::CILNode::PtrCast(
-        invoke_ftn,
-        Box::new(PtrCastRes::ISize),
-    ));
-
-    // newobj DelegateClass<ClassGenerics..>::.ctor(object, native int)
-    let delegate_cref = ctx.alloc_class_ref(ClassRef::new(
-        class_name,
+    finish_delegate(
+        ctx,
         asm,
+        class_name,
         is_valuetype,
-        class_generics.into(),
-    ));
-    let delegate_ctor_sig = ctx.sig(
-        [
-            Type::ClassRef(delegate_cref),
-            Type::PlatformObject,
-            Type::Int(Int::ISize),
-        ],
-        Type::Void,
-    );
-    let delegate_ctor = MethodRef::new(
-        delegate_cref,
-        ctx.alloc_string(".ctor"),
-        delegate_ctor_sig,
-        MethodKind::Constructor,
-        vec![].into(),
-    );
-    let delegate_ctor = ctx.alloc_methodref(delegate_ctor);
-    let delegate = ctx.call(delegate_ctor, &[shim_obj, invoke_ftn], IsPure::NOT);
-    place_set(destination, delegate, ctx)
+        class_generics,
+        shim_cref,
+        vec![shim_fn_ptr_ty],
+        vec![fnptr_arg],
+        &inputs,
+        output,
+        destination,
+    )
 }
 /// Delegates & callbacks — wrap a **capturing** Rust closure into a managed delegate. Unlike
 /// [`delegate_from_fnptr`] (a capture-less `fn`), the closure has an environment, so the caller (the
@@ -902,7 +870,6 @@ fn delegate_from_closure<'tcx>(
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Root {
     use cilly::cilnode::PtrCastRes;
-    use cilly::{Access, BasicBlock, ClassDef, MethodDef, MethodImpl};
     assert_eq!(
         args.len(),
         2,
@@ -992,8 +959,6 @@ fn delegate_from_closure<'tcx>(
             vec![None, Some(env_field_name), Some(fnptr_field_name)],
         ));
 
-        // ---- shim `Invoke(this, In0, …) -> Ret` : ldfld env ; ldargs ; ldfld fnptr ; calli(env, In..) ----
-        let invoke_name = ctx.alloc_string("Invoke");
         let invoke_this = ctx.alloc_node(cilly::CILNode::LdArg(0));
         let env_val = ctx.ld_field(invoke_this, env_field);
         let mut invoke_call_args = Vec::with_capacity(inputs.len() + 1);
@@ -1006,32 +971,16 @@ fn delegate_from_closure<'tcx>(
         }
         let invoke_this2 = ctx.alloc_node(cilly::CILNode::LdArg(0));
         let fnptr_val = ctx.ld_field(invoke_this2, fnptr_field);
-        let mut invoke_sig_inputs = vec![Type::ClassRef(shim_cref)];
-        invoke_sig_inputs.extend(inputs.iter().copied());
-        let invoke_sig = ctx.sig(invoke_sig_inputs, output);
-        let invoke_body = if output == Type::Void {
-            let call = ctx.call_indirect_root(tramp_fn_sig, fnptr_val, invoke_call_args);
-            let ret = ctx.alloc_root(cilly::CILRoot::VoidRet);
-            vec![call, ret]
-        } else {
-            let call = ctx.call_indirect(tramp_fn_sig, fnptr_val, invoke_call_args);
-            let ret = ctx.alloc_root(cilly::CILRoot::Ret(call));
-            vec![ret]
-        };
-        let mut invoke_arg_names = vec![None];
-        invoke_arg_names.extend((0..inputs.len()).map(|_| None));
-        ctx.new_method(MethodDef::new(
-            Access::Public,
+        emit_delegate_invoke(
+            ctx,
             shim_def,
-            invoke_name,
-            invoke_sig,
-            MethodKind::Instance,
-            MethodImpl::MethodBody {
-                blocks: vec![BasicBlock::new(invoke_body, 0, None)],
-                locals: vec![],
-            },
-            invoke_arg_names,
-        ));
+            shim_cref,
+            &inputs,
+            output,
+            tramp_fn_sig,
+            fnptr_val,
+            invoke_call_args,
+        );
     }
 
     // --- Emit: newobj shim(env, trampoline) ; ldftn shim::Invoke ; newobj Delegate::.ctor(obj, ftn) ---
@@ -1042,61 +991,19 @@ fn delegate_from_closure<'tcx>(
         Box::new(PtrCastRes::FnPtr(tramp_fn_sig)),
     ));
 
-    let shim_ctor_sig = ctx.sig(
-        [Type::ClassRef(shim_cref), env_ty, tramp_fn_ptr_ty],
-        Type::Void,
-    );
-    let shim_ctor = MethodRef::new(
-        shim_cref,
-        ctx.alloc_string(".ctor"),
-        shim_ctor_sig,
-        MethodKind::Constructor,
-        vec![].into(),
-    );
-    let shim_ctor = ctx.alloc_methodref(shim_ctor);
-    let shim_obj = ctx.call(shim_ctor, &[env_arg, tramp_arg], IsPure::NOT);
-
-    let mut invoke_sig_inputs = vec![Type::ClassRef(shim_cref)];
-    invoke_sig_inputs.extend(inputs.iter().copied());
-    let invoke_sig = ctx.sig(invoke_sig_inputs, output);
-    let shim_invoke = MethodRef::new(
-        shim_cref,
-        ctx.alloc_string("Invoke"),
-        invoke_sig,
-        MethodKind::Instance,
-        vec![].into(),
-    );
-    let shim_invoke = ctx.alloc_methodref(shim_invoke);
-    let invoke_ftn = ctx.ld_ftn(shim_invoke);
-    let invoke_ftn = ctx.alloc_node(cilly::CILNode::PtrCast(
-        invoke_ftn,
-        Box::new(PtrCastRes::ISize),
-    ));
-
-    let delegate_cref = ctx.alloc_class_ref(ClassRef::new(
-        class_name,
+    finish_delegate(
+        ctx,
         asm,
+        class_name,
         is_valuetype,
-        class_generics.into(),
-    ));
-    let delegate_ctor_sig = ctx.sig(
-        [
-            Type::ClassRef(delegate_cref),
-            Type::PlatformObject,
-            Type::Int(Int::ISize),
-        ],
-        Type::Void,
-    );
-    let delegate_ctor = MethodRef::new(
-        delegate_cref,
-        ctx.alloc_string(".ctor"),
-        delegate_ctor_sig,
-        MethodKind::Constructor,
-        vec![].into(),
-    );
-    let delegate_ctor = ctx.alloc_methodref(delegate_ctor);
-    let delegate = ctx.call(delegate_ctor, &[shim_obj, invoke_ftn], IsPure::NOT);
-    place_set(destination, delegate, ctx)
+        class_generics,
+        shim_cref,
+        vec![env_ty, tramp_fn_ptr_ty],
+        vec![env_arg, tramp_arg],
+        &inputs,
+        output,
+        destination,
+    )
 }
 /// Creates a new managed object, and places a reference to it in destination
 fn call_ctor<'tcx>(
@@ -1132,47 +1039,54 @@ fn call_ctor<'tcx>(
     } = InteropHeader::decode(subst_ref, ctx);
     let tpe = ClassRef::new(class_name, asm, is_valuetype, [].into());
     let tpe = ctx.alloc_class_ref(tpe);
-    // If no arguments, inputs don't have to be handled, so a simpler call handling is used.
-    if argc == 0 {
-        let mref = MethodRef::new(
-            tpe,
-            ctx.alloc_string(".ctor"),
-            ctx.sig([Type::ClassRef(tpe)], Type::Void),
-            MethodKind::Constructor,
-            vec![].into(),
-        );
-        let mref = ctx.alloc_methodref(mref);
-        let node = ctx.call(mref, EMPTY_ARGS, IsPure::NOT);
-        place_set(destination, node, ctx)
-    } else {
-        let mut inputs: Vec<_> = subst_ref[input_start..]
-            .iter()
-            .map(|ty| {
-                ctx.type_from_cache(
-                    ctx.monomorphize(*ty)
-                        .as_type()
-                        .expect("Expceted generic type but got something that was not a type!"),
-                )
-            })
-            .collect();
-        inputs.insert(0, Type::ClassRef(tpe));
-        let sig = ctx.sig(inputs, cilly::Type::Void);
-        let mut call = Vec::new();
-        for arg in args {
-            call.push(handle_operand(&arg.node, ctx));
+    let inputs: Vec<_> = subst_ref[input_start..]
+        .iter()
+        .map(|ty| {
+            ctx.type_from_cache(
+                ctx.monomorphize(*ty)
+                    .as_type()
+                    .expect("Expceted generic type but got something that was not a type!"),
+            )
+        })
+        .collect();
+    emit_constructor_call(tpe, inputs, args, destination, ctx)
+}
+
+/// Lower the small set of LLVM intrinsics that can appear in the managed sysroot.
+///
+/// These symbols are registered as typed managed fallbacks by the linker (see
+/// `cilly::builtins::x86`).  Keeping the lowering here, before normal ABI construction, is
+/// important: LLVM intrinsics intentionally have no Rust `FnAbi` for rustc to expose.
+fn handle_llvm_intrinsic<'tcx>(
+    function_name: &str,
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+) -> Vec<Root> {
+    match function_name {
+        "llvm.x86.xgetbv" => {
+            assert_eq!(args.len(), 1, "llvm.x86.xgetbv expects one argument");
+            let xcr_no = handle_operand(&args[0].node, ctx);
+            let value = ctx.call_static(
+                "llvm.x86.xgetbv",
+                [Type::Int(Int::U32)],
+                Type::Int(Int::I64),
+                &[xcr_no],
+            );
+            vec![place_set(destination, value, ctx)]
         }
-        let ctor = MethodRef::new(
-            tpe,
-            ctx.alloc_string(".ctor"),
-            sig,
-            MethodKind::Constructor,
-            vec![].into(),
-        );
-        let ctor = ctx.alloc_methodref(ctor);
-        let node = ctx.call(ctor, &call, IsPure::NOT);
-        place_set(destination, node, ctx)
+        "llvm.x86.avx.vzeroupper" | "llvm.x86.sse2.pause" => {
+            assert!(
+                args.is_empty(),
+                "{function_name} expects no arguments, got {}",
+                args.len()
+            );
+            vec![ctx.call_static_root(function_name, [], Type::Void, &[])]
+        }
+        other => panic!("unsupported LLVM intrinsic in CLR backend: {other}"),
     }
 }
+
 /// Dispatches a resolved MIR call: vtable calls for `InstanceKind::Virtual`, no-ops for drop
 /// glue on types with nothing to drop, then plain function calls — except when `instance` is one of
 /// the magic interop fns [`classify_magic_fn`] recognizes, each of which is a distinct hand-written
@@ -1187,6 +1101,9 @@ pub fn call_inner<'tcx>(
     destination: &Place<'tcx>,
     source_info: rustc_middle::mir::SourceInfo,
 ) -> Vec<Root> {
+    if super::drop_glue_is_noop(instance, ctx.tcx()) {
+        return vec![ctx.alloc_root(CILRoot::Nop)];
+    }
     if let rustc_middle::ty::InstanceKind::Virtual(_def, fn_idx) = instance.def {
         assert!(!args.is_empty());
 
@@ -1257,9 +1174,21 @@ pub fn call_inner<'tcx>(
             vec![place_set(destination, call, ctx)]
         };
     }
-    let abi = AbiPlan::from_instance(instance, ctx);
 
-    let function_name = fn_name_for_instance(ctx.tcx(), instance);
+    // LLVM intrinsics do not have a Rust ABI.  Asking rustc for their `FnAbi` is an ICE on
+    // current nightlies (`fn_abi_of_instance should not be called on LLVM intrinsics`), and they
+    // are intended to be expanded by the backend at the call site instead.  Keep this dispatch
+    // before `AbiPlan::from_instance`; the ordinary `#[rustc_intrinsic]` path is similarly a
+    // backend-owned lowering and must not be treated as a normal function call first.
+    let function_name = match instance.def {
+        InstanceKind::LlvmIntrinsic(def_id) => ctx
+            .tcx()
+            .codegen_fn_attrs(def_id)
+            .symbol_name
+            .expect("LLVM intrinsic is missing its symbol name")
+            .to_string(),
+        _ => fn_name_for_instance(ctx.tcx(), instance),
+    };
     if matches!(instance.def, InstanceKind::Intrinsic(_)) {
         return super::intrinsics::handle_intrinsic(
             &function_name,
@@ -1270,6 +1199,11 @@ pub fn call_inner<'tcx>(
             ctx,
         );
     }
+    if matches!(instance.def, InstanceKind::LlvmIntrinsic(_)) {
+        return handle_llvm_intrinsic(&function_name, args, destination, ctx);
+    }
+
+    let abi = AbiPlan::from_instance(instance, ctx);
     let mut signature = abi.signature().clone();
     // Checks if function is "magic" — classified by exact `DefId`, not by matching the mangled
     // `function_name`; see `classify_magic_fn`'s doc comment for why that's the safer mechanism.
@@ -1654,9 +1588,6 @@ pub fn call_inner<'tcx>(
     }
     let is_void = matches!(signature.output(), cilly::Type::Void);
     //rustc_middle::ty::print::with_no_trimmed_paths! {call.push(CILOp::Comment(format!("Calling {instance:?}").into()))};
-    if let InstanceKind::DropGlue(_def, None) = instance.def {
-        return vec![ctx.alloc_root(cilly::CILRoot::Nop)];
-    }
     let call_site = MethodRef::new(
         *ctx.main_module(),
         ctx.alloc_string(function_name),
@@ -1685,7 +1616,9 @@ pub fn call<'tcx>(
 ) -> Vec<Root> {
     let fn_type = ctx.monomorphize(fn_type);
     let instance = if let TyKind::FnDef(def_id, subst_ref) = fn_type.kind() {
-        let subst = ctx.monomorphize(*subst_ref);
+        let subst = subst_ref
+            .no_bound_vars()
+            .expect("function definition had bound generic arguments");
         let env = rustc_middle::ty::TypingEnv::fully_monomorphized();
         let Some(instance) =
             Instance::try_resolve(ctx.tcx(), env, *def_id, subst).expect("Invalid function def")

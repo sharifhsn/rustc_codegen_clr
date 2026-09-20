@@ -1,6 +1,7 @@
+use super::indirect_binop;
 use crate::{
-    Assembly, BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Float, Interned, MethodImpl,
-    MethodRef, Type, asm::MissingMethodPatcher, cilnode::MethodKind,
+    Assembly, BinOp, CILNode, ClassRef, Float, Interned, MethodRef, Type,
+    asm::MissingMethodPatcher, cilnode::MethodKind,
 };
 
 /// Converts `input` (a 16-bit float, `System.Half`) to the wider float `target` (`f32`/`f64`),
@@ -61,25 +62,17 @@ fn op_indirect(
         op = op.name(),
         lhs_type = lhs_type.name()
     ));
-    let generator = move |_, asm: &mut Assembly| {
-        let lhs = asm.alloc_node(CILNode::LdArg(0));
-        let rhs = asm.alloc_node(CILNode::LdArg(1));
-        let class = lhs_type.class(asm);
-        let class = asm[class].clone();
-        let call_op = class.static_mref(
-            &[Type::Float(lhs_type), Type::Float(rhs_type)],
-            ret_type,
-            asm.alloc_string(op.dotnet_name()),
-            asm,
-        );
-        let call = asm.alloc_node(CILNode::call(call_op, [lhs, rhs]));
-        let ret = asm.alloc_root(CILRoot::Ret(call));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
-        }
-    };
-    patcher.insert(name, Box::new(generator));
+    let class = lhs_type.class(asm);
+    let class = asm[class].clone();
+    indirect_binop(
+        patcher,
+        name,
+        class,
+        Type::Float(lhs_type),
+        Type::Float(rhs_type),
+        op,
+        ret_type,
+    );
 }
 /// Generates all ops operating on a 16 bit float.
 pub fn generate_f16_ops(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {

@@ -1,7 +1,7 @@
 use crate::assembly::MethodCompileCtx;
 
 use cilly::cilnode::{ExtendKind, IsPure, MethodKind};
-use cilly::{BinOp, Interned, Type};
+use cilly::{BinOp, Float, Interned, Type};
 use cilly::{ClassRef, FieldDesc, Int, MethodRef};
 
 use crate::r#type::get_type;
@@ -10,6 +10,7 @@ use crate::operand::handle_operand;
 use rustc_middle::mir::Rvalue;
 use rustc_middle::mir::{Operand, UnOp};
 use rustc_middle::ty::{IntTy, TyKind, UintTy};
+
 /// Implements an unary operation, such as negation.
 pub fn unop<'tcx>(
     unnop: UnOp,
@@ -45,6 +46,21 @@ pub fn unop<'tcx>(
                     ClassRef::uint_128(ctx),
                     ctx.alloc_string("op_UnaryNegation"),
                     ctx.sig([Type::Int(Int::U128)], Type::Int(Int::U128)),
+                    MethodKind::Static,
+                    vec![].into(),
+                );
+                let mref = ctx.alloc_methodref(mref);
+                ctx.call(mref, &[parrent_node], IsPure::NOT)
+            }
+            TyKind::Float(rustc_middle::ty::FloatTy::F16) => {
+                // `f16` is represented by the valuetype `System.Half`; the ECMA-335 `neg`
+                // instruction only accepts native f32/f64 stack values and would otherwise lose
+                // the sign of zero on this path.  Use Half's overloaded operator exactly as the
+                // scalar f16 arithmetic builtins do.
+                let mref = MethodRef::new(
+                    ClassRef::half(ctx),
+                    ctx.alloc_string("op_UnaryNegation"),
+                    ctx.sig([Type::Float(Float::F16)], Type::Float(Float::F16)),
                     MethodKind::Static,
                     vec![].into(),
                 );

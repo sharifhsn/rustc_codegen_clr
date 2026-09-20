@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-pub const DEFAULT_TOOLCHAIN: &str = "nightly-2026-06-17";
+pub const DEFAULT_TOOLCHAIN: &str = "nightly-2026-09-18";
 
 #[derive(Debug, Clone)]
 pub enum Mode {

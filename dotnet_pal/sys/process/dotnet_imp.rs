@@ -35,7 +35,7 @@ use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 pub use crate::ffi::OsString as EnvKey;
 use crate::ffi::{OsStr, OsString};
 use crate::num::NonZero;
-use crate::path::Path;
+use crate::path::{Path, PathBuf};
 use crate::process::StdioPipes;
 use crate::sys::fd::FileDesc;
 use crate::sys::fs::File;
@@ -48,6 +48,15 @@ unsafe extern "C" {
     fn rcl_dotnet_proc_psi_new(prog_ptr: *const u8, prog_len: usize) -> *mut u8;
     fn rcl_dotnet_proc_psi_args(psi: *mut u8, ptr: *const u8, len: usize);
     fn rcl_dotnet_proc_psi_cwd(psi: *mut u8, ptr: *const u8, len: usize);
+    fn rcl_dotnet_proc_psi_clear_env(psi: *mut u8);
+    fn rcl_dotnet_proc_psi_env_set(
+        psi: *mut u8,
+        key_ptr: *const u8,
+        key_len: usize,
+        value_ptr: *const u8,
+        value_len: usize,
+    );
+    fn rcl_dotnet_proc_psi_env_remove(psi: *mut u8, key_ptr: *const u8, key_len: usize);
     fn rcl_dotnet_proc_psi_capture(psi: *mut u8);
     fn rcl_dotnet_proc_start(psi: *mut u8) -> *mut u8;
     fn rcl_dotnet_proc_stdout(handle: *mut u8) -> *mut u8;
@@ -110,8 +119,39 @@ fn paste_arguments(args: &[OsString]) -> Vec<u8> {
 /// Build a `ProcessStartInfo` from `cmd` and `Process.Start` it; returns the process GCHandle.
 /// `capture` requests stdout/stderr redirection (for `output()`). `program` is `args[0]` (FileName);
 /// the rest become `Arguments`. A null from a hook means the start failed (errno set BCL-side).
+fn resolve_program(cmd: &Command) -> OsString {
+    let program = &cmd.program;
+    let bytes = program.as_encoded_bytes();
+    if bytes.iter().any(|byte| matches!(byte, b'/' | b'\\')) {
+        return program.clone();
+    }
+
+    // CoreCLR resolves ProcessStartInfo.FileName against the parent process PATH before it
+    // applies ProcessStartInfo.EnvironmentVariables. Resolve a bare program against the exact
+    // CommandEnv PATH first so `Command::env("PATH", ...)` retains Rust's execvp semantics.
+    let path_value = if cmd.env.have_changed_path() {
+        cmd.env
+            .capture()
+            .get(OsStr::new("PATH"))
+            .cloned()
+    } else {
+        crate::env::var_os("PATH")
+    };
+    let Some(path_value) = path_value else {
+        return program.clone();
+    };
+    for directory in crate::env::split_paths(&path_value) {
+        let candidate: PathBuf = directory.join(program);
+        if candidate.is_file() {
+            return candidate.into_os_string();
+        }
+    }
+    program.clone()
+}
+
 fn build_and_start(cmd: &Command, capture: bool) -> io::Result<*mut u8> {
-    let prog = cmd.program.as_encoded_bytes();
+    let resolved_program = resolve_program(cmd);
+    let prog = resolved_program.as_encoded_bytes();
     let psi = unsafe { rcl_dotnet_proc_psi_new(prog.as_ptr(), prog.len()) };
     if psi.is_null() {
         return Err(io::Error::last_os_error());
@@ -123,6 +163,29 @@ fn build_and_start(cmd: &Command, capture: bool) -> io::Result<*mut u8> {
     if let Some(cwd) = &cmd.cwd {
         let b = cwd.as_encoded_bytes();
         unsafe { rcl_dotnet_proc_psi_cwd(psi, b.as_ptr(), b.len()) };
+    }
+    if cmd.env.does_clear() {
+        unsafe { rcl_dotnet_proc_psi_clear_env(psi) };
+    }
+    for (key, value) in cmd.get_envs() {
+        let key_bytes = key.as_encoded_bytes();
+        match value {
+            Some(value) => {
+                let value_bytes = value.as_encoded_bytes();
+                unsafe {
+                    rcl_dotnet_proc_psi_env_set(
+                        psi,
+                        key_bytes.as_ptr(),
+                        key_bytes.len(),
+                        value_bytes.as_ptr(),
+                        value_bytes.len(),
+                    )
+                };
+            }
+            None => unsafe {
+                rcl_dotnet_proc_psi_env_remove(psi, key_bytes.as_ptr(), key_bytes.len())
+            },
+        }
     }
     if capture {
         unsafe { rcl_dotnet_proc_psi_capture(psi) };
@@ -166,6 +229,12 @@ pub enum Stdio {
     // `From<OwnedFd> for process::Stdio` (os/unix/process.rs) build this. The fd is
     // a unified fd-table `FileDesc`; with no real spawn it is only carried/dropped.
     Fd(FileDesc),
+}
+
+macro_rules! ignored_method {
+    ($name:ident($($arg:tt)*)) => {
+        pub fn $name(&mut self, $($arg)*) {}
+    };
 }
 
 impl Command {
@@ -276,21 +345,10 @@ impl Command {
     // never acted on. `exec` returns the Unsupported error directly.
     // =======================================================================
 
-    pub fn uid(&mut self, _id: u32) {
-        // setuid in a non-existent child — stored-and-ignored.
-    }
-
-    pub fn gid(&mut self, _id: u32) {
-        // setgid in a non-existent child — stored-and-ignored.
-    }
-
-    pub fn groups(&mut self, _groups: &[u32]) {
-        // setgroups in a non-existent child — stored-and-ignored.
-    }
-
-    pub fn pre_exec(&mut self, _f: Box<dyn FnMut() -> io::Result<()> + Send + Sync>) {
-        // The pre-`exec` hook can never run (no `exec` happens) — dropped.
-    }
+    ignored_method!(uid(_id: u32));
+    ignored_method!(gid(_id: u32));
+    ignored_method!(groups(_groups: &[u32]));
+    ignored_method!(pre_exec(_f: Box<dyn FnMut() -> io::Result<()> + Send + Sync>));
 
     pub fn exec(&mut self, _default: Stdio) -> io::Error {
         // `exec` replaces the current image; impossible on CoreCLR. On the unix
@@ -303,17 +361,9 @@ impl Command {
         self.arg0 = Some(arg.to_owned());
     }
 
-    pub fn pgroup(&mut self, _pgroup: i32) {
-        // setpgid in a non-existent child — stored-and-ignored.
-    }
-
-    pub fn chroot(&mut self, _dir: &Path) {
-        // chroot in a non-existent child — stored-and-ignored (no chroot on CLR).
-    }
-
-    pub fn setsid(&mut self, _setsid: bool) {
-        // setsid in a non-existent child — stored-and-ignored.
-    }
+    ignored_method!(pgroup(_pgroup: i32));
+    ignored_method!(chroot(_dir: &Path));
+    ignored_method!(setsid(_setsid: bool));
 }
 
 pub fn output(_cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {

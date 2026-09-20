@@ -2,9 +2,7 @@ use crate::r#type::escape_field_name;
 use rustc_abi::{ExternAbi, VariantIdx};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty::{
-    ConstKind, GenericArg, Instance, List, PseudoCanonicalInput, Ty, TyCtxt, TyKind,
-};
+use rustc_middle::ty::{ConstKind, GenericArg, PseudoCanonicalInput, Ty, TyCtxt, TyKind};
 use rustc_span::Symbol;
 
 pub mod adt;
@@ -332,20 +330,6 @@ pub fn classify_magic_fn(tcx: TyCtxt, def_id: DefId) -> Option<MagicFn> {
     })
 }
 
-// WARNING: this is *wrong*: For some reason, `Instance::try_resolve` should not operate on structs(why?), and this just silences the newly introduced warning.
-pub fn instance_try_resolve<'tcx>(
-    adt: DefId,
-    tcx: TyCtxt<'tcx>,
-    gargs: &'tcx List<GenericArg<'tcx>>,
-) -> Instance<'tcx> {
-    tcx.resolve_instance_raw(PseudoCanonicalInput {
-        typing_env: rustc_middle::ty::TypingEnv::fully_monomorphized(),
-        value: (adt, gargs),
-    })
-    .unwrap()
-    .unwrap()
-}
-
 /// Gets the name of a field with index `idx`
 pub fn field_name(ty: Ty, idx: u32) -> crate::IString {
     match ty.kind() {
@@ -371,31 +355,7 @@ pub fn variant_name(ty: Ty, idx: u32) -> crate::IString {
     }
 }
 
-/// Converts a generic argument to a boolean, and panics if it could not.
-pub fn garg_to_bool<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> bool {
-    let usize_const = garg
-        .as_const()
-        .expect("Generic argument was not an constant!");
-
-    let kind = usize_const.kind();
-    match kind {
-        ConstKind::Value(val) => {
-            let scalar = val
-                .try_to_leaf()
-                .expect("String const did not contain valid scalar!");
-            let ty = val.ty;
-            assert!(
-                ty.is_bool(),
-                "Generic argument was not a bool type! ty:{ty:?}"
-            );
-            scalar.to_uint(scalar.size()) != 0
-        }
-        _ => todo!("Can't convert generic arg of const kind {kind:?} to string!"),
-    }
-}
-
-/// Converts a `usize` const-generic argument to its host index representation.
-pub fn garg_to_usize<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> usize {
+pub(crate) fn garg_to_uint<'tcx>(garg: GenericArg<'tcx>) -> (u128, Ty<'tcx>) {
     let value = garg
         .as_const()
         .expect("Generic argument was not a constant!");
@@ -403,13 +363,28 @@ pub fn garg_to_usize<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> usize 
         ConstKind::Value(value) => {
             let scalar = value
                 .try_to_leaf()
-                .expect("usize const did not contain a scalar");
-            assert!(value.ty.is_usize(), "Generic argument was not usize");
-            usize::try_from(scalar.to_uint(scalar.size()))
-                .expect("usize const-generic value exceeds host usize")
+                .expect("Generic argument did not contain a scalar");
+            (scalar.to_uint(scalar.size()), value.ty)
         }
-        kind => todo!("Can't convert generic arg of const kind {kind:?} to usize!"),
+        kind => todo!("Can't convert generic arg of const kind {kind:?} to integer!"),
     }
+}
+
+/// Converts a generic argument to a boolean, and panics if it could not.
+pub fn garg_to_bool<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> bool {
+    let (value, ty) = garg_to_uint(garg);
+    assert!(
+        ty.is_bool(),
+        "Generic argument was not a bool type! ty:{ty:?}"
+    );
+    value != 0
+}
+
+/// Converts a `usize` const-generic argument to its host index representation.
+pub fn garg_to_usize<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> usize {
+    let (value, ty) = garg_to_uint(garg);
+    assert!(ty.is_usize(), "Generic argument was not usize");
+    usize::try_from(value).expect("usize const-generic value exceeds host usize")
 }
 /// This function returns the size of a type at the compile time. This should be used ONLY for handling constants. It currently assumes a 64 bit env
 pub fn const_sizeof<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> u64 {

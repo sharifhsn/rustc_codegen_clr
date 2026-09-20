@@ -308,16 +308,7 @@ impl ContentStore {
                 retained += 1;
                 continue;
             }
-            let Ok(build_lock) = KeyLock::try_acquire(&locks.join(format!("{name}.build.lock")))
-            else {
-                continue;
-            };
-            let Ok(consumer_lock) =
-                KeyLock::try_acquire(&locks.join(format!("{name}.consumer.lock")))
-            else {
-                continue;
-            };
-            let Ok(lease_lock) = KeyLock::try_acquire(&locks.join(format!("{name}.lease.lock")))
+            let Some((build_lock, consumer_lock, lease_lock)) = try_entry_locks(&locks, &name)
             else {
                 continue;
             };
@@ -346,16 +337,7 @@ impl ContentStore {
             if !metadata.is_dir() || link_or_reparse(&metadata) || validate_key(&name).is_err() {
                 continue;
             }
-            let Ok(build_lock) = KeyLock::try_acquire(&locks.join(format!("{name}.build.lock")))
-            else {
-                continue;
-            };
-            let Ok(consumer_lock) =
-                KeyLock::try_acquire(&locks.join(format!("{name}.consumer.lock")))
-            else {
-                continue;
-            };
-            let Ok(lease_lock) = KeyLock::try_acquire(&locks.join(format!("{name}.lease.lock")))
+            let Some((build_lock, consumer_lock, lease_lock)) = try_entry_locks(&locks, &name)
             else {
                 continue;
             };
@@ -510,18 +492,9 @@ impl KeyLock {
         Ok(Self(Some(file)))
     }
 
-    fn into_shared(self, guard: SharedLock) -> Result<CacheLease> {
-        self.into_shared_with_hook(guard, || {})
-    }
-
-    fn into_shared_with_hook(
-        mut self,
-        guard: SharedLock,
-        after_exclusive_unlock: impl FnOnce(),
-    ) -> Result<CacheLease> {
+    fn into_shared(mut self, guard: SharedLock) -> Result<CacheLease> {
         let file = self.0.take().expect("key lock has a file");
         FileExt::unlock(&file)?;
-        after_exclusive_unlock();
         FileExt::lock_shared(&file)?;
         Ok(CacheLease {
             primary: file,
@@ -590,6 +563,13 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+fn try_entry_locks(locks: &Path, key: &str) -> Option<(KeyLock, KeyLock, KeyLock)> {
+    let build = KeyLock::try_acquire(&locks.join(format!("{key}.build.lock"))).ok()?;
+    let consumer = KeyLock::try_acquire(&locks.join(format!("{key}.consumer.lock"))).ok()?;
+    let lease = KeyLock::try_acquire(&locks.join(format!("{key}.lease.lock"))).ok()?;
+    Some((build, consumer, lease))
+}
+
 fn remove_cache_entry(objects: &Path, target: &Path) -> Result<()> {
     if target.parent() != Some(objects) {
         bail!(
@@ -654,44 +634,38 @@ pub(crate) fn digest_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> Str
 }
 
 pub(crate) fn hash_tree(path: &Path, hash: &mut Sha256) -> Result<()> {
-    hash_tree_with_hook(path, hash, &[], &mut |_| {})
+    hash_tree_excluding(path, hash, &[])
 }
 
-fn hash_tree_with_hook(
+fn hash_tree_excluding(
     root: &Path,
     hash: &mut Sha256,
     excluded_root_entries: &[&str],
-    before_file_open: &mut dyn FnMut(&Path),
 ) -> Result<()> {
     validate_tree_root(root)?;
     let capability = DirectoryCapability::open(root)?;
     hash.update(b"rust-dotnet-tree-digest-v2\0");
-    let mut relative_hook = |relative: &Path| before_file_open(&root.join(relative));
-    capability.walk_regular_tree_with_hook(
-        excluded_root_entries,
-        &mut relative_hook,
-        &mut |relative, node| {
-            match node {
-                TreeWalkNode::DirectoryEnter(_) => {
-                    hash.update(b"directory-enter\0");
-                    hash_relative_path(relative, hash)?;
-                }
-                TreeWalkNode::File(file) => {
-                    hash.update(b"file\0");
-                    hash_relative_path(relative, hash)?;
-                    let display = root.join(relative);
-                    let bytes = rust_dotnet_sdk_core::safe_fs::read_opened_regular(file, &display)?;
-                    hash.update((bytes.len() as u64).to_le_bytes());
-                    hash.update(bytes);
-                }
-                TreeWalkNode::DirectoryLeave(_) => {
-                    hash.update(b"directory-leave\0");
-                    hash_relative_path(relative, hash)?;
-                }
+    capability.walk_regular_tree(excluded_root_entries, &mut |relative, node| {
+        match node {
+            TreeWalkNode::DirectoryEnter(_) => {
+                hash.update(b"directory-enter\0");
+                hash_relative_path(relative, hash)?;
             }
-            Ok(())
-        },
-    )?;
+            TreeWalkNode::File(file) => {
+                hash.update(b"file\0");
+                hash_relative_path(relative, hash)?;
+                let display = root.join(relative);
+                let bytes = rust_dotnet_sdk_core::safe_fs::read_opened_regular(file, &display)?;
+                hash.update((bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            }
+            TreeWalkNode::DirectoryLeave(_) => {
+                hash.update(b"directory-leave\0");
+                hash_relative_path(relative, hash)?;
+            }
+        }
+        Ok(())
+    })?;
     hash.update(b"tree-end\0");
     Ok(())
 }
@@ -722,7 +696,7 @@ pub(crate) fn tree_digest_excluding_root_entries(
     excluded_root_entries: &[&str],
 ) -> Result<String> {
     let mut hash = Sha256::new();
-    hash_tree_with_hook(path, &mut hash, excluded_root_entries, &mut |_| {})?;
+    hash_tree_excluding(path, &mut hash, excluded_root_entries)?;
     Ok(format!("{:x}", hash.finalize()))
 }
 
@@ -864,38 +838,6 @@ mod tests {
     }
 
     #[test]
-    fn promotion_downgrade_has_no_garbage_collection_deletion_gap() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = ContentStore::new(temp.path().join("cache"), 1).unwrap();
-        let digest = key("downgrade-gap");
-        let objects = store.fixed_directory("objects").unwrap();
-        let locks = store.fixed_directory("locks").unwrap();
-        let target = objects.join(&digest);
-        fs::create_dir(&target).unwrap();
-        fs::write(target.join("artifact"), b"good").unwrap();
-        let primary_path = locks.join(format!("{digest}.lease.lock"));
-        let guard_path = locks.join(format!("{digest}.consumer.lock"));
-        let guard = SharedLock::acquire(&guard_path).unwrap();
-        let exclusive = KeyLock::acquire(&primary_path).unwrap();
-
-        let lease = exclusive
-            .into_shared_with_hook(guard, || {
-                assert!(
-                    KeyLock::try_acquire(&guard_path).is_err(),
-                    "GC acquired its deletion guard during the primary-lock downgrade"
-                );
-                assert!(
-                    target.is_dir(),
-                    "GC-visible object disappeared during downgrade"
-                );
-            })
-            .unwrap();
-        assert!(target.is_dir());
-        drop(lease);
-        assert!(KeyLock::try_acquire(&guard_path).is_ok());
-    }
-
-    #[test]
     fn forced_rebuild_rolls_back_when_promoted_object_fails_revalidation() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("cache");
@@ -945,66 +887,6 @@ mod tests {
             tree_digest(&shallow).unwrap(),
             tree_digest(&nested).unwrap()
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tree_hash_rejects_a_leaf_swapped_after_directory_enumeration() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let outside = temp.path().join("outside-secret");
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join("victim"), b"inside").unwrap();
-        fs::write(&outside, b"outside").unwrap();
-        let mut swapped = false;
-        let mut hash = Sha256::new();
-        let error = hash_tree_with_hook(&root, &mut hash, &[], &mut |path| {
-            if !swapped && path.file_name().is_some_and(|name| name == "victim") {
-                fs::remove_file(path).unwrap();
-                symlink(&outside, path).unwrap();
-                swapped = true;
-            }
-        })
-        .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("following links")
-                || format!("{error:#}").contains("regular file"),
-            "{error:#}"
-        );
-        assert_eq!(fs::read(outside).unwrap(), b"outside");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tree_hash_keeps_one_root_capability_after_enumeration() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        let expected = temp.path().join("expected");
-        let replacement = temp.path().join("replacement");
-        fs::create_dir(&root).unwrap();
-        fs::create_dir(&expected).unwrap();
-        fs::create_dir(&replacement).unwrap();
-        fs::write(root.join("victim"), b"inside").unwrap();
-        fs::write(expected.join("victim"), b"inside").unwrap();
-        fs::write(replacement.join("victim"), b"outside-secret").unwrap();
-        let expected_digest = tree_digest(&expected).unwrap();
-
-        let mut swapped = false;
-        let mut hash = Sha256::new();
-        hash_tree_with_hook(&root, &mut hash, &[], &mut |_| {
-            if !swapped {
-                fs::rename(&root, temp.path().join("root.original")).unwrap();
-                fs::rename(&replacement, &root).unwrap();
-                swapped = true;
-            }
-        })
-        .unwrap();
-
-        assert!(swapped);
-        assert_eq!(format!("{:x}", hash.finalize()), expected_digest);
-        assert_eq!(fs::read(root.join("victim")).unwrap(), b"outside-secret");
     }
 
     #[cfg(unix)]

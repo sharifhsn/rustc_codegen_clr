@@ -184,6 +184,12 @@ pub struct Context {
     pub flags: Flags,
     /// The crate dir to build (absolute; verified to contain Cargo.toml).
     pub crate_dir: PathBuf,
+    /// Cargo's effective workspace root. Locks and workspace-scoped configuration live here even
+    /// when `crate_dir` is one selected member.
+    pub workspace_root: PathBuf,
+    /// Cargo's canonical package ID for the one selected manifest. Artifact discovery must match
+    /// this identity, not merely a target name that another workspace package can reuse.
+    pub selected_package_id: String,
     pub paths: Paths,
     /// The exact toolchain pinned into every inner Cargo/rustc invocation. External crate and
     /// bindgen working directories cannot inherit this repository's rustup directory override.
@@ -232,6 +238,11 @@ impl Context {
     pub(crate) fn resolve_with_mode(args: &BuildArgs, is_run: bool, mode: Mode) -> Result<Self> {
         let host = HostFacts::detect();
         let initial_crate_dir = host::resolve_crate_dir(&args.path)?;
+        // The original Docker/bash frontend wrote a generated Cargo config into fixtures. Remove
+        // every recognized historical header before even the package-selection metadata query;
+        // otherwise Cargo can try container-only `/work/...` paths before the native pipeline has
+        // a chance to create its private build-local config. User-owned configs are preserved.
+        crate::overlays::remove_legacy_generated_config(&initial_crate_dir)?;
 
         // host preflight (rustc/cargo present; dotnet reachable).
         host::ensure_rust_toolchain()?;
@@ -276,7 +287,15 @@ impl Context {
             toolchain.as_deref(),
         )?;
         let paths = Paths::resolve(&mode, &host, &crate_dir)?;
-        let package = cargo_package(&crate_dir)?;
+        let selected_metadata = cargo_metadata_with_environment(
+            &crate_dir,
+            &cargo,
+            &selection_cargo_home,
+            toolchain.as_deref(),
+        )?;
+        let package = package_for_manifest(&selected_metadata, &manifest_path(&crate_dir))?.clone();
+        let workspace_root = selected_metadata.workspace_root.into_std_path_buf();
+        let selected_package_id = package.id.repr.clone();
         let managed_project = resolve_managed_project(&package)?;
         let source_link_url = validate_source_link_url(args.source_link_url.as_deref())?;
         if managed_project.is_some() {
@@ -299,6 +318,8 @@ impl Context {
                 extra_cargo,
             },
             crate_dir,
+            workspace_root,
+            selected_package_id,
             paths,
             toolchain,
             cargo,
@@ -375,15 +396,38 @@ pub(crate) fn manifest_path(crate_path: &Path) -> PathBuf {
 /// Full-graph callers (provenance, restore receipts, and metadata-input tracking) deliberately
 /// keep their own Cargo invocation because they need locked/config/toolchain semantics.
 pub(crate) fn cargo_package(crate_path: &Path) -> Result<cargo_metadata::Package> {
-    cargo_metadata(crate_path)?
-        .root_package()
-        .cloned()
-        .with_context(|| {
-            format!(
-                "Cargo metadata has no root package for {}",
-                crate_path.display()
-            )
-        })
+    let metadata = cargo_metadata(crate_path)?;
+    let manifest = manifest_path(crate_path);
+    package_for_manifest(&metadata, &manifest).cloned()
+}
+
+pub(crate) fn package_for_manifest<'a>(
+    metadata: &'a cargo_metadata::Metadata,
+    manifest: &Path,
+) -> Result<&'a cargo_metadata::Package> {
+    let manifest = manifest
+        .canonicalize()
+        .with_context(|| format!("canonicalize Cargo manifest {}", manifest.display()))?;
+    let mut matches = metadata.packages.iter().filter(|package| {
+        package
+            .manifest_path
+            .as_std_path()
+            .canonicalize()
+            .is_ok_and(|candidate| candidate == manifest)
+    });
+    let package = matches.next().with_context(|| {
+        format!(
+            "Cargo metadata has no package for selected manifest {}",
+            manifest.display()
+        )
+    })?;
+    if matches.next().is_some() {
+        bail!(
+            "Cargo metadata has multiple packages for selected manifest {}",
+            manifest.display()
+        );
+    }
+    Ok(package)
 }
 
 pub(crate) fn cargo_metadata(crate_path: &Path) -> Result<cargo_metadata::Metadata> {
@@ -393,6 +437,28 @@ pub(crate) fn cargo_metadata(crate_path: &Path) -> Result<cargo_metadata::Metada
         .no_deps()
         .exec()
         .context("read Cargo metadata")
+}
+
+fn cargo_metadata_with_environment(
+    crate_path: &Path,
+    cargo: &str,
+    cargo_home: &Path,
+    toolchain: Option<&str>,
+) -> Result<cargo_metadata::Metadata> {
+    let manifest = manifest_path(crate_path);
+    let mut command = cargo_metadata::MetadataCommand::new();
+    command
+        .cargo_path(cargo)
+        .manifest_path(manifest)
+        .current_dir(crate_path)
+        .no_deps()
+        .env("CARGO_HOME", cargo_home);
+    if let Some(toolchain) = toolchain {
+        command.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
+    command
+        .exec()
+        .context("read Cargo metadata with the selected cargo environment")
 }
 
 fn resolve_managed_project(
@@ -623,9 +689,91 @@ fn is_clr_identifier(segment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_metadata_uses_selected_cargo_home_and_toolchain() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn shell_quote(value: &str) -> String {
+            format!("'{}'", value.replace('\'', "'\"'\"'"))
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let crate_dir = root.path().join("selected");
+        let cargo_home = root.path().join("cargo-home");
+        let marker = root.path().join("metadata-environment.txt");
+        let wrapper = root.path().join("cargo-wrapper.sh");
+        fs::create_dir_all(crate_dir.join("src")).unwrap();
+        fs::create_dir_all(&cargo_home).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname='configured-metadata'\nversion='0.0.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(crate_dir.join("src/lib.rs"), "").unwrap();
+
+        let real_cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n' \"$CARGO_HOME\" \"$RUSTUP_TOOLCHAIN\" > {}\nunset RUSTUP_TOOLCHAIN\nexec {} \"$@\"\n",
+                shell_quote(&marker.to_string_lossy()),
+                shell_quote(&real_cargo),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).unwrap();
+
+        let metadata = cargo_metadata_with_environment(
+            &crate_dir,
+            wrapper.to_str().unwrap(),
+            &cargo_home,
+            Some("configured-toolchain-probe"),
+        )
+        .unwrap();
+        assert_eq!(
+            package_for_manifest(&metadata, &crate_dir.join("Cargo.toml"))
+                .unwrap()
+                .name,
+            "configured-metadata"
+        );
+        assert_eq!(
+            fs::read_to_string(marker).unwrap(),
+            format!("{}\nconfigured-toolchain-probe\n", cargo_home.display())
+        );
+    }
 
     #[test]
-    fn public_runtime_profiles_include_unity_netstandard() {
+    fn cargo_package_selects_a_workspace_member_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let member = root.path().join("member");
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"selected-member\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(member.join("src/lib.rs"), "").unwrap();
+
+        let package = cargo_package(&member).unwrap();
+        assert_eq!(package.name, "selected-member");
+        assert_eq!(
+            package.manifest_path.as_std_path().canonicalize().unwrap(),
+            member.join("Cargo.toml").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn archived_runtime_profile_parses_for_legacy_validation() {
         assert_eq!("10".parse::<DotnetVersion>().unwrap(), DotnetVersion::Net10);
         assert_eq!(
             "unity-netstandard2.1".parse::<DotnetVersion>().unwrap(),

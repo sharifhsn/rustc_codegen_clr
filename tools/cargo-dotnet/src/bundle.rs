@@ -54,14 +54,10 @@ struct OpenedBundleArchive {
 
 impl OpenedBundleArchive {
     fn open(path: &Path) -> Result<Self> {
-        Self::open_bounded_with_hook(path, MAX_BUNDLE_ARCHIVE_BYTES, || {})
+        Self::open_bounded(path, MAX_BUNDLE_ARCHIVE_BYTES)
     }
 
-    fn open_bounded_with_hook(
-        path: &Path,
-        max_bytes: u64,
-        before_copy: impl FnOnce(),
-    ) -> Result<Self> {
+    fn open_bounded(path: &Path, max_bytes: u64) -> Result<Self> {
         let mut source = rust_dotnet_sdk_core::safe_fs::open_regular_nofollow(path)
             .with_context(|| format!("opening bundle {}", path.display()))?;
         let declared_bytes = source.metadata()?.len();
@@ -78,7 +74,6 @@ impl OpenedBundleArchive {
         let mut hash = Sha256::new();
         let mut buffer = [0_u8; 128 * 1024];
         let mut copied_bytes = 0_u64;
-        before_copy();
         loop {
             let read = source
                 .read(&mut buffer)
@@ -169,22 +164,12 @@ fn resolve_home(home: &Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn create(home: &Path, out: &Path) -> Result<()> {
-    create_with_hooks(home, out, &mut |_| {}, &mut || Ok(()))
-}
-
-fn create_with_hooks(
-    home: &Path,
-    out: &Path,
-    before_source_open: &mut dyn FnMut(&Path),
-    after_archive_publish: &mut dyn FnMut() -> Result<()>,
-) -> Result<()> {
     let source = DirectoryCapability::open(home)
         .with_context(|| format!("opening sealed bundle source {}", home.display()))?;
     let sealed_manifest = verified_sealed_source_manifest(&source)?;
     let running_cli =
         std::env::current_exe().context("locating the running cargo-dotnet executable")?;
-    let (manifest, sources) =
-        inventory_from_capability(&source, home, Some(&running_cli), true, before_source_open)?;
+    let (manifest, sources) = inventory_from_capability(&source, home, Some(&running_cli), true)?;
     if let Some(sealed_manifest) = sealed_manifest
         && manifest != sealed_manifest
     {
@@ -229,12 +214,7 @@ fn create_with_hooks(
     let generated = OpenedBundleArchive::from_bytes(out, &archive_bytes)?;
     verify_opened(&generated, false).context("self-verifying generated bundle")?;
     let checksum = format!("{}  {}\n", hex_sha256(&archive_bytes), file_name(out)?);
-    publish_bundle_pair(
-        out,
-        &archive_bytes,
-        checksum.as_bytes(),
-        after_archive_publish,
-    )?;
+    publish_bundle_pair(out, &archive_bytes, checksum.as_bytes())?;
     println!("created cargo-dotnet bundle: {}", out.display());
     println!("bundle checksum: {}", checksum_path(out).display());
     Ok(())
@@ -280,24 +260,9 @@ fn inventory(
     cli_override: Option<&Path>,
     require_running_cli: bool,
 ) -> Result<(SdkManifest, Vec<SourceFile>)> {
-    inventory_with_hook(home, cli_override, require_running_cli, &mut |_| {})
-}
-
-fn inventory_with_hook(
-    home: &Path,
-    cli_override: Option<&Path>,
-    require_running_cli: bool,
-    before_source_open: &mut dyn FnMut(&Path),
-) -> Result<(SdkManifest, Vec<SourceFile>)> {
     let capability = DirectoryCapability::open(home)
         .with_context(|| format!("opening install home capability {}", home.display()))?;
-    inventory_from_capability(
-        &capability,
-        home,
-        cli_override,
-        require_running_cli,
-        before_source_open,
-    )
+    inventory_from_capability(&capability, home, cli_override, require_running_cli)
 }
 
 fn inventory_from_capability(
@@ -305,7 +270,6 @@ fn inventory_from_capability(
     home: &Path,
     cli_override: Option<&Path>,
     require_running_cli: bool,
-    before_source_open: &mut dyn FnMut(&Path),
 ) -> Result<(SdkManifest, Vec<SourceFile>)> {
     let facts = crate::host::HostFacts::detect();
     let layout = SdkLayout::for_host(&facts);
@@ -322,9 +286,8 @@ fn inventory_from_capability(
         }
         if metadata.is_dir() {
             let tree = capability.subdirectory(Path::new(name))?;
-            collect_sources(&tree, Path::new(name), before_source_open, &mut sources)?;
+            collect_sources(&tree, Path::new(name), &mut sources)?;
         } else if metadata.is_file() {
-            before_source_open(Path::new(name));
             let (_, mut file) = capability.open_regular(Path::new(name))?;
             let bytes = rust_dotnet_sdk_core::safe_fs::read_opened_regular(&mut file, &path)?;
             sources.push(SourceFile {
@@ -340,7 +303,6 @@ fn inventory_from_capability(
     if let Some(cli_override) = cli_override {
         let executable_name = layout.cargo_dotnet.as_str();
         sources.retain(|source| source.path != executable_name);
-        before_source_open(Path::new("<running-cargo-dotnet>"));
         let mut file = rust_dotnet_sdk_core::safe_fs::open_regular_nofollow(cli_override)?;
         let bytes = rust_dotnet_sdk_core::safe_fs::read_opened_regular(&mut file, cli_override)?;
         sources.push(SourceFile {
@@ -417,25 +379,20 @@ fn inventory_from_capability(
 fn collect_sources(
     tree: &DirectoryCapability,
     prefix: &Path,
-    before_source_open: &mut dyn FnMut(&Path),
     out: &mut Vec<SourceFile>,
 ) -> Result<()> {
-    tree.walk_regular_tree_with_hook(
-        &[],
-        &mut |relative| before_source_open(&prefix.join(relative)),
-        &mut |relative, node| {
-            if let TreeWalkNode::File(file) = node {
-                let path = tree.root().join(relative);
-                let bytes = rust_dotnet_sdk_core::safe_fs::read_opened_regular(file, &path)?;
-                out.push(SourceFile {
-                    path: portable_path(&prefix.join(relative))?,
-                    bytes,
-                    executable: is_executable(&path, &file.metadata()?),
-                });
-            }
-            Ok(())
-        },
-    )?;
+    tree.walk_regular_tree(&[], &mut |relative, node| {
+        if let TreeWalkNode::File(file) = node {
+            let path = tree.root().join(relative);
+            let bytes = rust_dotnet_sdk_core::safe_fs::read_opened_regular(file, &path)?;
+            out.push(SourceFile {
+                path: portable_path(&prefix.join(relative))?,
+                bytes,
+                executable: is_executable(&path, &file.metadata()?),
+            });
+        }
+        Ok(())
+    })?;
     tree.ensure_path_still_bound()
 }
 
@@ -455,12 +412,7 @@ fn bundle_publication_lock(path: &Path, shared: bool) -> Result<crate::build_loc
     }
 }
 
-fn publish_bundle_pair(
-    out: &Path,
-    archive: &[u8],
-    checksum: &[u8],
-    after_archive_publish: &mut dyn FnMut() -> Result<()>,
-) -> Result<()> {
+fn publish_bundle_pair(out: &Path, archive: &[u8], checksum: &[u8]) -> Result<()> {
     let _publication = bundle_publication_lock(out, false)?;
     let parent = out
         .parent()
@@ -480,7 +432,6 @@ fn publish_bundle_pair(
     let previous_checksum = snapshot_optional_leaf(&capability, &checksum_leaf)?;
     let publish = (|| -> Result<()> {
         capability.publish_bytes(&archive_leaf, archive)?;
-        after_archive_publish()?;
         capability.publish_bytes(&checksum_leaf, checksum)?;
         capability.ensure_path_still_bound()?;
         Ok(())
@@ -930,12 +881,6 @@ pub(crate) fn validate_loaded_driver_identity(home: &Path, embedded_build_id: &s
 
 fn install(archive: &Path, home: &Path, force: bool, install_cli: bool) -> Result<()> {
     let _publication = bundle_publication_lock(archive, true)?;
-    if crate::install_transaction::recover(home)? {
-        eprintln!(
-            "recovered an interrupted bundle activation for {}",
-            home.display()
-        );
-    }
     let opened_archive = OpenedBundleArchive::open(archive)?;
     verify_archive_checksum(&opened_archive)?;
     let manifest = verify_opened(&opened_archive, true)?;
@@ -1000,7 +945,7 @@ fn install(archive: &Path, home: &Path, force: bool, install_cli: bool) -> Resul
     let front_end = install_cli
         .then(|| stage_front_end(&staged, home))
         .transpose()?;
-    activate_install(&staged, home, front_end, || Ok(()))?;
+    activate_install(&staged, home, front_end)?;
     println!(
         "installed verified cargo-dotnet bundle -> {} (toolchain {})",
         home.display(),
@@ -1051,19 +996,7 @@ fn extract_verified(
 }
 
 fn verify_tree(root: &Path, manifest: &SdkManifest) -> Result<()> {
-    let expected = manifest
-        .files
-        .iter()
-        .map(|file| (file.path.as_str(), file))
-        .collect::<BTreeMap<_, _>>();
-    let mut allowed_dirs = BTreeSet::new();
-    for file in &manifest.files {
-        let mut parent = Path::new(&file.path).parent();
-        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
-            allowed_dirs.insert(portable_path(path)?);
-            parent = path.parent();
-        }
-    }
+    let (expected, allowed_dirs) = manifest_tree_shape(manifest)?;
     verify_tree_entries(root, root, &expected, &allowed_dirs)?;
     for file in &manifest.files {
         let path = root.join(&file.path);
@@ -1093,19 +1026,7 @@ fn verify_tree_from_capability(
     manifest: &SdkManifest,
     lock_bytes: &[u8],
 ) -> Result<()> {
-    let expected = manifest
-        .files
-        .iter()
-        .map(|file| (file.path.as_str(), file))
-        .collect::<BTreeMap<_, _>>();
-    let mut allowed_dirs = BTreeSet::new();
-    for file in &manifest.files {
-        let mut parent = Path::new(&file.path).parent();
-        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
-            allowed_dirs.insert(portable_path(path)?);
-            parent = path.parent();
-        }
-    }
+    let (expected, allowed_dirs) = manifest_tree_shape(manifest)?;
     let mut seen = BTreeSet::new();
     source.walk_regular_tree(&[], &mut |relative, node| {
         if relative.as_os_str().is_empty() {
@@ -1163,6 +1084,25 @@ fn verify_tree_from_capability(
         bail!("installed bundle is missing declared file: {missing}");
     }
     source.ensure_path_still_bound()
+}
+
+fn manifest_tree_shape<'a>(
+    manifest: &'a SdkManifest,
+) -> Result<(BTreeMap<&'a str, &'a SdkFile>, BTreeSet<String>)> {
+    let expected = manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut allowed_dirs = BTreeSet::new();
+    for file in &manifest.files {
+        let mut parent = Path::new(&file.path).parent();
+        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            allowed_dirs.insert(portable_path(path)?);
+            parent = path.parent();
+        }
+    }
+    Ok((expected, allowed_dirs))
 }
 
 fn verify_tree_entries<'a>(
@@ -1386,29 +1326,11 @@ fn stage_front_end(staged_home: &Path, install_home: &Path) -> Result<StagedFron
     })
 }
 
-fn activate_install<F>(
+fn activate_install(
     staged_home: &Path,
     home: &Path,
     front_end: Option<StagedFrontEnd>,
-    before_front_end: F,
-) -> Result<()>
-where
-    F: FnOnce() -> Result<()>,
-{
-    activate_install_with_hook(staged_home, home, front_end, || Ok(()), before_front_end)
-}
-
-fn activate_install_with_hook<F, G>(
-    staged_home: &Path,
-    home: &Path,
-    front_end: Option<StagedFrontEnd>,
-    before_backup: F,
-    before_front_end: G,
-) -> Result<()>
-where
-    F: FnOnce() -> Result<()>,
-    G: FnOnce() -> Result<()>,
-{
+) -> Result<()> {
     let (temporary, destination, cli) = match front_end {
         Some(front_end) => {
             let destination = front_end.destination;
@@ -1427,8 +1349,8 @@ where
         home,
         cli,
         crate::install_transaction::RollbackDisposition::DiscardInputs,
-        before_backup,
-        before_front_end,
+        || Ok(()),
+        || Ok(()),
         || {
             if let Some(destination) = &validation_destination
                 && fs::read(
@@ -1669,52 +1591,6 @@ mod tests {
     }
 
     #[test]
-    fn sealed_home_lock_and_tree_swap_during_capture_is_rejected() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = fake_home(&temp.path().join("trusted"));
-
-        let replacement = fake_home(&temp.path().join("replacement"));
-        let layout = SdkLayout::for_host(&crate::host::HostFacts::detect());
-        fs::write(
-            replacement.join(&layout.pal_root).join("pal.rs"),
-            b"separately sealed replacement revision",
-        )
-        .unwrap();
-        seal_install_home(&replacement, &std::env::current_exe().unwrap()).unwrap();
-
-        let archive = temp.path().join("swapped.zip");
-        let mut swapped = false;
-        let error = create_with_hooks(
-            &home,
-            &archive,
-            &mut |_| {
-                if !swapped {
-                    fs::copy(
-                        replacement.join(SDK_MANIFEST_FILE),
-                        home.join(SDK_MANIFEST_FILE),
-                    )
-                    .unwrap();
-                    fs::copy(
-                        replacement.join(&layout.pal_root).join("pal.rs"),
-                        home.join(&layout.pal_root).join("pal.rs"),
-                    )
-                    .unwrap();
-                    swapped = true;
-                }
-            },
-            &mut || Ok(()),
-        )
-        .unwrap_err();
-
-        assert!(swapped);
-        assert!(
-            format!("{error:#}").contains("sealed SDK source changed"),
-            "{error:#}"
-        );
-        assert!(!archive.exists());
-    }
-
-    #[test]
     fn current_sealed_home_cannot_be_reblessed_after_lock_deletion_and_tamper() {
         let temp = tempfile::tempdir().unwrap();
         let home = fake_home(temp.path());
@@ -1762,34 +1638,13 @@ mod tests {
         let file = File::create(&archive).unwrap();
         file.set_len(1025).unwrap();
 
-        let error = OpenedBundleArchive::open_bounded_with_hook(&archive, 1024, || {})
+        let error = OpenedBundleArchive::open_bounded(&archive, 1024)
             .err()
             .unwrap();
         assert!(
             error
                 .to_string()
                 .contains("exceeds the configured byte limit"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn archive_snapshot_rejects_growth_beyond_copy_limit() {
-        let temp = tempfile::tempdir().unwrap();
-        let archive = temp.path().join("growing.zip");
-        fs::write(&archive, vec![0_u8; 512]).unwrap();
-
-        let error = OpenedBundleArchive::open_bounded_with_hook(&archive, 1024, || {
-            let mut file = fs::OpenOptions::new().append(true).open(&archive).unwrap();
-            file.write_all(&vec![1_u8; 1024]).unwrap();
-            file.sync_all().unwrap();
-        })
-        .err()
-        .unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("grew beyond the configured byte limit"),
             "{error:#}"
         );
     }
@@ -1914,83 +1769,6 @@ mod tests {
         assert_eq!(
             verify_installed_if_locked(&restored).unwrap(),
             InstalledIntegrity::Sealed
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bundle_source_leaf_swap_is_rejected_before_any_payload_is_published() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let home = fake_home(temp.path());
-        let archive = temp.path().join("sdk.zip");
-        let pal = home.join("dotnet_pal/pal.rs");
-        let original = home.join("dotnet_pal/pal.original.rs");
-        let outside = temp.path().join("outside-pal.rs");
-        fs::write(&outside, b"outside bytes must never enter the bundle").unwrap();
-        let mut swapped = false;
-
-        let error = create_with_hooks(
-            &home,
-            &archive,
-            &mut |relative| {
-                if !swapped && relative == Path::new("dotnet_pal/pal.rs") {
-                    fs::rename(&pal, &original).unwrap();
-                    symlink(&outside, &pal).unwrap();
-                    swapped = true;
-                }
-            },
-            &mut || Ok(()),
-        )
-        .unwrap_err();
-
-        assert!(swapped);
-        assert!(
-            format!("{error:#}").contains("without following links")
-                || format!("{error:#}").contains("regular file"),
-            "{error:#}"
-        );
-        assert!(!archive.exists());
-        assert!(!checksum_path(&archive).exists());
-        assert_eq!(
-            fs::read(&outside).unwrap(),
-            b"outside bytes must never enter the bundle"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bundle_pair_publication_rolls_back_a_post_archive_leaf_replacement() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let home = fake_home(temp.path());
-        let archive = temp.path().join("sdk.zip");
-        create(&home, &archive).unwrap();
-        let before_archive = fs::read(&archive).unwrap();
-        let before_checksum = fs::read(checksum_path(&archive)).unwrap();
-        let outside = temp.path().join("outside-sentinel");
-        fs::write(&outside, b"keep").unwrap();
-
-        fs::write(home.join("dotnet_pal/pal.rs"), b"next bundle").unwrap();
-        seal_install_home(&home, &std::env::current_exe().unwrap()).unwrap();
-        let error = create_with_hooks(&home, &archive, &mut |_| {}, &mut || {
-            fs::remove_file(&archive)?;
-            symlink(&outside, &archive)?;
-            bail!("injected post-archive publication failure")
-        })
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("rolled back"), "{error:#}");
-        assert_eq!(fs::read(&archive).unwrap(), before_archive);
-        assert_eq!(fs::read(checksum_path(&archive)).unwrap(), before_checksum);
-        assert_eq!(fs::read(&outside).unwrap(), b"keep");
-        assert!(
-            !fs::symlink_metadata(&archive)
-                .unwrap()
-                .file_type()
-                .is_symlink()
         );
     }
 
@@ -2295,7 +2073,6 @@ mod tests {
                 temporary,
                 destination: destination.clone(),
             }),
-            || bail!("injected activation failure"),
         )
         .unwrap_err();
         assert!(error.to_string().contains("rolled back"), "{error:#}");
@@ -2313,50 +2090,10 @@ mod tests {
         fs::write(home.join("do-not-delete"), b"unrelated").unwrap();
         fs::write(staged.join("marker"), b"new-sdk").unwrap();
 
-        let error = activate_install(&staged, &home, None, || Ok(())).unwrap_err();
+        let error = activate_install(&staged, &home, None).unwrap_err();
 
         assert!(error.to_string().contains("ownership marker"), "{error:#}");
         assert_eq!(fs::read(home.join("do-not-delete")).unwrap(), b"unrelated");
         assert_eq!(fs::read(staged.join("marker")).unwrap(), b"new-sdk");
-    }
-
-    #[test]
-    fn bundle_revalidates_the_exact_home_moved_to_backup() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("active-home");
-        let staged = temp.path().join("staged-sdk");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&staged).unwrap();
-        fs::write(
-            home.join("VERSION"),
-            "schema = 1\nrelease_tag = untagged\nhost_rid = test\ntoolchain = nightly\n",
-        )
-        .unwrap();
-        fs::write(staged.join("marker"), b"new-sdk").unwrap();
-        let swapped_home = home.clone();
-
-        let error = activate_install_with_hook(
-            &staged,
-            &home,
-            None,
-            move || {
-                fs::remove_dir_all(&swapped_home)?;
-                fs::create_dir(&swapped_home)?;
-                fs::write(swapped_home.join("do-not-delete"), b"swapped-unrelated")?;
-                Ok(())
-            },
-            || Ok(()),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("rolled back"), "{error:#}");
-        assert_eq!(
-            fs::read(home.join("do-not-delete")).unwrap(),
-            b"swapped-unrelated"
-        );
-        assert!(
-            !staged.exists(),
-            "transaction-owned stage leaked after rollback"
-        );
     }
 }

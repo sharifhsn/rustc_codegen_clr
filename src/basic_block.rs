@@ -4,7 +4,7 @@ use rustc_middle::mir::{BasicBlock, BasicBlockData};
 use rustc_middle::mir::{Terminator, UnwindAction, UnwindTerminateReason};
 use rustc_middle::{
     mir::{BasicBlocks, Body, TerminatorKind},
-    ty::{Instance, InstanceKind, TyCtxt},
+    ty::{Instance, TyCtxt},
 };
 
 /// True if `term` is a `Call` whose callee is one of the "magic" interop fns
@@ -146,7 +146,7 @@ fn simplify_handler<'tcx>(
             let ty = monomorphize(method_instance, place.ty(method, tcx).ty, tcx);
 
             let drop_instance = Instance::resolve_drop_glue(tcx, ty);
-            if let InstanceKind::DropGlue(_, None) = drop_instance.def {
+            if crate::terminator::drop_glue_is_noop(drop_instance, tcx) {
                 //Empty drop, nothing needs to happen.
                 simplify_handler(Some(target.as_u32()), blocks, tcx, method_instance, method)
             } else {

@@ -11,7 +11,7 @@ FROM debian:bookworm-slim
 
 # Pin the nightly so the image is reproducible. This was the *latest* nightly on
 # 2026-06-17. To track a newer nightly: bump this and fix any fresh API drift.
-ARG NIGHTLY=nightly-2026-06-17
+ARG NIGHTLY=nightly-2026-09-18
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/root/.cargo/bin:/usr/share/dotnet:$PATH \

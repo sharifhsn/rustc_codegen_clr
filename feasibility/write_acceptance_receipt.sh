@@ -39,7 +39,7 @@ else
     dirty=false
 fi
 
-rustc_version="$(rustc +nightly-2026-06-17 --version 2>&1 || true)"
+rustc_version="$(rustc +nightly-2026-09-18 --version 2>&1 || true)"
 dotnet_version="$(dotnet --version 2>&1 || true)"
 host_os="$(uname -s)"
 host_arch="$(uname -m)"

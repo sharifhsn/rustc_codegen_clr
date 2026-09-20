@@ -30,13 +30,11 @@ pub fn handle_statement<'tcx>(
             let owner = ctx.type_from_cache(owner_ty);
 
             let layout = ctx.layout_of(owner_ty);
-            //let (disrc_type, _) = adt::enum_tag_info(&layout.layout, tcx);
             let cilly::Type::ClassRef(owner) = owner else {
                 panic!(
                     "Nonsense operation: attempted to set the discriminant of type {owner_ty:?}, which is not valid."
                 );
             };
-            //ops.push();
 
             let addr = place_address(place, ctx);
             let root = set_discr(layout.layout, *variant_index, addr, owner, owner_ty, ctx);

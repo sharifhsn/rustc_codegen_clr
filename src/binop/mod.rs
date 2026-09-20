@@ -9,7 +9,7 @@ use cilly::{
     {Float, Int},
 };
 use cmp::{eq_unchecked, gt_unchecked, lt_unchecked, ne_unchecked};
-use rustc_hir::lang_items::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::{
     mir::{BinOp, Operand},
     ty::{FloatTy, IntTy, List, Ty, TyKind, UintTy},
@@ -22,6 +22,16 @@ pub mod cmp;
 pub mod shift;
 
 type Node = Interned<cilly::ir::CILNode>;
+
+fn typed_binary_call<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    name: &str,
+    tpe: Type,
+    lhs: Node,
+    rhs: Node,
+) -> Node {
+    ctx.call_static(name, [tpe, tpe], tpe, &[lhs, rhs])
+}
 
 /// Preforms an unchecked binary operation.
 pub(crate) fn binop<'tcx>(
@@ -75,6 +85,15 @@ pub(crate) fn binop<'tcx>(
                 let f = ctx.alloc_node(false);
                 ctx.biop(lt, f, V2BinOp::Eq)
             }
+            TyKind::Float(FloatTy::F16) => {
+                // `System.Half.op_GreaterThan` is ordered and returns false for NaN.  Taking its
+                // complement (the generic fallback below) would therefore make `NaN >= x` true.
+                // Rust's ordered comparison is `(a > b) || (a == b)`; both terms stay false for
+                // NaN and preserve the correct signed-zero equality behavior.
+                let gt = gt_unchecked(ty_a, ops_a, ops_b, ctx);
+                let eq = eq_unchecked(ty_a, ops_a, ops_b, ctx);
+                ctx.biop(gt, eq, V2BinOp::Or)
+            }
             TyKind::Float(FloatTy::F128) => ctx.call_static(
                 "__getf2",
                 [Type::Float(Float::F128), Type::Float(Float::F128)],
@@ -93,6 +112,13 @@ pub(crate) fn binop<'tcx>(
                 let gt = ctx.biop(ops_a, ops_b, V2BinOp::GtUn);
                 let f = ctx.alloc_node(false);
                 ctx.biop(gt, f, V2BinOp::Eq)
+            }
+            TyKind::Float(FloatTy::F16) => {
+                // As above, express `<=` as the ordered `<` or `==` relation instead of
+                // complementing Half's ordered `>` result (which would incorrectly accept NaN).
+                let lt = lt_unchecked(ty_a, ops_a, ops_b, ctx);
+                let eq = eq_unchecked(ty_a, ops_a, ops_b, ctx);
+                ctx.biop(lt, eq, V2BinOp::Or)
             }
             TyKind::Float(FloatTy::F128) => ctx.call_static(
                 "__letf2",
@@ -148,37 +174,32 @@ pub(crate) fn binop<'tcx>(
         }
     }
 }
-/// Preforms unchecked addition
-pub fn add_unchecked<'tcx>(
+fn arithmetic_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
     ty_b: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     ops_a: Node,
     ops_b: Node,
+    add: bool,
 ) -> Node {
+    let (op, i128_name, u128_name, f128_name, f16_name) = if add {
+        (V2BinOp::Add, "add_i128", "add_u128", "__addtf3", "add_f16")
+    } else {
+        (V2BinOp::Sub, "sub_i128", "sub_u128", "__subtf3", "sub_f16")
+    };
     match ty_a.kind() {
         TyKind::Int(int_ty) => {
             if let IntTy::I128 = int_ty {
-                ctx.call_static(
-                    "add_i128",
-                    [Type::Int(Int::I128), Type::Int(Int::I128)],
-                    Type::Int(Int::I128),
-                    &[ops_a, ops_b],
-                )
+                typed_binary_call(ctx, i128_name, Type::Int(Int::I128), ops_a, ops_b)
             } else {
-                ctx.biop(ops_a, ops_b, V2BinOp::Add)
+                ctx.biop(ops_a, ops_b, op)
             }
         }
         TyKind::Uint(uint_ty) => {
             if let UintTy::U128 = uint_ty {
-                ctx.call_static(
-                    "add_u128",
-                    [Type::Int(Int::U128), Type::Int(Int::U128)],
-                    Type::Int(Int::U128),
-                    &[ops_a, ops_b],
-                )
-            } else {
-                let sum = ctx.biop(ops_a, ops_b, V2BinOp::Add);
+                typed_binary_call(ctx, u128_name, Type::Int(Int::U128), ops_a, ops_b)
+            } else if add {
+                let sum = ctx.biop(ops_a, ops_b, op);
                 match uint_ty {
                     UintTy::U8 => ctx.int_cast(sum, Int::U8, ExtendKind::ZeroExtend),
                     UintTy::U16 => ctx.int_cast(sum, Int::U16, ExtendKind::ZeroExtend),
@@ -186,25 +207,33 @@ pub fn add_unchecked<'tcx>(
                     UintTy::U64 => ctx.int_cast(sum, Int::U64, ExtendKind::ZeroExtend),
                     _ => sum,
                 }
+            } else {
+                ctx.biop(ops_a, ops_b, op)
             }
         }
-        TyKind::Float(FloatTy::F32 | FloatTy::F64) => ctx.biop(ops_a, ops_b, V2BinOp::Add),
-        TyKind::Float(FloatTy::F128) => ctx.call_static(
-            "__addtf3",
-            [Type::Float(Float::F128), Type::Float(Float::F128)],
-            Type::Float(Float::F128),
-            &[ops_a, ops_b],
-        ),
-        TyKind::Float(FloatTy::F16) => ctx.call_static(
-            "add_f16",
-            [Type::Float(Float::F16), Type::Float(Float::F16)],
-            Type::Float(Float::F16),
-            &[ops_a, ops_b],
-        ),
+        TyKind::Float(FloatTy::F32 | FloatTy::F64) => ctx.biop(ops_a, ops_b, op),
+        TyKind::Float(FloatTy::F128) => {
+            typed_binary_call(ctx, f128_name, Type::Float(Float::F128), ops_a, ops_b)
+        }
+        TyKind::Float(FloatTy::F16) => {
+            typed_binary_call(ctx, f16_name, Type::Float(Float::F16), ops_a, ops_b)
+        }
         _ => todo!("can't add numbers of types {ty_a} and {ty_b}"),
     }
 }
-/// Preforms unchecked subtraction
+
+/// Performs unchecked addition.
+pub fn add_unchecked<'tcx>(
+    ty_a: Ty<'tcx>,
+    ty_b: Ty<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    ops_a: Node,
+    ops_b: Node,
+) -> Node {
+    arithmetic_unchecked(ty_a, ty_b, ctx, ops_a, ops_b, true)
+}
+
+/// Performs unchecked subtraction.
 pub fn sub_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
     ty_b: Ty<'tcx>,
@@ -212,46 +241,7 @@ pub fn sub_unchecked<'tcx>(
     ops_a: Node,
     ops_b: Node,
 ) -> Node {
-    match ty_a.kind() {
-        TyKind::Int(int_ty) => {
-            if let IntTy::I128 = int_ty {
-                ctx.call_static(
-                    "sub_i128",
-                    [Type::Int(Int::I128), Type::Int(Int::I128)],
-                    Type::Int(Int::I128),
-                    &[ops_a, ops_b],
-                )
-            } else {
-                ctx.biop(ops_a, ops_b, V2BinOp::Sub)
-            }
-        }
-        TyKind::Uint(uint_ty) => {
-            if let UintTy::U128 = uint_ty {
-                ctx.call_static(
-                    "sub_u128",
-                    [Type::Int(Int::U128), Type::Int(Int::U128)],
-                    Type::Int(Int::U128),
-                    &[ops_a, ops_b],
-                )
-            } else {
-                ctx.biop(ops_a, ops_b, V2BinOp::Sub)
-            }
-        }
-        TyKind::Float(FloatTy::F32 | FloatTy::F64) => ctx.biop(ops_a, ops_b, V2BinOp::Sub),
-        TyKind::Float(FloatTy::F128) => ctx.call_static(
-            "__subtf3",
-            [Type::Float(Float::F128), Type::Float(Float::F128)],
-            Type::Float(Float::F128),
-            &[ops_a, ops_b],
-        ),
-        TyKind::Float(FloatTy::F16) => ctx.call_static(
-            "sub_f16",
-            [Type::Float(Float::F16), Type::Float(Float::F16)],
-            Type::Float(Float::F16),
-            &[ops_a, ops_b],
-        ),
-        _ => todo!("can't sub numbers of types {ty_a} and {ty_b}"),
-    }
+    arithmetic_unchecked(ty_a, ty_b, ctx, ops_a, ops_b, false)
 }
 
 fn rem_unchecked<'tcx>(
@@ -262,110 +252,92 @@ fn rem_unchecked<'tcx>(
     ops_b: Node,
 ) -> Node {
     match ty_a.kind() {
-        TyKind::Int(IntTy::I128) => ctx.call_static(
-            "mod_i128",
-            [Type::Int(Int::I128), Type::Int(Int::I128)],
-            Type::Int(Int::I128),
-            &[ops_a, ops_b],
-        ),
-        TyKind::Uint(UintTy::U128) => ctx.call_static(
-            "mod_u128",
-            [Type::Int(Int::U128), Type::Int(Int::U128)],
-            Type::Int(Int::U128),
-            &[ops_a, ops_b],
-        ),
+        TyKind::Int(IntTy::I128) => {
+            typed_binary_call(ctx, "mod_i128", Type::Int(Int::I128), ops_a, ops_b)
+        }
+        TyKind::Uint(UintTy::U128) => {
+            typed_binary_call(ctx, "mod_u128", Type::Int(Int::U128), ops_a, ops_b)
+        }
         TyKind::Int(_) | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
             ctx.biop(ops_a, ops_b, V2BinOp::Rem)
         }
-        TyKind::Float(FloatTy::F128) => ctx.call_static(
-            "fmodl",
-            [Type::Float(Float::F128), Type::Float(Float::F128)],
-            Type::Float(Float::F128),
-            &[ops_a, ops_b],
-        ),
-        TyKind::Float(FloatTy::F16) => ctx.call_static(
-            "mod_f16",
-            [Type::Float(Float::F16), Type::Float(Float::F16)],
-            Type::Float(Float::F16),
-            &[ops_a, ops_b],
-        ),
+        TyKind::Float(FloatTy::F128) => {
+            typed_binary_call(ctx, "fmodl", Type::Float(Float::F128), ops_a, ops_b)
+        }
+        TyKind::Float(FloatTy::F16) => {
+            typed_binary_call(ctx, "mod_f16", Type::Float(Float::F16), ops_a, ops_b)
+        }
         TyKind::Uint(_) => ctx.biop(ops_a, ops_b, V2BinOp::RemUn),
 
         _ => todo!(),
     }
 }
 
-fn mul_unchecked<'tcx>(
+fn mul_div_unchecked<'tcx>(
     ty_a: Ty<'tcx>,
-
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     operand_a: Node,
     operand_b: Node,
+    divide: bool,
 ) -> Node {
-    match ty_a.kind() {
-        TyKind::Int(IntTy::I128) => ctx.call_static(
-            "mul_i128",
-            [Type::Int(Int::I128), Type::Int(Int::I128)],
-            Type::Int(Int::I128),
-            &[operand_a, operand_b],
-        ),
-        TyKind::Uint(UintTy::U128) => ctx.call_static(
-            "mul_u128",
-            [Type::Int(Int::U128), Type::Int(Int::U128)],
-            Type::Int(Int::U128),
-            &[operand_a, operand_b],
-        ),
-        TyKind::Float(FloatTy::F128) => ctx.call_static(
-            "__multf3",
-            [Type::Float(Float::F128), Type::Float(Float::F128)],
-            Type::Float(Float::F128),
-            &[operand_a, operand_b],
-        ),
-        TyKind::Float(FloatTy::F16) => ctx.call_static(
-            "mul_f16",
-            [Type::Float(Float::F16), Type::Float(Float::F16)],
-            Type::Float(Float::F16),
-            &[operand_a, operand_b],
-        ),
-        _ => ctx.biop(operand_a, operand_b, V2BinOp::Mul),
-    }
-}
-fn div_unchecked<'tcx>(
-    ty_a: Ty<'tcx>,
-
-    ctx: &mut MethodCompileCtx<'tcx, '_>,
-    operand_a: Node,
-    operand_b: Node,
-) -> Node {
-    match ty_a.kind() {
-        TyKind::Int(IntTy::I128) => ctx.call_static(
+    let (i128_name, u128_name, f128_name, f16_name, signed_op, unsigned_op) = if divide {
+        (
             "div_i128",
-            [Type::Int(Int::I128), Type::Int(Int::I128)],
-            Type::Int(Int::I128),
-            &[operand_a, operand_b],
-        ),
-        TyKind::Uint(UintTy::U128) => ctx.call_static(
             "div_u128",
-            [Type::Int(Int::U128), Type::Int(Int::U128)],
-            Type::Int(Int::U128),
-            &[operand_a, operand_b],
-        ),
-        TyKind::Uint(_) => ctx.biop(operand_a, operand_b, V2BinOp::DivUn),
-        TyKind::Int(_) | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
-            ctx.biop(operand_a, operand_b, V2BinOp::Div)
-        }
-        TyKind::Float(FloatTy::F128) => ctx.call_static(
             "__divtf3",
-            [Type::Float(Float::F128), Type::Float(Float::F128)],
-            Type::Float(Float::F128),
-            &[operand_a, operand_b],
-        ),
-        TyKind::Float(FloatTy::F16) => ctx.call_static(
             "div_f16",
-            [Type::Float(Float::F16), Type::Float(Float::F16)],
-            Type::Float(Float::F16),
-            &[operand_a, operand_b],
+            V2BinOp::Div,
+            V2BinOp::DivUn,
+        )
+    } else {
+        (
+            "mul_i128",
+            "mul_u128",
+            "__multf3",
+            "mul_f16",
+            V2BinOp::Mul,
+            V2BinOp::Mul,
+        )
+    };
+    match ty_a.kind() {
+        TyKind::Int(IntTy::I128) => {
+            typed_binary_call(ctx, i128_name, Type::Int(Int::I128), operand_a, operand_b)
+        }
+        TyKind::Uint(UintTy::U128) => {
+            typed_binary_call(ctx, u128_name, Type::Int(Int::U128), operand_a, operand_b)
+        }
+        TyKind::Uint(_) => ctx.biop(operand_a, operand_b, unsigned_op),
+        TyKind::Int(_) | TyKind::Char | TyKind::Float(FloatTy::F32 | FloatTy::F64) => {
+            ctx.biop(operand_a, operand_b, signed_op)
+        }
+        TyKind::Float(FloatTy::F128) => typed_binary_call(
+            ctx,
+            f128_name,
+            Type::Float(Float::F128),
+            operand_a,
+            operand_b,
         ),
+        TyKind::Float(FloatTy::F16) => {
+            typed_binary_call(ctx, f16_name, Type::Float(Float::F16), operand_a, operand_b)
+        }
         _ => todo!(),
     }
+}
+
+fn mul_unchecked<'tcx>(
+    ty_a: Ty<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    operand_a: Node,
+    operand_b: Node,
+) -> Node {
+    mul_div_unchecked(ty_a, ctx, operand_a, operand_b, false)
+}
+
+fn div_unchecked<'tcx>(
+    ty_a: Ty<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    operand_a: Node,
+    operand_b: Node,
+) -> Node {
+    mul_div_unchecked(ty_a, ctx, operand_a, operand_b, true)
 }

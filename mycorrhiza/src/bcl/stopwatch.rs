@@ -39,6 +39,7 @@
 //! [`elapsed_millis`](Stopwatch::elapsed_millis) or [`elapsed`](Stopwatch::elapsed) for a portable
 //! duration; reach for `elapsed_ticks` only when you also know the platform frequency.
 
+use crate::managed_option::ManagedRef;
 use crate::system::MString;
 
 /// The raw managed-handle alias for `System.Diagnostics.Stopwatch` (impl assembly
@@ -52,27 +53,30 @@ pub type MStopwatch = crate::intrinsics::RustcCLRInteropManagedClass<
 
 /// A managed `System.Diagnostics.Stopwatch`. See the [module docs](self).
 ///
-/// A plain handle to a managed stopwatch (the .NET GC owns the object, so there is no `Drop`).
+/// A move-only, `GCHandle`-rooted owner of a managed stopwatch. Its Rust representation contains no
+/// naked CLR reference and is therefore safe to retain in ordinary Rust storage.
 /// Construct it stopped with [`Stopwatch::new`] or already-running with [`Stopwatch::start_new`],
 /// then query the elapsed time as it runs or after [`stop`](Stopwatch::stop). The mutating methods
 /// take `&self` because they mutate the *managed* object, not the Rust handle.
-#[derive(Clone, Copy)]
 #[repr(transparent)]
-pub struct Stopwatch(MStopwatch);
+pub struct Stopwatch(ManagedRef<MStopwatch>);
 
 impl Stopwatch {
     /// `new Stopwatch()` — a fresh, **stopped**, zeroed stopwatch. Call [`start`](Stopwatch::start)
     /// to begin measuring.
     #[inline(always)]
     pub fn new() -> Self {
-        Stopwatch(MStopwatch::ctor0())
+        Stopwatch(ManagedRef::from_raw(MStopwatch::ctor0()))
     }
 
     /// `Stopwatch.StartNew()` — a fresh stopwatch that is **already running** (the idiomatic way to
     /// begin a measurement).
     #[inline(always)]
     pub fn start_new() -> Self {
-        Stopwatch(MStopwatch::static0::<"StartNew", MStopwatch>())
+        Stopwatch(ManagedRef::from_raw(MStopwatch::static0::<
+            "StartNew",
+            MStopwatch,
+        >()))
     }
 
     /// The current high-resolution timestamp counter value (`Stopwatch.GetTimestamp()`) — a raw tick
@@ -86,57 +90,62 @@ impl Stopwatch {
     /// Wrap an existing managed `Stopwatch` handle (e.g. one returned by another BCL call).
     #[inline(always)]
     pub fn from_handle(h: MStopwatch) -> Self {
-        Stopwatch(h)
+        Stopwatch(ManagedRef::from_raw(h))
     }
 
-    /// The underlying managed handle, for lower-level BCL calls.
+    /// Copy out the underlying managed handle for an immediate lower-level BCL call.
+    ///
+    /// The returned naked reference is kept alive by `self`; do not retain it in Rust-owned
+    /// storage or use it after `self` is dropped.
     #[inline(always)]
-    pub fn handle(self) -> MStopwatch {
-        self.0
+    pub fn handle(&self) -> MStopwatch {
+        self.0.copy_raw()
     }
 
     /// Start (or resume) measuring elapsed time (`Stopwatch.Start`). A no-op if already running.
     #[inline(always)]
     pub fn start(&self) {
-        self.0.instance0::<"Start", ()>()
+        self.0.copy_raw().instance0::<"Start", ()>()
     }
 
     /// Stop measuring elapsed time (`Stopwatch.Stop`). The accumulated elapsed time is retained, so a
     /// later [`start`](Stopwatch::start) resumes from where it left off.
     #[inline(always)]
     pub fn stop(&self) {
-        self.0.instance0::<"Stop", ()>()
+        self.0.copy_raw().instance0::<"Stop", ()>()
     }
 
     /// Stop and zero the elapsed time (`Stopwatch.Reset`).
     #[inline(always)]
     pub fn reset(&self) {
-        self.0.instance0::<"Reset", ()>()
+        self.0.copy_raw().instance0::<"Reset", ()>()
     }
 
     /// Zero the elapsed time and start measuring again from zero (`Stopwatch.Restart`).
     #[inline(always)]
     pub fn restart(&self) {
-        self.0.instance0::<"Restart", ()>()
+        self.0.copy_raw().instance0::<"Restart", ()>()
     }
 
     /// Whether the stopwatch is currently running (`Stopwatch.IsRunning`).
     #[inline(always)]
     pub fn is_running(&self) -> bool {
-        self.0.instance0::<"get_IsRunning", bool>()
+        self.0.copy_raw().instance0::<"get_IsRunning", bool>()
     }
 
     /// Total elapsed time in whole milliseconds (`Stopwatch.ElapsedMilliseconds`).
     #[inline(always)]
     pub fn elapsed_millis(&self) -> i64 {
-        self.0.instance0::<"get_ElapsedMilliseconds", i64>()
+        self.0
+            .copy_raw()
+            .instance0::<"get_ElapsedMilliseconds", i64>()
     }
 
     /// Total elapsed time in raw **Stopwatch** ticks (`Stopwatch.ElapsedTicks`). These are *not*
     /// 100-nanosecond ticks — their length depends on the platform frequency (see the module docs).
     #[inline(always)]
     pub fn elapsed_ticks(&self) -> i64 {
-        self.0.instance0::<"get_ElapsedTicks", i64>()
+        self.0.copy_raw().instance0::<"get_ElapsedTicks", i64>()
     }
 
     /// Total elapsed time as a [`std::time::Duration`], at **millisecond** resolution (derived from
@@ -150,8 +159,8 @@ impl Stopwatch {
     /// The managed `ToString()` of the underlying object, as an idiomatic Rust [`String`] (the
     /// elapsed `TimeSpan`'s textual form, e.g. `"00:00:01.2340000"`).
     #[inline(always)]
-    pub fn to_rust_string(self) -> std::string::String {
-        crate::system::DotNetString::from_handle(self.0.to_mstring()).to_rust_string()
+    pub fn to_rust_string(&self) -> std::string::String {
+        crate::system::DotNetString::from_handle(self.0.copy_raw().to_mstring()).to_rust_string()
     }
 }
 
@@ -165,7 +174,7 @@ impl Default for Stopwatch {
 impl core::fmt::Display for Stopwatch {
     /// Formats via the managed `Stopwatch.ToString()` (the elapsed `TimeSpan`'s textual form).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let s: MString = self.0.to_mstring();
+        let s: MString = self.0.copy_raw().to_mstring();
         core::fmt::Display::fmt(&crate::system::DotNetString::from_handle(s), f)
     }
 }

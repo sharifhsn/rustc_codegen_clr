@@ -20,7 +20,7 @@ hash_file() {
     fi
 }
 
-ambient_library="$(rustc +nightly-2026-06-17 --print sysroot)/lib/rustlib/src/rust/library"
+ambient_library="$(rustc +nightly-2026-09-18 --print sysroot)/lib/rustlib/src/rust/library"
 rust_src_probe="$ambient_library/std/src/lib.rs"
 registry_probe="$(find "$HOME/.cargo/registry/src" -path '*/libc-*/src/lib.rs' -type f 2>/dev/null | LC_ALL=C sort | tail -1)"
 rust_before="$(hash_file "$rust_src_probe")"

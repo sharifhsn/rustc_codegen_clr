@@ -24,7 +24,7 @@ impl BuildLock {
         Self::acquire_scope_with(scope, false)
     }
 
-    /// Observe one mutable SDK-owned resource without crossing an in-progress transaction.
+    /// Observe one mutable SDK-owned resource without crossing an in-progress writer.
     pub fn acquire_scope_shared(scope: &str) -> Result<Self> {
         Self::acquire_scope_with(scope, true)
     }
@@ -51,14 +51,6 @@ impl BuildLock {
                 .with_context(|| format!("lock cargo-dotnet build lock {}", path.display()))?;
         }
         Ok(Self { file })
-    }
-
-    /// Convert an exclusive recovery lock into a shared reader lease. The unlock/relock window is
-    /// intentional; callers must re-check their recovery marker after this returns before reading.
-    pub(crate) fn downgrade_to_shared(self) -> Result<Self> {
-        FileExt::unlock(&self.file).context("unlock cargo-dotnet build lock for downgrade")?;
-        FileExt::lock_shared(&self.file).context("share cargo-dotnet build lock after recovery")?;
-        Ok(self)
     }
 }
 

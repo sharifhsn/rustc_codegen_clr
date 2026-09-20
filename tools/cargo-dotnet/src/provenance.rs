@@ -111,6 +111,7 @@ pub fn artifact_provenance(receipt: &Path) -> Result<Vec<u8>> {
         "dotnet",
         "toolchain",
         "cargo_arguments",
+        "test_target",
         "pal_tree_sha256",
         "overlays_tree_sha256",
         "managed_identity",
@@ -141,7 +142,11 @@ fn strip_paths(value: &Value) -> Value {
         Value::Object(object) => Value::Object(
             object
                 .iter()
-                .filter(|(key, _)| key.as_str() != "path" && key.as_str() != "cargo_home")
+                .filter(|(key, _)| {
+                    key.as_str() != "path"
+                        && key.as_str() != "cargo_home"
+                        && key.as_str() != "target_dir"
+                })
                 .map(|(key, value)| (key.clone(), strip_paths(value)))
                 .collect(),
         ),
@@ -229,6 +234,30 @@ mod tests {
         fs::write(&path, br#"{"schema":1,"artifact":{"path":"/private/build/a.dll","sha256":"abc","bytes":3},"cargo_home":"/private/cargo"}"#).unwrap();
         let projected = artifact_provenance(&path).unwrap();
         assert!(!String::from_utf8(projected).unwrap().contains("/private/"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn artifact_projection_preserves_test_target_identity_without_target_dir() {
+        let path = std::env::temp_dir().join(format!(
+            "cargo-dotnet-provenance-test-target-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            br#"{"schema":2,"test_target":{"selector":"--test=coretests","package_id":"registry+https://example.invalid/index#coretests@0.0.0","artifact_name":"coretests","artifact_kind":["test"],"target_dir":"/private/target","locked":true,"cargo_lock_sha256":"abc"}}"#,
+        )
+        .unwrap();
+        let projected: Value =
+            serde_json::from_slice(&artifact_provenance(&path).unwrap()).unwrap();
+        let test_target = &projected["test_target"];
+        assert_eq!(test_target["selector"], "--test=coretests");
+        assert_eq!(
+            test_target["package_id"],
+            "registry+https://example.invalid/index#coretests@0.0.0"
+        );
+        assert_eq!(test_target["artifact_name"], "coretests");
+        assert!(test_target.get("target_dir").is_none());
         let _ = fs::remove_file(path);
     }
 }

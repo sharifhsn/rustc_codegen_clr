@@ -43,15 +43,10 @@ pub fn find_enclosing_function(asm: &mut Assembly, patcher: &mut MissingMethodPa
     );
 }
 
-/// Registers the managed fallback for libunwind's canonical-frame-address accessor.
-///
-/// The only pinned-`std` caller uses this to copy the stack pointer out of a native
-/// `_Unwind_Context`. The managed `_Unwind_Backtrace` capability never constructs or exposes such
-/// a context, so zero is the only truthful value: no native stack pointer is available.
-pub fn get_cfa(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+fn unavailable(asm: &mut Assembly, patcher: &mut MissingMethodPatcher, service: RuntimeService) {
     patcher.insert_runtime_service(
         asm,
-        RuntimeService::UnwindGetCfa,
+        service,
         Box::new(|_, asm| {
             let unavailable = asm.alloc_node(Const::USize(0));
             let ret = asm.alloc_root(CILRoot::Ret(unavailable));
@@ -63,24 +58,22 @@ pub fn get_cfa(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     );
 }
 
+/// Registers the managed fallback for libunwind's canonical-frame-address accessor.
+///
+/// The only pinned-`std` caller uses this to copy the stack pointer out of a native
+/// `_Unwind_Context`. The managed `_Unwind_Backtrace` capability never constructs or exposes such
+/// a context, so zero is the only truthful value: no native stack pointer is available.
+pub fn get_cfa(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
+    unavailable(asm, patcher, RuntimeService::UnwindGetCfa);
+}
+
 /// Registers the managed fallback for libunwind's instruction-pointer accessor.
 ///
 /// The only pinned-`std` caller reads a return address from a native `_Unwind_Context`. The managed
 /// `_Unwind_Backtrace` capability never constructs or exposes such a context, so zero truthfully
 /// reports that no native instruction pointer is available.
 pub fn get_ip(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    patcher.insert_runtime_service(
-        asm,
-        RuntimeService::UnwindGetIp,
-        Box::new(|_, asm| {
-            let unavailable = asm.alloc_node(Const::USize(0));
-            let ret = asm.alloc_root(CILRoot::Ret(unavailable));
-            MethodImpl::MethodBody {
-                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-                locals: vec![],
-            }
-        }),
-    );
+    unavailable(asm, patcher, RuntimeService::UnwindGetIp);
 }
 
 /// Registers the managed fallback for libunwind's native frame walker.

@@ -19,13 +19,13 @@ pub use crate::fn_ctx::MethodCompileCtx;
 use crate::fn_ctx::fn_name_for_instance;
 use crate::operand::static_data::{add_static, static_is_nested};
 use crate::r#type::{GetTypeExt, adt::field_descrptor, get_type};
-use rustc_hir::attrs::CrateType;
 use rustc_middle::{
     middle::codegen_fn_attrs::CodegenFnAttrFlags,
     mir::{Local, LocalDecl, Statement, Terminator, interpret::GlobalAlloc},
     mono::MonoItem,
     ty::{Instance, TyCtxt, TyKind},
 };
+use rustc_structures::CrateType;
 type LocalDefList = Vec<LocalDef>;
 type ArgsDebugInfo = Vec<Option<Interned<IString>>>;
 
@@ -248,35 +248,35 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // the monomorphized `instance_mir` is otherwise hard to obtain (library generics like
     // `Vec::<u32>::extend_with` are instantiated at codegen, not emitted by `--emit=mir`). Pairs with
     // `INSERT_MIR_DEBUG_COMMENTS=1` (which annotates the emitted CIL with these same statements).
-    if let Some(filter) = crate::config::current().dump_mir() {
-        if name.contains(filter) {
-            use std::fmt::Write as _;
-            use std::io::Write as _;
-            // APPEND to a file (default /tmp/dump_mir.txt, override DUMP_MIR_OUT) rather than stderr:
-            // cargo-dotnet codegens std/alloc in a discarded warm pass, so library generics like
-            // `Vec::<u32>::extend_with` would be lost from stderr. A file survives every pass.
-            let path = crate::config::current().dump_mir_out();
-            let mut out = format!("\n===DUMP_MIR_BEGIN {name}\n");
-            for (local, decl) in mir.local_decls.iter_enumerated() {
-                let _ = writeln!(out, "  let {local:?}: {:?};", decl.ty);
+    if let Some(filter) = crate::config::current().dump_mir()
+        && name.contains(filter)
+    {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        // APPEND to a file (default /tmp/dump_mir.txt, override DUMP_MIR_OUT) rather than stderr:
+        // cargo-dotnet codegens std/alloc in a discarded warm pass, so library generics like
+        // `Vec::<u32>::extend_with` would be lost from stderr. A file survives every pass.
+        let path = crate::config::current().dump_mir_out();
+        let mut out = format!("\n===DUMP_MIR_BEGIN {name}\n");
+        for (local, decl) in mir.local_decls.iter_enumerated() {
+            let _ = writeln!(out, "  let {local:?}: {:?};", decl.ty);
+        }
+        for (bb, data) in mir.basic_blocks.iter_enumerated() {
+            let _ = writeln!(out, "  {bb:?}:");
+            for stmt in &data.statements {
+                let _ = writeln!(out, "    {stmt:?};");
             }
-            for (bb, data) in mir.basic_blocks.iter_enumerated() {
-                let _ = writeln!(out, "  {bb:?}:");
-                for stmt in &data.statements {
-                    let _ = writeln!(out, "    {stmt:?};");
-                }
-                if let Some(term) = &data.terminator {
-                    let _ = writeln!(out, "    {:?};", term.kind);
-                }
+            if let Some(term) = &data.terminator {
+                let _ = writeln!(out, "    {:?};", term.kind);
             }
-            let _ = writeln!(out, "===DUMP_MIR_END {name}");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = f.write_all(out.as_bytes());
-            }
+        }
+        let _ = writeln!(out, "===DUMP_MIR_END {name}");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(out.as_bytes());
         }
     }
     let mut ctx = ctx.with_body(mir);
@@ -323,9 +323,6 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     crate::managed_storage::validate_body(ctx)?;
 
     let timer = ctx.tcx().prof.generic_activity_with_arg("codegen fn", name);
-    // Check if function is public or not.
-    // FIXME: figure out the source of the bug causing visibility to not be read propely.
-    // let access_modifier = Access::from_visibility(tcx.visibility(instance.def_id()));
     let attrs = ctx.tcx().codegen_fn_attrs(ctx.instance().def_id());
     // Only an explicit `#[unsafe(no_mangle)]` or `#[unsafe(export_name = "...")]` on the user's
     // crate authorizes a public managed export. rustc's broader `contains_extern_indicator()` also
@@ -378,6 +375,36 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     // Handle the function signature
     let abi = AbiPlan::from_instance(ctx.instance(), ctx);
     let sig = abi.signature().clone();
+
+    // The current core implementation uses a generic element-wise loop for
+    // `SlicePartialEq::equal_same_length` when the element type does not opt
+    // into `BytewiseEq`.  That is correct for ordinary values, but the unit
+    // specialization is a degenerate case: every element is equal and the
+    // official coretests intentionally compare slices with `usize::MAX`
+    // elements.  Lowering that loop literally would spend effectively
+    // forever visiting the same zero-sized value.  Keep this backend-owned
+    // specialization narrow (the exact monomorphization is visible in the
+    // demangled symbol) and return the contractually correct result directly.
+    let demangled = format!("{:#}", rustc_demangle::demangle(name));
+    if demangled.contains("<() as core::slice::cmp::SlicePartialEq<()>>::equal_same_length") {
+        let sig_idx = ctx.alloc_sig(sig.clone());
+        let true_value = ctx.alloc_node(cilly::Const::Bool(true));
+        let ret = ctx.alloc_root(CILRoot::Ret(true_value));
+        let method = MethodDef::new(
+            Access::Assembly,
+            cilly::class::ClassDefIdx(*ctx.main_module()),
+            ctx.alloc_string(name),
+            sig_idx,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            (0..sig.inputs().len()).map(|_| None).collect(),
+        );
+        ctx.new_method(method);
+        return Ok(());
+    }
 
     // Get locals
     let (arg_names, mut locals) =
@@ -543,10 +570,10 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
         );
         // A handler id past the last real MIR block is a synthetic terminate handler — record it so
         // the matching FailFast cleanup block is emitted below.
-        if let Some(h) = handler_id {
-            if h >= n_blocks {
-                used_terminate.insert(h);
-            }
+        if let Some(h) = handler_id
+            && h >= n_blocks
+        {
+            used_terminate.insert(h);
         }
         let block_id = u32::try_from(last_bb_id).unwrap();
         let bb = BasicBlock::new(trees, block_id, None);
@@ -558,7 +585,6 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
             }
             normal_bbs.push(bb);
         }
-        //ops.extend(trees.iter().flat_map(|tree| tree.flatten()))
     }
 
     // Materialize the synthetic terminate-handler cleanup blocks referenced by `UnwindAction::Terminate`
@@ -665,7 +691,6 @@ pub fn add_fn<'tcx, 'asm, 'a: 'asm>(
     ctx.new_method(method);
     drop(timer);
     Ok(())
-    //todo!("Can't add function")
 }
 /// This is used *ONLY* to catch uncaught errors.
 pub fn checked_add_fn<'a: 'c, 'b: 'c, 'c>(
@@ -673,19 +698,6 @@ pub fn checked_add_fn<'a: 'c, 'b: 'c, 'c>(
     name: &str,
 ) -> Result<(), CodegenError> {
     add_fn(name, ctx)
-    /*match std::panic::catch_unwind(add_fn) {
-        Ok(success) => success,
-        Err(payload) => {
-            if let Some(msg) = payload.downcast_ref::<&str>() {
-                eprintln!("could not compile method {name}. fn_add panicked with unhandled message: {msg:?}");
-                //self.add_method(Method::missing_because(format!("could not compile method {name}. fn_add panicked with unhandled message: {msg:?}")));
-                Ok(())
-            } else {
-                eprintln!("could not compile method {name}. fn_add panicked with no message.");
-                Ok(())
-            }
-        }
-    }*/
 }
 /// Adds a MIR item (method,inline assembly code, etc.) to the assembly.
 #[allow(clippy::similar_names)]

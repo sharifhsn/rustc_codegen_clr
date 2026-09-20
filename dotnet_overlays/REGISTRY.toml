@@ -24,8 +24,9 @@
 # for its three coexisting majors (0.2/0.3/0.4 can ALL be live in one dep graph). The
 # auto-apply step emits one `paths` dir per [[overlay]]; cargo's `paths` override is
 # keyed by crate NAME and picks, among the candidate dirs, the one whose own
-# Cargo.toml version SATISFIES each locked instance — so the three same-name dirs
-# coexist and resolve 0.2.17->getrandom-0.2, 0.3.4->getrandom-0.3, 0.4.3->getrandom-0.4.
+# Cargo.toml version SATISFIES each locked instance — so the four lock-compatible
+# entries resolve 0.2.17->getrandom-0.2, 0.3.4->getrandom-0.3, and either
+# 0.4.2->getrandom-0.4.2 or 0.4.3->getrandom-0.4.
 # The lock-mismatch verifier matches on (name, version), not name alone, so each
 # major reports APPLIED/MISMATCH independently.
 
@@ -43,6 +44,24 @@ dir = "socket2"
 name = "tokio"
 version = "1.52.3"
 dir = "tokio"
+
+# console — the unix terminal backend assumes std::os::fd is available on every
+# cfg(unix) target.  The CLR PAL intentionally exposes no raw Unix fd ABI, so
+# the overlay selects console's existing no-op/wasm terminal backend for
+# target_os=dotnet while preserving the upstream dependency graph.
+[[overlay]]
+name = "console"
+version = "0.16.3"
+dir = "console"
+
+# ppv-lite86 — its x86-64 dispatcher compiles AVX/SSE entry points even when
+# the runtime later declines those features.  The CLR target has no native
+# x86 register ABI, so select ppv-lite86's existing generic representation at
+# compile time while retaining the same algorithm and dependency version.
+[[overlay]]
+name = "ppv-lite86"
+version = "0.2.21"
+dir = "ppv-lite86"
 
 # parking_lot_core — ONE marked arm (a `target_os="dotnet"` branch in
 # thread_parker/mod.rs) routing the parker off the raw-pthread `unix.rs` (which has
@@ -62,6 +81,11 @@ dir = "parking_lot_core"
 name = "getrandom"
 version = "0.4.3"
 dir = "getrandom-0.4"
+
+[[overlay]]
+name = "getrandom"
+version = "0.4.2"
+dir = "getrandom-0.4.2"
 
 [[overlay]]
 name = "getrandom"

@@ -38,6 +38,7 @@
 //! array-marshalling surface and is not a thin one-liner; use the raw handle via [`Random::handle`]
 //! if you need it.
 
+use crate::managed_option::ManagedRef;
 use crate::system::MString;
 
 /// The raw managed-handle alias for `System.Random` (from the generated BCL bindings). A `Random`
@@ -47,102 +48,111 @@ pub type MRandom =
 
 /// A managed `System.Random` — a pseudo-random number generator on the CLR heap.
 ///
-/// Move-only (a plain handle to a managed object; the .NET GC owns the object, so there is no
-/// `Drop`). See the [module docs](self) for the full member mapping and semantics.
-#[derive(Clone, Copy)]
+/// Move-only and `GCHandle`-rooted. Its Rust representation contains no naked CLR reference.
+/// See the [module docs](self) for the full member mapping and semantics.
 #[repr(transparent)]
-pub struct Random(MRandom);
+pub struct Random(ManagedRef<MRandom>);
 
 impl Random {
     /// `new Random()` — seeded from a time-dependent default, so each instance yields a different
     /// sequence (matches C#'s parameterless constructor).
     #[inline(always)]
     pub fn new() -> Self {
-        Random(MRandom::ctor0())
+        Random(ManagedRef::from_raw(MRandom::ctor0()))
     }
 
     /// `new Random(int Seed)` — a reproducible generator: two `Random::with_seed(s)` values with the
     /// same `s` produce identical sequences (the .NET seeded-reproducibility contract).
     #[inline(always)]
     pub fn with_seed(seed: i32) -> Self {
-        Random(MRandom::ctor1::<i32>(seed))
+        Random(ManagedRef::from_raw(MRandom::ctor1::<i32>(seed)))
     }
 
     /// The process-wide, thread-safe shared instance (`Random.Shared`). Cheap to fetch repeatedly;
     /// safe to use from any thread (unlike an owned `Random`, whose methods are not thread-safe).
     #[inline(always)]
     pub fn shared() -> Self {
-        Random(MRandom::static0::<"get_Shared", MRandom>())
+        Random(ManagedRef::from_raw(MRandom::static0::<
+            "get_Shared",
+            MRandom,
+        >()))
     }
 
     /// Wrap an existing managed `System.Random` handle (e.g. one returned by another BCL call).
     #[inline(always)]
     pub fn from_handle(h: MRandom) -> Self {
-        Random(h)
+        Random(ManagedRef::from_raw(h))
     }
 
-    /// The underlying managed handle, for lower-level BCL calls.
+    /// Copy out the underlying managed handle for an immediate lower-level BCL call.
+    ///
+    /// The returned naked reference is kept alive by `self`; do not retain it in Rust-owned
+    /// storage or use it after `self` is dropped.
     #[inline(always)]
-    pub fn handle(self) -> MRandom {
-        self.0
+    pub fn handle(&self) -> MRandom {
+        self.0.copy_raw()
     }
 
     /// `Next()` — a non-negative `i32` in `[0, i32::MAX)`.
     #[inline(always)]
     pub fn next(&mut self) -> i32 {
-        self.0.instance0::<"Next", i32>()
+        self.0.copy_raw().instance0::<"Next", i32>()
     }
 
     /// `Next(int maxValue)` — a non-negative `i32` in `[0, max)`. `max` must be `>= 0`
     /// (a negative `max` throws `ArgumentOutOfRangeException` on the .NET side); `max == 0` yields `0`.
     #[inline(always)]
     pub fn next_below(&mut self, max: i32) -> i32 {
-        self.0.instance1::<"Next", i32, i32>(max)
+        self.0.copy_raw().instance1::<"Next", i32, i32>(max)
     }
 
     /// `Next(int minValue, int maxValue)` — an `i32` in `[min, max)`. Requires `min <= max`
     /// (otherwise .NET throws `ArgumentOutOfRangeException`); `min == max` yields `min`.
     #[inline(always)]
     pub fn next_range(&mut self, min: i32, max: i32) -> i32 {
-        self.0.instance2::<"Next", i32, i32, i32>(min, max)
+        self.0
+            .copy_raw()
+            .instance2::<"Next", i32, i32, i32>(min, max)
     }
 
     /// `NextInt64()` — a non-negative `i64` in `[0, i64::MAX)`.
     #[inline(always)]
     pub fn next_i64(&mut self) -> i64 {
-        self.0.instance0::<"NextInt64", i64>()
+        self.0.copy_raw().instance0::<"NextInt64", i64>()
     }
 
     /// `NextInt64(long maxValue)` — a non-negative `i64` in `[0, max)`. Same range rules as
     /// [`Random::next_below`].
     #[inline(always)]
     pub fn next_i64_below(&mut self, max: i64) -> i64 {
-        self.0.instance1::<"NextInt64", i64, i64>(max)
+        self.0.copy_raw().instance1::<"NextInt64", i64, i64>(max)
     }
 
     /// `NextInt64(long minValue, long maxValue)` — an `i64` in `[min, max)`. Same range rules as
     /// [`Random::next_range`].
     #[inline(always)]
     pub fn next_i64_range(&mut self, min: i64, max: i64) -> i64 {
-        self.0.instance2::<"NextInt64", i64, i64, i64>(min, max)
+        self.0
+            .copy_raw()
+            .instance2::<"NextInt64", i64, i64, i64>(min, max)
     }
 
     /// `NextDouble()` — an `f64` in `[0.0, 1.0)`.
     #[inline(always)]
     pub fn next_f64(&mut self) -> f64 {
-        self.0.instance0::<"NextDouble", f64>()
+        self.0.copy_raw().instance0::<"NextDouble", f64>()
     }
 
     /// `NextSingle()` — an `f32` in `[0.0, 1.0)`.
     #[inline(always)]
     pub fn next_f32(&mut self) -> f32 {
-        self.0.instance0::<"NextSingle", f32>()
+        self.0.copy_raw().instance0::<"NextSingle", f32>()
     }
 
     /// The managed `ToString()` of the underlying object, as an idiomatic Rust [`String`].
     #[inline(always)]
-    pub fn to_rust_string(self) -> std::string::String {
-        crate::system::DotNetString::from_handle(self.0.to_mstring()).to_rust_string()
+    pub fn to_rust_string(&self) -> std::string::String {
+        crate::system::DotNetString::from_handle(self.0.copy_raw().to_mstring()).to_rust_string()
     }
 }
 
@@ -156,7 +166,7 @@ impl Default for Random {
 impl core::fmt::Display for Random {
     /// The managed `object.ToString()` (for the base `System.Random`, its type name).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let s: MString = self.0.to_mstring();
+        let s: MString = self.0.copy_raw().to_mstring();
         core::fmt::Display::fmt(&crate::system::DotNetString::from_handle(s), f)
     }
 }

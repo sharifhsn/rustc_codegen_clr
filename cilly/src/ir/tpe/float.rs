@@ -43,46 +43,8 @@ impl Float {
     }
     /// Checks if this float is NaN
     pub fn is_nan(&self, val: Interned<CILNode>, asm: &mut Assembly) -> Interned<CILNode> {
-        let is_nan = asm.alloc_string("IsNaN");
-        let sig = asm.sig([Type::Float(*self)], Type::Bool);
-        match self {
-            Float::F16 => {
-                let half = ClassRef::half(asm);
-                let mref = asm.alloc_methodref(MethodRef::new(
-                    half,
-                    is_nan,
-                    sig,
-                    MethodKind::Static,
-                    [].into(),
-                ));
-                asm.alloc_node(CILNode::call(mref, [val]))
-            }
-            Float::F32 => {
-                let single = ClassRef::single(asm);
-                let mref = asm.alloc_methodref(MethodRef::new(
-                    single,
-                    is_nan,
-                    sig,
-                    MethodKind::Static,
-                    [].into(),
-                ));
-                asm.alloc_node(CILNode::call(mref, [val]))
-            }
-            Float::F64 => {
-                // `f64::is_nan` must call `System.Double::IsNaN`, NOT `System.Single::IsNaN`
-                // (copy-paste slip). Calling the f32 method on an f64 arg is a type mismatch.
-                let double = ClassRef::double(asm);
-                let mref = asm.alloc_methodref(MethodRef::new(
-                    double,
-                    is_nan,
-                    sig,
-                    MethodKind::Static,
-                    [].into(),
-                ));
-                asm.alloc_node(CILNode::call(mref, [val]))
-            }
-            Float::F128 => todo!(),
-        }
+        let method = self.method_ref(asm, "IsNaN", [Type::Float(*self)], Type::Bool);
+        asm.alloc_node(CILNode::call(method, [val]))
     }
     /// Returns a short name of the float
     #[must_use]
@@ -102,20 +64,13 @@ impl Float {
         fmax: Interned<CILNode>,
         asm: &mut Assembly,
     ) -> Interned<CILNode> {
-        let class = self.class(asm);
-        let clamp = asm.alloc_string("Clamp");
-        let sig = asm.sig(
+        let method = self.method_ref(
+            asm,
+            "Clamp",
             [Type::Float(*self), Type::Float(*self), Type::Float(*self)],
-            *self,
+            Type::Float(*self),
         );
-        let mref = asm.alloc_methodref(MethodRef::new(
-            class,
-            clamp,
-            sig,
-            MethodKind::Static,
-            [].into(),
-        ));
-        asm.alloc_node(CILNode::call(mref, [val, fmin, fmax]))
+        asm.alloc_node(CILNode::call(method, [val, fmin, fmax]))
     }
     /// Returns a class representing this flaoting-point type.
     pub fn class(&self, asm: &mut Assembly) -> Interned<ClassRef> {
@@ -133,17 +88,7 @@ impl Float {
         exp: Interned<CILNode>,
         asm: &mut Assembly,
     ) -> Interned<CILNode> {
-        let pow = asm.alloc_string("Pow");
-        let class = self.class(asm);
-        let sig = asm.sig([Type::Float(*self), Type::Float(*self)], *self);
-        let mref = asm.alloc_methodref(MethodRef::new(
-            class,
-            pow,
-            sig,
-            MethodKind::Static,
-            [].into(),
-        ));
-        asm.alloc_node(CILNode::call(mref, [base, exp]))
+        self.math2(base, exp, asm, "Pow")
     }
     /// Raises base to power.
     pub fn math2(
@@ -153,17 +98,13 @@ impl Float {
         asm: &mut Assembly,
         name: &str,
     ) -> Interned<CILNode> {
-        let pow = asm.alloc_string(name);
-        let class = self.class(asm);
-        let sig = asm.sig([Type::Float(*self), Type::Float(*self)], *self);
-        let mref = asm.alloc_methodref(MethodRef::new(
-            class,
-            pow,
-            sig,
-            MethodKind::Static,
-            [].into(),
-        ));
-        asm.alloc_node(CILNode::call(mref, [base, exp]))
+        let method = self.method_ref(
+            asm,
+            name,
+            [Type::Float(*self), Type::Float(*self)],
+            Type::Float(*self),
+        );
+        asm.alloc_node(CILNode::call(method, [base, exp]))
     }
 
     pub fn math1(
@@ -172,17 +113,27 @@ impl Float {
         asm: &mut Assembly,
         name: &str,
     ) -> Interned<CILNode> {
-        let name = asm.alloc_string(name);
+        let method = self.method_ref(asm, name, [Type::Float(*self)], Type::Float(*self));
+        asm.alloc_node(CILNode::call(method, [val]))
+    }
+
+    fn method_ref(
+        &self,
+        asm: &mut Assembly,
+        name: &str,
+        inputs: impl Into<Box<[Type]>>,
+        output: Type,
+    ) -> Interned<MethodRef> {
         let class = self.class(asm);
-        let sig = asm.sig([Type::Float(*self)], *self);
-        let mref = asm.alloc_methodref(MethodRef::new(
+        let name = asm.alloc_string(name);
+        let sig = asm.sig(inputs, output);
+        asm.alloc_methodref(MethodRef::new(
             class,
             name,
             sig,
             MethodKind::Static,
             [].into(),
-        ));
-        asm.alloc_node(CILNode::call(mref, [val]))
+        ))
     }
     /// Counts the number of bits this number has.
     /// ```

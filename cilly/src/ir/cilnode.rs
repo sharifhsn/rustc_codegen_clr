@@ -372,33 +372,6 @@ impl CILNode {
         CILNode::call(op_explict, [alloc])
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{FnSig, MethodRef, Type, cilnode::MethodKind};
-
-    #[test]
-    fn identity_map_preserves_call_purity() {
-        let mut asm = Assembly::default();
-        let owner = asm.main_module();
-        let name = asm.alloc_string("pure_call");
-        let sig = asm.alloc_sig(FnSig::new([], Type::Void));
-        let method = asm.alloc_methodref(MethodRef::new(
-            owner.0,
-            name,
-            sig,
-            MethodKind::Static,
-            [].into(),
-        ));
-        let call = CILNode::Call(Box::new((method, [].into(), IsPure::PURE)));
-        let mapped = call.map(&mut asm, &mut |node, _| node);
-        let CILNode::Call(mapped) = mapped else {
-            panic!("identity map changed the call variant");
-        };
-        assert_eq!(mapped.2, IsPure::PURE);
-    }
-}
 impl CILNode {
     /// Changes the node by applying the `map` closure to each node. This process is
     // The complexity of this function is unavoidable.
@@ -588,5 +561,32 @@ impl CILNode {
                 map(node, asm)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FnSig, MethodRef, Type, cilnode::MethodKind};
+
+    #[test]
+    fn identity_map_preserves_call_purity() {
+        let mut asm = Assembly::default();
+        let owner = asm.main_module();
+        let name = asm.alloc_string("pure_call");
+        let sig = asm.alloc_sig(FnSig::new([], Type::Void));
+        let method = asm.alloc_methodref(MethodRef::new(
+            owner.0,
+            name,
+            sig,
+            MethodKind::Static,
+            [].into(),
+        ));
+        let call = CILNode::Call(Box::new((method, [].into(), IsPure::PURE)));
+        let mapped = call.map(&mut asm, &mut |node, _| node);
+        let CILNode::Call(mapped) = mapped else {
+            panic!("identity map changed the call variant");
+        };
+        assert_eq!(mapped.2, IsPure::PURE);
     }
 }

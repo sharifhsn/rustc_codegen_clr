@@ -1,7 +1,62 @@
 use crate::{
-    Assembly, BasicBlock, BinOp, CILNode, CILRoot, Const, Int, Interned, MethodImpl, MethodRef,
-    Type, asm::MissingMethodPatcher, tpe::simd::SIMDElem,
+    Assembly, BasicBlock, BinOp, CILNode, CILRoot, Const, Float, Int, Interned, MethodImpl,
+    MethodRef, Type, asm::MissingMethodPatcher, tpe::simd::SIMDElem,
 };
+
+/// Build a scalar operator call for a `System.Half` lane.
+///
+/// `System.Half` is a value type rather than one of the ECMA-335 native floating-point stack
+/// types.  Consequently a raw CIL `add`/`div`/`ceq` on an f16 lane is not a valid fallback: the
+/// operation must go through the operator method that the BCL exposes on `Half`.  The vector
+/// intrinsics currently reject `VectorN<Half>` on the supported CoreCLR runtime, so all f16 SIMD
+/// fallbacks use this helper while f32/f64 continue to use native CIL operators.
+pub(super) fn half_binop(
+    asm: &mut Assembly,
+    lhs: Interned<CILNode>,
+    rhs: Interned<CILNode>,
+    op: BinOp,
+    output: Type,
+) -> Interned<CILNode> {
+    let half = Float::F16.class(asm);
+    let half = asm[half].clone();
+    let sig = [Type::Float(Float::F16), Type::Float(Float::F16)];
+    let method = half.static_mref(&sig, output, asm.alloc_string(op.dotnet_name()), asm);
+    asm.alloc_node(CILNode::call(method, [lhs, rhs]))
+}
+
+/// Build a scalar unary operator call for a `System.Half` lane.  The ECMA-335 `neg` instruction
+/// only accepts the native `float32`/`float64` stack types, so f16 negation must use Half's
+/// overloaded `op_UnaryNegation` method as well.
+pub(super) fn half_unop(
+    asm: &mut Assembly,
+    value: Interned<CILNode>,
+    name: &str,
+    output: Type,
+) -> Interned<CILNode> {
+    let half = Float::F16.class(asm);
+    let half = asm[half].clone();
+    let method = half.static_mref(
+        &[Type::Float(Float::F16)],
+        output,
+        asm.alloc_string(name),
+        asm,
+    );
+    asm.alloc_node(CILNode::call(method, [value]))
+}
+
+pub(super) fn float_lane_binop(
+    asm: &mut Assembly,
+    lhs: Interned<CILNode>,
+    rhs: Interned<CILNode>,
+    elem: SIMDElem,
+    op: BinOp,
+    output: Type,
+) -> Interned<CILNode> {
+    match elem {
+        SIMDElem::Float(Float::F16) => half_binop(asm, lhs, rhs, op, output),
+        _ => asm.biop(lhs, rhs, op),
+    }
+}
 macro_rules! binop {
     ($op_name:ident,$op_dotnet:literal,$binop:expr) => {
         pub fn $op_name(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
@@ -13,8 +68,19 @@ macro_rules! binop {
                 let Some(comparands) = sig.inputs()[0].as_simdvector() else {
                     // Array fallback: an unsupported vector size (sub-64-bit / >512 / non-power-of-2)
                     // has no managed `Vector{bits}` class, so lower the op per lane instead.
-                    return lane_binop_body(mref, asm, &|asm, l, r, _, _| asm.biop(l, r, $binop));
+                    return lane_binop_body(mref, asm, &|asm, l, r, elem, res_elem| {
+                        float_lane_binop(asm, l, r, elem, $binop, res_elem)
+                    });
                 };
+                // CoreCLR currently rejects the generic `VectorN<Half>` surface at runtime
+                // (`NotSupportedException` from `VectorN<Half>.Count`/the operation itself).
+                // Keep the managed-vector representation, but lower f16 values per lane through
+                // `System.Half` operators just like the non-vector fallback.
+                if matches!(comparands.elem(), SIMDElem::Float(Float::F16)) {
+                    return lane_binop_body(mref, asm, &|asm, l, r, elem, res_elem| {
+                        float_lane_binop(asm, l, r, elem, $binop, res_elem)
+                    });
+                }
                 let elem: Type = comparands.elem().into();
 
                 let extension_class = comparands.extension_class(asm);
@@ -91,6 +157,14 @@ pub(super) fn simd_lane_info(tpe: Type, asm: &Assembly) -> Option<(SIMDElem, u64
     Some((elem, total / elem_size))
 }
 
+fn scalar_return_body(asm: &mut Assembly, value: Interned<CILNode>) -> MethodImpl {
+    let ret = asm.alloc_root(CILRoot::Ret(value));
+    MethodImpl::MethodBody {
+        blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+        locals: vec![],
+    }
+}
+
 /// Per-lane spill-and-index body for an element-wise binary op: read lane `i` of each input
 /// (reinterpreting the operand address as `*elem`), apply `op`, store to result lane `i`. Works for
 /// BOTH `SIMDVector` operands and the array fallback (same memory layout) via `simd_lane_info`, so
@@ -112,6 +186,20 @@ pub(super) fn lane_binop_body(
     let res_elem: Type = res_elem_s.into();
     let (elem, count) =
         simd_lane_info(sig.inputs()[0], asm).expect("simd binop input is not a vector");
+    // `Simd<T, 1>` is represented as the scalar `T` by the Rust type lowering.  Taking an address
+    // of a scalar `Half` argument and reinterpreting it as an element pointer is not a valid ABI
+    // operation on all CoreCLR call paths (and can become an access violation), so use a direct
+    // scalar call for this shape.  Multi-lane managed vectors and fixed-array fallbacks retain the
+    // spill-and-index implementation below.
+    if count == 1
+        && matches!(sig.inputs()[0], Type::Int(_) | Type::Float(_))
+        && matches!(res, Type::Int(_) | Type::Float(_))
+    {
+        let lhs = asm.alloc_node(CILNode::LdArg(0));
+        let rhs = asm.alloc_node(CILNode::LdArg(1));
+        let value = op(asm, lhs, rhs, elem, res_elem);
+        return scalar_return_body(asm, value);
+    }
     let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
     let tpe: Type = elem.into();
     let tpe_idx = asm.alloc_type(tpe);
@@ -159,6 +247,14 @@ pub(super) fn lane_unop_body(
     let res_elem: Type = res_elem_s.into();
     let (elem, count) =
         simd_lane_info(sig.inputs()[0], asm).expect("simd unop input is not a vector");
+    if count == 1
+        && matches!(sig.inputs()[0], Type::Int(_) | Type::Float(_))
+        && matches!(res, Type::Int(_) | Type::Float(_))
+    {
+        let value = asm.alloc_node(CILNode::LdArg(0));
+        let value = op(asm, value, elem, res_elem);
+        return scalar_return_body(asm, value);
+    }
     let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
     let tpe: Type = elem.into();
     let tpe_idx = asm.alloc_type(tpe);
@@ -190,8 +286,46 @@ pub(super) fn lane_unop_body(
 pub(super) fn lane_splat_body(mref: Interned<MethodRef>, asm: &mut Assembly) -> MethodImpl {
     let sig = asm[asm[mref].sig()].clone();
     let res = *sig.output();
-    let (res_elem_s, count) = simd_lane_info(res, asm).expect("simd splat result is not a vector");
-    let res_elem: Type = res_elem_s.into();
+    // `Simd<T, 1>` is lowered to the scalar `T`.  Pointer vectors use this path for their
+    // one-lane instantiations; there is no aggregate local to spill, so the splat is simply the
+    // scalar value itself.
+    if matches!(
+        res,
+        Type::Ptr(_) | Type::Ref(_) | Type::Int(_) | Type::Float(_)
+    ) {
+        let value = asm.alloc_node(CILNode::LdArg(0));
+        return scalar_return_body(asm, value);
+    }
+    // Pointer vectors are represented by the fixed-array fallback because raw pointers are not
+    // valid CLR `Vector<T>` element types.  Recover their field type directly instead of limiting
+    // splat to `SIMDElem` (ints/floats); this is needed by portable-simd's pointer helpers, which
+    // construct `Simd<*const T, N>` from a scalar pointer before exercising pointer intrinsics.
+    let (res_elem, count) = if let Some((elem, count)) = simd_lane_info(res, asm) {
+        (Type::from(elem), count)
+    } else {
+        let Type::ClassRef(cref) = res else {
+            panic!("simd splat result is not a vector")
+        };
+        let def = asm
+            .class_ref_to_def(cref)
+            .expect("simd splat array fallback has no class definition");
+        let def = &asm[def];
+        let (elem, _, _) = *def
+            .fields()
+            .first()
+            .expect("simd splat array fallback has no element field");
+        let total = u64::from(
+            def.explict_size()
+                .expect("simd splat array fallback has no explicit size")
+                .get(),
+        );
+        let elem_size = u64::from(asm.sizeof_type(elem));
+        assert!(
+            elem_size != 0,
+            "simd splat array fallback has a zero-sized element"
+        );
+        (elem, total / elem_size)
+    };
     let res_ptr = asm.alloc_node(CILNode::LdLocA(0));
     let mut roots = vec![];
     for idx in 0..count {
@@ -230,19 +364,45 @@ pub(super) fn lane_cmp_body(
         let unsigned = matches!(elem, SIMDElem::Int(i) if !i.is_signed());
         let lt = if unsigned { BinOp::LtUn } else { BinOp::Lt };
         let gt = if unsigned { BinOp::GtUn } else { BinOp::Gt };
+        let scalar_cmp = |asm: &mut Assembly,
+                          lhs: Interned<CILNode>,
+                          rhs: Interned<CILNode>,
+                          op: BinOp|
+         -> Interned<CILNode> {
+            float_lane_binop(asm, lhs, rhs, elem, op, Type::Bool)
+        };
         let cmp01 = match kind {
-            CmpKind::Eq => asm.biop(l, r, BinOp::Eq),
-            CmpKind::Lt => asm.biop(l, r, lt),
-            CmpKind::Gt => asm.biop(l, r, gt),
+            CmpKind::Eq => scalar_cmp(asm, l, r, BinOp::Eq),
+            CmpKind::Lt => scalar_cmp(asm, l, r, lt),
+            CmpKind::Gt => scalar_cmp(asm, l, r, gt),
+            // Scalar comparison nodes produce `bool`, not an integer 0/1.
+            // Comparing that bool to an i32 zero is rejected by the verifier
+            // for f16 lanes. Compare it with a bool false instead; this is the
+            // ordered complement required for `>=`/`<=` (and keeps NaN
+            // unordered as false) without relying on integer-only `Not`.
             CmpKind::Ge => {
-                let lt = asm.biop(l, r, lt);
-                let zero = asm.alloc_node(Const::I32(0));
-                asm.biop(lt, zero, BinOp::Eq)
+                if matches!(elem, SIMDElem::Float(Float::F16)) {
+                    // Half's ordered operators return false for NaN, so `>=` must be expressed
+                    // as `>` OR `==`; complementing `<` would incorrectly accept unordered lanes.
+                    let gt = scalar_cmp(asm, l, r, gt);
+                    let eq = scalar_cmp(asm, l, r, BinOp::Eq);
+                    asm.biop(gt, eq, BinOp::Or)
+                } else {
+                    let lt = scalar_cmp(asm, l, r, lt);
+                    let false_value = asm.alloc_node(Const::Bool(false));
+                    asm.biop(lt, false_value, BinOp::Eq)
+                }
             }
             CmpKind::Le => {
-                let gt = asm.biop(l, r, gt);
-                let zero = asm.alloc_node(Const::I32(0));
-                asm.biop(gt, zero, BinOp::Eq)
+                if matches!(elem, SIMDElem::Float(Float::F16)) {
+                    let lt = scalar_cmp(asm, l, r, lt);
+                    let eq = scalar_cmp(asm, l, r, BinOp::Eq);
+                    asm.biop(lt, eq, BinOp::Or)
+                } else {
+                    let gt = scalar_cmp(asm, l, r, gt);
+                    let false_value = asm.alloc_node(Const::Bool(false));
+                    asm.biop(gt, false_value, BinOp::Eq)
+                }
             }
         };
         // `cmp01` is 0/1 (i32). Widen to the mask lane width, then negate: 0 -> 0, 1 -> all-ones.
@@ -295,7 +455,7 @@ pub(super) fn lane_all_any_body(
             tpe: tpe_idx,
             volatile: false,
         });
-        let eq = asm.biop(a, b, BinOp::Eq);
+        let eq = float_lane_binop(asm, a, b, elem, BinOp::Eq, Type::Bool);
         let acc = asm.alloc_node(CILNode::LdLoc(0));
         let new_acc = asm.biop(acc, eq, if all { BinOp::And } else { BinOp::Or });
         roots.push(asm.alloc_root(CILRoot::StInd(Box::new((
@@ -366,12 +526,12 @@ pub(super) fn register_value_lane_ops(asm: &mut Assembly, patcher: &mut MissingM
     // `BinOp` distinguishes `Div` (signed/float) from `DivUn` (unsigned), so unsigned lanes must use
     // `DivUn` to avoid a signed-division miscompile.
     simd_binop(
-        |asm, lhs, rhs, elem, _| {
+        |asm, lhs, rhs, elem, res_elem| {
             let op = match elem {
                 SIMDElem::Int(int) if !int.is_signed() => BinOp::DivUn,
                 _ => BinOp::Div,
             };
-            asm.biop(lhs, rhs, op)
+            float_lane_binop(asm, lhs, rhs, elem, op, res_elem)
         },
         "simd_div",
         asm,
@@ -380,12 +540,12 @@ pub(super) fn register_value_lane_ops(asm: &mut Assembly, patcher: &mut MissingM
     // `simd_rem` — element-wise remainder. Like `simd_div`, pick signed/unsigned/float remainder
     // from the lane type (`Rem` for signed/float, `RemUn` for unsigned).
     simd_binop(
-        |asm, lhs, rhs, elem, _| {
+        |asm, lhs, rhs, elem, res_elem| {
             let op = match elem {
                 SIMDElem::Int(int) if !int.is_signed() => BinOp::RemUn,
                 _ => BinOp::Rem,
             };
-            asm.biop(lhs, rhs, op)
+            float_lane_binop(asm, lhs, rhs, elem, op, res_elem)
         },
         "simd_rem",
         asm,
@@ -562,8 +722,8 @@ fn simd_reduce(
             let lane = asm.load(slot, elem_idx);
             let acc = asm.alloc_node(CILNode::LdLoc(0));
             let new_acc = match kind {
-                ReduceKind::Add => asm.biop(acc, lane, BinOp::Add),
-                ReduceKind::Mul => asm.biop(acc, lane, BinOp::Mul),
+                ReduceKind::Add => float_lane_binop(asm, acc, lane, elem_s, BinOp::Add, elem),
+                ReduceKind::Mul => float_lane_binop(asm, acc, lane, elem_s, BinOp::Mul, elem),
                 ReduceKind::And => asm.biop(acc, lane, BinOp::And),
                 ReduceKind::Or => asm.biop(acc, lane, BinOp::Or),
                 ReduceKind::Xor => asm.biop(acc, lane, BinOp::XOr),
@@ -581,7 +741,14 @@ fn simd_reduce(
                         (_, true) => BinOp::Gt,
                         (_, false) => BinOp::GtUn,
                     };
-                    let take_lane = asm.biop(lane_v, acc_v, cmp);
+                    let take_lane = if matches!(elem_s, SIMDElem::Float(Float::F16)) {
+                        // `Half` is a value type and cannot be compared with raw CIL `clt`/`cgt`.
+                        // Use the BCL operator, preserving the ordered NaN behavior expected by
+                        // the scalar `f16::min`/`max` implementations.
+                        half_binop(asm, lane_v, acc_v, cmp, Type::Bool)
+                    } else {
+                        asm.biop(lane_v, acc_v, cmp)
+                    };
                     let ptr_ty = asm.nptr(elem_idx);
                     let chosen = asm.select(ptr_ty, lane_addr, acc_addr, take_lane);
                     asm.load(chosen, elem_idx)

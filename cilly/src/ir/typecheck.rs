@@ -378,6 +378,18 @@ fn is_erased_ptr_sink(arg: Type, expected: Type, asm: &Assembly) -> bool {
     false
 }
 impl BinOp {
+    fn fallback_int(&self, lhs: Type, rhs: Type, asm: &Assembly) -> Result<Type, TypeCheckError> {
+        if lhs.is_assignable_to(rhs, asm) && (lhs.as_int().is_some() || rhs.as_int().is_some()) {
+            Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
+        } else {
+            Err(TypeCheckError::WrongBinopArgs {
+                lhs,
+                rhs,
+                op: *self,
+            })
+        }
+    }
+
     fn typecheck(&self, lhs: Type, rhs: Type, asm: &Assembly) -> Result<Type, TypeCheckError> {
         match self {
             BinOp::Add | BinOp::Sub => match (lhs, rhs) {
@@ -385,32 +397,12 @@ impl BinOp {
                 (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Float(lhs)),
                 (Type::Ptr(lhs), Type::Ptr(rhs)) if rhs == lhs => Ok(Type::Ptr(lhs)),
                 (Type::FnPtr(lhs), Type::FnPtr(rhs)) if rhs == lhs => Ok(Type::FnPtr(lhs)),
-                (Type::Ptr(_inner), Type::Int(Int::ISize | Int::USize)) => {
-                    // Since pointer ops operate in bytes, this is not an issue ATM.
-                    /*if asm[inner] != Type::Void {
-                        Ok(lhs)
-                    } else {
-                        Err(TypeCheckError::VoidPointerOp { op: self.clone() })
-                    }*/
-                    Ok(lhs)
-                }
-                (Type::FnPtr(_), Type::Int(Int::ISize | Int::USize)) => Ok(lhs),
+                (
+                    Type::Ptr(_) | Type::FnPtr(_) | Type::Ref(_),
+                    Type::Int(Int::ISize | Int::USize),
+                ) => Ok(lhs),
                 (Type::Int(Int::ISize | Int::USize), Type::Ptr(_) | Type::FnPtr(_)) => Ok(rhs),
-                // TODO: investigate the cause of this issue. Changing a reference is not valid.
-                (Type::Ref(_), Type::Int(Int::ISize | Int::USize)) => Ok(lhs),
-                _ => {
-                    if lhs.is_assignable_to(rhs, asm)
-                        && (lhs.as_int().is_some() || rhs.as_int().is_some())
-                    {
-                        Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
-                    }
-                }
+                _ => self.fallback_int(lhs, rhs, asm),
             },
             BinOp::Eq => {
                 if lhs == rhs || lhs.is_assignable_to(rhs, asm) {
@@ -453,56 +445,35 @@ impl BinOp {
                     }
                 }
             },
-            BinOp::LtUn | BinOp::GtUn => match (lhs, rhs) {
-                (Type::Int(lhs), Type::Int(rhs)) if rhs == lhs => Ok(Type::Bool),
-                (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Bool),
-                (Type::Ptr(lhs), Type::Ptr(rhs)) if rhs == lhs => Ok(Type::Bool),
-                (Type::FnPtr(lhs), Type::FnPtr(rhs)) if rhs == lhs => Ok(Type::Bool),
-                (Type::Bool, Type::Bool) => Ok(Type::Bool),
-                _ => {
-                    if lhs == rhs || lhs.is_assignable_to(rhs, asm) {
+            BinOp::LtUn | BinOp::GtUn | BinOp::Lt | BinOp::Gt => {
+                let allow_pointer = matches!(*self, BinOp::LtUn | BinOp::GtUn);
+                match (lhs, rhs) {
+                    (Type::Int(lhs), Type::Int(rhs)) if rhs == lhs => Ok(Type::Bool),
+                    (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Bool),
+                    (Type::Ptr(lhs), Type::Ptr(rhs)) if allow_pointer && rhs == lhs => {
                         Ok(Type::Bool)
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
+                    }
+                    (Type::FnPtr(lhs), Type::FnPtr(rhs)) if allow_pointer && rhs == lhs => {
+                        Ok(Type::Bool)
+                    }
+                    (Type::Bool, Type::Bool) => Ok(Type::Bool),
+                    _ => {
+                        if lhs == rhs || lhs.is_assignable_to(rhs, asm) {
+                            Ok(Type::Bool)
+                        } else {
+                            Err(TypeCheckError::WrongBinopArgs {
+                                lhs,
+                                rhs,
+                                op: *self,
+                            })
+                        }
                     }
                 }
-            },
-            BinOp::Lt | BinOp::Gt => match (lhs, rhs) {
-                (Type::Int(lhs), Type::Int(rhs)) if rhs == lhs => Ok(Type::Bool),
-                (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Bool),
-                (Type::Bool, Type::Bool) => Ok(Type::Bool),
-                _ => {
-                    if lhs == rhs || lhs.is_assignable_to(rhs, asm) {
-                        Ok(Type::Bool)
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
-                    }
-                }
-            },
+            }
             BinOp::Or | BinOp::XOr | BinOp::And => match (lhs, rhs) {
                 (Type::Int(lhs), Type::Int(rhs)) if rhs == lhs => Ok(Type::Int(lhs)),
                 (Type::Bool, Type::Bool) => Ok(Type::Bool),
-                _ => {
-                    if lhs.is_assignable_to(rhs, asm)
-                        && (lhs.as_int().is_some() || rhs.as_int().is_some())
-                    {
-                        Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
-                    }
-                }
+                _ => self.fallback_int(lhs, rhs, asm),
             },
             BinOp::Rem => match (lhs, rhs) {
                 (Type::Int(lhs), Type::Int(rhs)) if rhs == lhs && rhs.is_signed() => {
@@ -512,19 +483,7 @@ impl BinOp {
                 // float arms. The previous `Ok(Type::Bool)` was a copy-paste from a comparison op and
                 // surfaced downstream as toml's `CantCompareTypes { Bool, F64 }`.
                 (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Float(lhs)),
-                _ => {
-                    if lhs.is_assignable_to(rhs, asm)
-                        && (lhs.as_int().is_some() || rhs.as_int().is_some())
-                    {
-                        Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
-                    }
-                }
+                _ => self.fallback_int(lhs, rhs, asm),
             },
             BinOp::RemUn => match (lhs, rhs) {
                 (Type::Int(lhs), Type::Int(rhs)) if rhs == lhs && !rhs.is_signed() => {
@@ -532,161 +491,44 @@ impl BinOp {
                 }
                 // Float `%` yields a float (see the `Rem` arm) — was wrongly `Ok(Type::Bool)`.
                 (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Float(lhs)),
-                _ => {
-                    if lhs.is_assignable_to(rhs, asm)
-                        && (lhs.as_int().is_some() || rhs.as_int().is_some())
-                    {
-                        Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
-                    }
-                }
+                _ => self.fallback_int(lhs, rhs, asm),
             },
-            BinOp::Shl => match (lhs, rhs) {
-                (
-                    Type::Int(
-                        lhs @ (Int::I128
-                        | Int::U128
-                        | Int::I64
-                        | Int::U64
-                        | Int::USize
-                        | Int::ISize
-                        | Int::I32
-                        | Int::U32
-                        | Int::I16
-                        | Int::U16
-                        | Int::U8
-                        | Int::I8),
-                    ),
-                    Type::Int(
-                        Int::USize
-                        | Int::ISize
-                        | Int::I32
-                        | Int::U32
-                        | Int::I16
-                        | Int::U16
-                        | Int::U8
-                        | Int::I8,
-                    ),
-                ) => Ok(Type::Int(lhs)),
-                _ => {
-                    if lhs.is_assignable_to(rhs, asm)
-                        && (lhs.as_int().is_some() || rhs.as_int().is_some())
-                    {
-                        Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
+            BinOp::Shl | BinOp::Shr | BinOp::ShrUn => {
+                let valid_shift = match (&lhs, &rhs) {
+                    (Type::Int(lhs), Type::Int(rhs))
+                        if matches!(
                             rhs,
-                            op: *self,
-                        })
-                    }
-                }
-            },
-            BinOp::Shr => match (lhs, rhs) {
-                (
-                    Type::Int(
-                        lhs @ (Int::I128
-                        | Int::U128
-                        | Int::I64
-                        | Int::U64
-                        | Int::USize
-                        | Int::ISize
-                        | Int::I32
-                        | Int::U32
-                        | Int::I16
-                        | Int::U16
-                        | Int::U8
-                        | Int::I8),
-                    ),
-                    Type::Int(
-                        Int::USize
-                        | Int::ISize
-                        | Int::I32
-                        | Int::U32
-                        | Int::I16
-                        | Int::U16
-                        | Int::U8
-                        | Int::I8,
-                    ),
-                ) if lhs.is_signed() => Ok(Type::Int(lhs)),
-                _ => {
-                    if lhs.is_assignable_to(rhs, asm)
-                        && (lhs.as_int().is_some() || rhs.as_int().is_some())
+                            Int::USize
+                                | Int::ISize
+                                | Int::I32
+                                | Int::U32
+                                | Int::I16
+                                | Int::U16
+                                | Int::U8
+                                | Int::I8
+                        ) =>
                     {
-                        Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
+                        match self {
+                            BinOp::Shl => true,
+                            BinOp::Shr => lhs.is_signed(),
+                            BinOp::ShrUn => !lhs.is_signed(),
+                            _ => unreachable!("shift op arm"),
+                        }
                     }
+                    _ => false,
+                };
+                if valid_shift {
+                    Ok(lhs)
+                } else {
+                    self.fallback_int(lhs, rhs, asm)
                 }
-            },
-            BinOp::ShrUn => match (lhs, rhs) {
-                (
-                    Type::Int(
-                        lhs @ (Int::I128
-                        | Int::U128
-                        | Int::I64
-                        | Int::U64
-                        | Int::USize
-                        | Int::ISize
-                        | Int::I32
-                        | Int::U32
-                        | Int::I16
-                        | Int::U16
-                        | Int::U8
-                        | Int::I8),
-                    ),
-                    Type::Int(
-                        Int::USize
-                        | Int::ISize
-                        | Int::I32
-                        | Int::U32
-                        | Int::I16
-                        | Int::U16
-                        | Int::U8
-                        | Int::I8,
-                    ),
-                ) if !lhs.is_signed() => Ok(Type::Int(lhs)),
-                _ => {
-                    if lhs.is_assignable_to(rhs, asm)
-                        && (lhs.as_int().is_some() || rhs.as_int().is_some())
-                    {
-                        Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
-                    }
-                }
-            },
+            }
             BinOp::DivUn => match (lhs, rhs) {
                 (
                     Type::Int(lhs @ (Int::U64 | Int::USize | Int::U32 | Int::U16 | Int::U8)),
                     Type::Int(rhs @ (Int::U64 | Int::USize | Int::U32 | Int::U16 | Int::U8)),
                 ) if lhs == rhs => Ok(Type::Int(lhs)),
-                _ => {
-                    if lhs.is_assignable_to(rhs, asm)
-                        && (lhs.as_int().is_some() || rhs.as_int().is_some())
-                    {
-                        Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
-                    }
-                }
+                _ => self.fallback_int(lhs, rhs, asm),
             },
             BinOp::Div => match (lhs, rhs) {
                 (
@@ -714,23 +556,78 @@ impl BinOp {
                     ),
                 ) if lhs.is_signed() && lhs == rhs => Ok(Type::Int(lhs)),
                 (Type::Float(lhs), Type::Float(rhs)) if rhs == lhs => Ok(Type::Float(lhs)),
-                _ => {
-                    if lhs.is_assignable_to(rhs, asm)
-                        && (lhs.as_int().is_some() || rhs.as_int().is_some())
-                    {
-                        Ok(Type::Int(lhs.as_int().or(rhs.as_int()).unwrap()))
-                    } else {
-                        Err(TypeCheckError::WrongBinopArgs {
-                            lhs,
-                            rhs,
-                            op: *self,
-                        })
-                    }
-                }
+                _ => self.fallback_int(lhs, rhs, asm),
             },
         }
     }
 }
+
+fn require_managed_object(value: Type, asm: &Assembly) -> Result<(), TypeCheckError> {
+    match value {
+        Type::ClassRef(cref) => {
+            if asm.class_ref(cref).is_valuetype() {
+                Err(TypeCheckError::ExpectedClassGotValuetype {
+                    cref: asm.class_ref(cref).clone(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        Type::PlatformObject
+        | Type::PlatformGeneric(_, _)
+        | Type::PlatformString
+        | Type::PlatformArray { .. } => Ok(()),
+        _ => Err(TypeCheckError::TypeNotClass { object: value }),
+    }
+}
+
+fn validate_field_access(
+    asm: &Assembly,
+    field: FieldDesc,
+    pointed_owner: Interned<ClassRef>,
+) -> Result<(), TypeCheckError> {
+    if !Type::ClassRef(pointed_owner).is_assignable_to(Type::ClassRef(field.owner()), asm) {
+        return Err(TypeCheckError::FieldOwnerMismatch {
+            owner: pointed_owner,
+            expected_owner: field.owner(),
+            field,
+        });
+    }
+    if let Some(cdef) = asm.class_ref_to_def(field.owner())
+        && !asm[cdef]
+            .fields()
+            .iter()
+            .any(|(tpe, name, _offset)| *tpe == field.tpe() && *name == field.name())
+    {
+        return Err(TypeCheckError::FieldNotPresent {
+            tpe: field.tpe(),
+            name: field.name(),
+            owner: field.owner(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_field_target(
+    asm: &Assembly,
+    addr_tpe: Type,
+    field: FieldDesc,
+) -> Result<(), TypeCheckError> {
+    let pointed_tpe = match addr_tpe {
+        Type::Ptr(type_idx) | Type::Ref(type_idx) => Some(asm[type_idx]),
+        Type::ClassRef(_) => Some(addr_tpe),
+        _ => None,
+    }
+    .ok_or(TypeCheckError::TypeNotPtr { tpe: addr_tpe })?;
+    let Type::ClassRef(pointed_owner) = pointed_tpe else {
+        return Err(TypeCheckError::FieldAccessInvalidType {
+            tpe: pointed_tpe,
+            field,
+        });
+    };
+    validate_field_access(asm, field, pointed_owner)
+}
+
 impl CILNode {
     #[allow(unused_variables)]
     /// Typechecks this node, and returns its type if its valid.
@@ -755,9 +652,9 @@ impl CILNode {
                 let arg = asm.get_node(*arg).clone();
                 let arg_type = arg.typecheck(sig, locals, asm)?;
                 match (arg_type, op) {
-                    (Type::Int(_) | Type::Float(_) | Type::Ptr(_), UnOp::Not) => Ok(arg_type),
+                    (Type::Int(_) | Type::Float(_) | Type::Ptr(_), UnOp::Not)
+                    | (Type::Float(_) | Type::Ptr(_), UnOp::Neg) => Ok(arg_type),
                     (Type::Int(int), UnOp::Neg) if int.is_signed() => Ok(arg_type),
-                    (Type::Float(_) | Type::Ptr(_), UnOp::Neg) => Ok(arg_type),
                     _ => Err(TypeCheckError::WrongUnOpArgs {
                         tpe: arg_type,
                         op: op.clone(),
@@ -936,53 +833,10 @@ impl CILNode {
                 let field = *asm.get_field(*field);
                 let addr = asm.get_node(*addr).clone();
                 let addr_tpe = addr.typecheck(sig, locals, asm)?;
-                let pointed_tpe = {
-                    match addr_tpe {
-                        Type::Ptr(type_idx) | Type::Ref(type_idx) => Some(asm[type_idx]),
-                        Type::ClassRef(_) => Some(addr_tpe),
-                        _ => None,
-                    }
-                }
-                .ok_or(TypeCheckError::TypeNotPtr { tpe: addr_tpe })?;
-
-                let Type::ClassRef(pointed_owner) = pointed_tpe else {
-                    return Err(TypeCheckError::FieldAccessInvalidType {
-                        tpe: pointed_tpe,
-                        field,
-                    });
-                };
-                if pointed_owner != field.owner() {
-                    return Err(TypeCheckError::FieldOwnerMismatch {
-                        owner: pointed_owner,
-                        expected_owner: field.owner(),
-                        field,
-                    });
-                }
-                // Check that this type owns a matching field
-                if let Some(cdef) = asm.class_ref_to_def(field.owner()) {
-                    if !asm[cdef]
-                        .fields()
-                        .iter()
-                        .any(|(tpe, name, _offset)| *tpe == field.tpe() && *name == field.name())
-                    {
-                        return Err(TypeCheckError::FieldNotPresent {
-                            tpe: field.tpe(),
-                            name: field.name(),
-                            owner: field.owner(),
-                        });
-                    }
-                }
+                validate_field_target(asm, addr_tpe, field)?;
                 match addr_tpe {
-                    Type::Ref(_) => Ok(asm.nref(field.tpe())),
+                    Type::Ref(_) | Type::ClassRef(_) => Ok(asm.nref(field.tpe())),
                     Type::Ptr(_) => Ok(asm.nptr(field.tpe())),
-                    // `ldflda` on a by-value object reference (`ClassRef`) is legal CIL: it yields
-                    // a managed pointer to the field. This case is deliberately accepted by the
-                    // pointed-type match above (line ~851) and fully validated (owner + field
-                    // presence); `LdField` returns `Ok` for the identical case and BOTH exporters
-                    // emit `ldflda` for it. The correct result type is a managed reference to the
-                    // field type — mirror the `Type::Ref` result. Returning a `TypeCheckError`
-                    // here would be a FALSE NEGATIVE rejecting valid IR the exporters emit.
-                    Type::ClassRef(_) => Ok(asm.nref(field.tpe())),
                     _ => unreachable!(
                         "LdFieldAddress addr typechecked to {addr_tpe:?}, which was not accepted by \
                          the pointed-type match above"
@@ -994,41 +848,7 @@ impl CILNode {
                 let field = *asm.get_field(*field);
                 let addr = asm.get_node(*addr).clone();
                 let addr_tpe = addr.typecheck(sig, locals, asm)?;
-                let pointed_tpe = {
-                    match addr_tpe {
-                        Type::Ptr(type_idx) | Type::Ref(type_idx) => Some(asm[type_idx]),
-                        Type::ClassRef(_) => Some(addr_tpe),
-                        _ => None,
-                    }
-                }
-                .ok_or(TypeCheckError::TypeNotPtr { tpe: addr_tpe })?;
-                let Type::ClassRef(pointed_owner) = pointed_tpe else {
-                    return Err(TypeCheckError::FieldAccessInvalidType {
-                        tpe: pointed_tpe,
-                        field,
-                    });
-                };
-                if pointed_owner != field.owner() {
-                    return Err(TypeCheckError::FieldOwnerMismatch {
-                        owner: pointed_owner,
-                        expected_owner: field.owner(),
-                        field,
-                    });
-                }
-                // Check that this type owns a matching field
-                if let Some(cdef) = asm.class_ref_to_def(field.owner()) {
-                    if !asm[cdef]
-                        .fields()
-                        .iter()
-                        .any(|(tpe, name, _offset)| *tpe == field.tpe() && *name == field.name())
-                    {
-                        return Err(TypeCheckError::FieldNotPresent {
-                            tpe: field.tpe(),
-                            name: field.name(),
-                            owner: field.owner(),
-                        });
-                    }
-                }
+                validate_field_target(asm, addr_tpe, field)?;
                 Ok(field.tpe())
             }
             CILNode::LdInd {
@@ -1070,46 +890,16 @@ impl CILNode {
             CILNode::IsInst(obj, _) => {
                 let obj = asm.get_node(*obj).clone();
                 let obj = obj.typecheck(sig, locals, asm)?;
-                // `isinst` requires an object reference on the stack. Accept every GC-reference
-                // shape the backend produces (managed class refs, Object, platform string/array,
-                // open generics); reject clearly-non-reference operands (Int/Float/Ptr/...).
-                // Mirrors the `UnboxAny` operand check; result stays `Bool` because this backend's
-                // IsInst feeds a Rust `bool` (mycorrhiza `..._is_inst`) and a `BranchCond::False`.
-                match obj {
-                    Type::ClassRef(cref) => {
-                        if asm.class_ref(cref).is_valuetype() {
-                            return Err(TypeCheckError::ExpectedClassGotValuetype {
-                                cref: asm.class_ref(cref).clone(),
-                            });
-                        }
-                    }
-                    Type::PlatformObject
-                    | Type::PlatformGeneric(_, _)
-                    | Type::PlatformString
-                    | Type::PlatformArray { .. } => (),
-                    _ => return Err(TypeCheckError::TypeNotClass { object: obj }),
-                }
+                // `isinst` requires an object reference on the stack; accept every GC-reference
+                // shape the backend produces and reject clearly-non-reference operands.
+                require_managed_object(obj, asm)?;
                 Ok(Type::Bool)
             }
             CILNode::CheckedCast(obj, cast_res) => {
                 let obj = asm.get_node(*obj).clone();
                 let obj = obj.typecheck(sig, locals, asm)?;
-                // `castclass` requires an object reference on the stack (same accept-set as `isinst`
-                // / `UnboxAny`). The result is the target ref, exactly as `castclass T` yields a `T`.
-                match obj {
-                    Type::ClassRef(cref) => {
-                        if asm.class_ref(cref).is_valuetype() {
-                            return Err(TypeCheckError::ExpectedClassGotValuetype {
-                                cref: asm.class_ref(cref).clone(),
-                            });
-                        }
-                    }
-                    Type::PlatformObject
-                    | Type::PlatformGeneric(_, _)
-                    | Type::PlatformString
-                    | Type::PlatformArray { .. } => (),
-                    _ => return Err(TypeCheckError::TypeNotClass { object: obj }),
-                }
+                // `castclass` uses the same operand set as `isinst`; its result is the target ref.
+                require_managed_object(obj, asm)?;
                 Ok(asm[*cast_res])
             }
 
@@ -1153,10 +943,7 @@ impl CILNode {
                 if dims.get() != 1 {
                     return Err(TypeCheckError::LdLenArrNot1D { got: arr_tpe });
                 }
-                match index_tpe {
-                    Type::Int(Int::I32 | Int::U32 | Int::I64 | Int::USize | Int::ISize) => (),
-                    _ => return Err(TypeCheckError::ArrIndexInvalidType { index_tpe }),
-                }
+                require_array_index(index_tpe)?;
                 Ok(asm[elem])
             }
             CILNode::LdElem { array, index, elem } => {
@@ -1172,10 +959,7 @@ impl CILNode {
                 if dims.get() != 1 {
                     return Err(TypeCheckError::LdLenArrNot1D { got: arr_tpe });
                 }
-                match index_tpe {
-                    Type::Int(Int::I32 | Int::U32 | Int::I64 | Int::USize | Int::ISize) => (),
-                    _ => return Err(TypeCheckError::ArrIndexInvalidType { index_tpe }),
-                }
+                require_array_index(index_tpe)?;
                 let expected = asm[array_elem];
                 let requested = asm[*elem];
                 if expected != requested {
@@ -1251,6 +1035,13 @@ fn require_root_pointer(operation: &'static str, got: Type) -> Result<(), TypeCh
         Ok(())
     } else {
         Err(TypeCheckError::RootOperandType { operation, got })
+    }
+}
+
+fn require_array_index(index_tpe: Type) -> Result<(), TypeCheckError> {
+    match index_tpe {
+        Type::Int(Int::I32 | Int::U32 | Int::I64 | Int::USize | Int::ISize) => Ok(()),
+        _ => Err(TypeCheckError::ArrIndexInvalidType { index_tpe }),
     }
 }
 
@@ -1413,8 +1204,7 @@ impl CILRoot {
                     super::BranchCond::True(cond) | super::BranchCond::False(cond) => {
                         let cond = asm[*cond].clone().typecheck(sig, locals, asm)?;
                         match cond {
-                            Type::Bool => Ok(()),
-                            Type::Int(_) => Ok(()),
+                            Type::Bool | Type::Int(_) => Ok(()),
                             _ => Err(TypeCheckError::ConditionNotBool { cond }),
                         }
                     }
@@ -1499,39 +1289,7 @@ impl CILRoot {
                 // through a struct pointer) OR — for a managed REFERENCE type — the object reference
                 // itself (`stfld` on an objref is valid CIL; the exporter emits exactly that). This
                 // mirrors the `LdField` check above, which already accepts a direct `ClassRef`.
-                let pointed_tpe = match addr {
-                    Type::Ptr(type_idx) | Type::Ref(type_idx) => Some(asm[type_idx]),
-                    Type::ClassRef(_) => Some(addr),
-                    _ => None,
-                }
-                .ok_or(TypeCheckError::TypeNotPtr { tpe: addr })?;
-                let Type::ClassRef(pointed_owner) = pointed_tpe else {
-                    return Err(TypeCheckError::FieldAccessInvalidType {
-                        tpe: pointed_tpe,
-                        field,
-                    });
-                };
-                if pointed_owner != field.owner() {
-                    return Err(TypeCheckError::FieldOwnerMismatch {
-                        owner: pointed_owner,
-                        expected_owner: field.owner(),
-                        field,
-                    });
-                }
-                // Check that this type owns a matching field
-                if let Some(cdef) = asm.class_ref_to_def(field.owner()) {
-                    if !asm[cdef]
-                        .fields()
-                        .iter()
-                        .any(|(tpe, name, _offset)| *tpe == field.tpe() && *name == field.name())
-                    {
-                        return Err(TypeCheckError::FieldNotPresent {
-                            tpe: field.tpe(),
-                            name: field.name(),
-                            owner: field.owner(),
-                        });
-                    }
-                }
+                validate_field_target(asm, addr, field)?;
                 Ok(())
             }
             Self::Call(boxed) => {
@@ -1658,10 +1416,7 @@ impl CILRoot {
                 if dims.get() != 1 {
                     return Err(TypeCheckError::LdLenArrNot1D { got: arr_tpe });
                 }
-                match index_tpe {
-                    Type::Int(Int::I32 | Int::U32 | Int::I64 | Int::USize | Int::ISize) => (),
-                    _ => return Err(TypeCheckError::ArrIndexInvalidType { index_tpe }),
-                }
+                require_array_index(index_tpe)?;
                 let elem_tpe = asm[*elem];
                 // The declared element type must match the array's element type (modulo sign).
                 if !(asm[arr_elem] == elem_tpe

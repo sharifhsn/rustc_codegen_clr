@@ -511,11 +511,3 @@ fn macro_test() {
     let mut asm = super::Assembly::default();
     sum(&mut asm);
 }
-/*
-
-
-gen_binop! {div,  crate::BinOp::Div}
-gen_binop! {div_un,  crate::BinOp::Div}
-gen_binop! {rem,  crate::BinOp::Rem}
-gen_binop! {rem_un,  crate::BinOp::RemUn}
- */

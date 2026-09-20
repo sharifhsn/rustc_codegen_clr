@@ -382,13 +382,6 @@ pub fn escape_class_name(name: &str) -> String {
         .replace('!', "_excl_")
         .replace('\"', "_qt_")
 }
-/*
-#[test]
-fn argv() {
-    let mut asm = Assembly::empty();
-    argc_argv_init_method(&mut asm);
-} */
-
 #[test]
 fn environ() {
     let mut asm = Assembly::default();

@@ -105,6 +105,196 @@ impl<T> ReadOnlyList<T> {
 // name the impl assembly (the same rule the generic bridge documents).
 const CORELIB: &str = "System.Private.CoreLib";
 
+macro_rules! managed_collection_default {
+    ($type:ident<$($generic:ident),+>) => {
+        impl<$($generic),+> Default for $type<$($generic),+> {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+    };
+}
+
+macro_rules! managed_collection_basics {
+    ($type:ident<$($generic:ident),+>, $handle:ident, $ctor:ident, $count:ident, $clear:ident) => {
+        impl<$($generic),+> $type<$($generic),+> {
+            pub fn new() -> Self {
+                Self { h: $ctor::<$($generic),+>() }
+            }
+
+            pub fn len(&self) -> i32 {
+                $count::<$($generic),+>(self.h)
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.len() == 0
+            }
+
+            pub fn clear(&mut self) {
+                $clear::<$($generic),+>(self.h)
+            }
+
+            pub fn handle(&self) -> $handle<$($generic),+> {
+                self.h
+            }
+        }
+
+        managed_collection_default!($type<$($generic),+>);
+    };
+}
+
+macro_rules! managed_collection_basics_with_empty {
+    ($type:ident<$($generic:ident),+>, $handle:ident, $ctor:ident, $count:ident, $empty:ident, $clear:ident) => {
+        impl<$($generic),+> $type<$($generic),+> {
+            pub fn new() -> Self {
+                Self { h: $ctor::<$($generic),+>() }
+            }
+
+            pub fn len(&self) -> i32 {
+                $count::<$($generic),+>(self.h)
+            }
+
+            pub fn is_empty(&self) -> bool {
+                $empty::<$($generic),+>(self.h)
+            }
+
+            pub fn clear(&mut self) {
+                $clear::<$($generic),+>(self.h)
+            }
+
+            pub fn handle(&self) -> $handle<$($generic),+> {
+                self.h
+            }
+        }
+
+        managed_collection_default!($type<$($generic),+>);
+    };
+}
+
+macro_rules! managed_collection_basics_with_empty_no_clear {
+    ($type:ident<$($generic:ident),+>, $handle:ident, $ctor:ident, $count:ident, $empty:ident) => {
+        impl<$($generic),+> $type<$($generic),+> {
+            pub fn new() -> Self {
+                Self { h: $ctor::<$($generic),+>() }
+            }
+
+            pub fn len(&self) -> i32 {
+                $count::<$($generic),+>(self.h)
+            }
+
+            pub fn is_empty(&self) -> bool {
+                $empty::<$($generic),+>(self.h)
+            }
+
+            pub fn handle(&self) -> $handle<$($generic),+> {
+                self.h
+            }
+        }
+
+        managed_collection_default!($type<$($generic),+>);
+    };
+}
+
+macro_rules! managed_collection_iter {
+    ($type:ident<$generic:ident>) => {
+        impl<$generic> crate::enumerate::Enumerable<$generic> for $type<$generic> {
+            fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<$generic> {
+                crate::enumerate::as_enum_handle(self.h)
+            }
+        }
+
+        impl<'a, $generic: crate::NativeStorageSafe> IntoIterator for &'a $type<$generic> {
+            type Item = $generic;
+            type IntoIter = crate::enumerate::Enumerator<$generic>;
+
+            fn into_iter(self) -> Self::IntoIter {
+                use crate::enumerate::Enumerable;
+                self.iter_enumerator()
+            }
+        }
+    };
+}
+
+macro_rules! managed_collection_sequence_traits {
+    ($type:ident<$generic:ident>, $append:ident) => {
+        impl<$generic> FromIterator<$generic> for $type<$generic> {
+            fn from_iter<I: IntoIterator<Item = $generic>>(iter: I) -> Self {
+                let mut collection = Self::new();
+                for item in iter {
+                    collection.$append(item);
+                }
+                collection
+            }
+        }
+
+        impl<$generic> Extend<$generic> for $type<$generic> {
+            fn extend<I: IntoIterator<Item = $generic>>(&mut self, iter: I) {
+                for item in iter {
+                    self.$append(item);
+                }
+            }
+        }
+    };
+}
+
+macro_rules! managed_map_lookup {
+    ($type:ident<$key:ident, $value:ident>, $contains:ident, $get:ident) => {
+        impl<$key: Copy, $value> $type<$key, $value> {
+            pub fn get(&self, key: $key) -> Option<$value> {
+                if $contains::<$key, $value>(self.h, key) {
+                    Some($get::<$key, $value>(self.h, key))
+                } else {
+                    None
+                }
+            }
+
+            pub fn get_or_default(&self, key: $key, default: $value) -> $value {
+                if $contains::<$key, $value>(self.h, key) {
+                    $get::<$key, $value>(self.h, key)
+                } else {
+                    default
+                }
+            }
+        }
+    };
+}
+
+macro_rules! managed_map_mutation {
+    ($type:ident<$key:ident, $value:ident>, $set:ident, $contains:ident, $remove:ident) => {
+        impl<$key, $value> $type<$key, $value> {
+            pub fn insert(&mut self, key: $key, value: $value) {
+                $set::<$key, $value>(self.h, key, value)
+            }
+
+            pub fn contains_key(&self, key: $key) -> bool {
+                $contains::<$key, $value>(self.h, key)
+            }
+
+            pub fn remove(&mut self, key: $key) -> bool {
+                $remove::<$key, $value>(self.h, key)
+            }
+        }
+    };
+}
+
+macro_rules! managed_set_mutation {
+    ($type:ident<$generic:ident>, $add:ident, $contains:ident, $remove:ident) => {
+        impl<$generic> $type<$generic> {
+            pub fn insert(&mut self, item: $generic) -> bool {
+                $add::<$generic>(self.h, item)
+            }
+
+            pub fn contains(&self, item: $generic) -> bool {
+                $contains::<$generic>(self.h, item)
+            }
+
+            pub fn remove(&mut self, item: $generic) -> bool {
+                $remove::<$generic>(self.h, item)
+            }
+        }
+    };
+}
+
 const ILIST: &str = "System.Collections.Generic.IList";
 const ICOLLECTION: &str = "System.Collections.Generic.ICollection";
 const IDICTIONARY: &str = "System.Collections.Generic.IDictionary";
@@ -430,19 +620,11 @@ mod list {
         h: Handle<T>,
     }
 
+    managed_collection_basics!(List<T>, Handle, raw_ctor, raw_count, raw_clear);
+    managed_collection_iter!(List<T>);
+    managed_collection_sequence_traits!(List<T>, push);
+
     impl<T> List<T> {
-        /// `new List<T>()`.
-        pub fn new() -> Self {
-            Self { h: raw_ctor::<T>() }
-        }
-        /// Number of elements (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<T>(self.h)
-        }
-        /// `true` if empty.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
         /// Append `item` (`Add`).
         pub fn push(&mut self, item: T) {
             raw_add::<T>(self.h, item)
@@ -489,10 +671,6 @@ mod list {
         /// Index of the first occurrence of `item`, or `-1` (`IndexOf`).
         pub fn index_of(&self, item: T) -> i32 {
             raw_index_of::<T>(self.h, item)
-        }
-        /// Remove all elements (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<T>(self.h)
         }
         /// Apply a callback to each element in order (`List<T>.ForEach(Action<T>)`) — the .NET side
         /// drives the Rust `extern "C" fn` through a managed delegate. Pass a top-level fn or a
@@ -566,21 +744,11 @@ mod list {
                 len: self.len(),
             }
         }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<T> {
-            self.h
-        }
         /// Consume this list and project it as the familiar producer-side `IEnumerable<T>`
         /// interface without copying its elements.
         pub fn into_enumerable(self) -> crate::enumerate::ManagedEnumerable<T> {
             let interface = crate::enumerate::as_enum_handle::<_, T>(self.h);
             crate::enumerate::ManagedEnumerable::from_raw(interface)
-        }
-    }
-
-    impl<T> Default for List<T> {
-        fn default() -> Self {
-            Self::new()
         }
     }
 
@@ -643,40 +811,6 @@ mod list {
         }
     }
 
-    impl<T> FromIterator<T> for List<T> {
-        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-            let mut l = Self::new();
-            for item in iter {
-                l.push(item);
-            }
-            l
-        }
-    }
-
-    impl<T> Extend<T> for List<T> {
-        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-            for item in iter {
-                self.push(item);
-            }
-        }
-    }
-
-    // By-reference iteration via the enumerator bridge: `for x in &list` drives the .NET
-    // `IEnumerator<T>` (`GetEnumerator`/`MoveNext`/`Current`) rather than an index loop.
-    impl<T> crate::enumerate::Enumerable<T> for List<T> {
-        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            crate::enumerate::as_enum_handle(self.h)
-        }
-    }
-    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a List<T> {
-        type Item = T;
-        type IntoIter = crate::enumerate::Enumerator<T>;
-        fn into_iter(self) -> Self::IntoIter {
-            use crate::enumerate::Enumerable;
-            self.iter_enumerator()
-        }
-    }
-
     /// By-value iterator over a [`List`] (see [`List::iter`]).
     pub struct ListIter<T> {
         h: Handle<T>,
@@ -729,62 +863,9 @@ mod dictionary {
         h: Handle<K, V>,
     }
 
-    impl<K, V> Dictionary<K, V> {
-        /// `new Dictionary<K, V>()`.
-        pub fn new() -> Self {
-            Self {
-                h: raw_ctor::<K, V>(),
-            }
-        }
-        /// Number of entries (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<K, V>(self.h)
-        }
-        /// `true` if empty.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
-        /// Insert or overwrite `key => value` (the indexer `set_Item` — never throws on a duplicate).
-        pub fn insert(&mut self, key: K, value: V) {
-            raw_set::<K, V>(self.h, key, value)
-        }
-        /// Whether `key` is present (`ContainsKey`).
-        pub fn contains_key(&self, key: K) -> bool {
-            raw_contains::<K, V>(self.h, key)
-        }
-        /// Remove `key`; returns whether it was present (`Remove`).
-        pub fn remove(&mut self, key: K) -> bool {
-            raw_remove::<K, V>(self.h, key)
-        }
-        /// Remove all entries (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<K, V>(self.h)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<K, V> {
-            self.h
-        }
-    }
-
-    impl<K: Copy, V> Dictionary<K, V> {
-        /// The value for `key`, or `None` if absent (checks `ContainsKey` first, so it never throws;
-        /// `K: Copy` because the key is used for both the presence check and the lookup).
-        pub fn get(&self, key: K) -> Option<V> {
-            if raw_contains::<K, V>(self.h, key) {
-                Some(raw_get::<K, V>(self.h, key))
-            } else {
-                None
-            }
-        }
-        /// The value for `key`, or `default` if the key is absent (never throws, never inserts).
-        pub fn get_or_default(&self, key: K, default: V) -> V {
-            if raw_contains::<K, V>(self.h, key) {
-                raw_get::<K, V>(self.h, key)
-            } else {
-                default
-            }
-        }
-    }
+    managed_collection_basics!(Dictionary<K, V>, Handle, raw_ctor, raw_count, raw_clear);
+    managed_map_lookup!(Dictionary<K, V>, raw_contains, raw_get);
+    managed_map_mutation!(Dictionary<K, V>, raw_set, raw_contains, raw_remove);
 
     impl<K: crate::NativeStorageSafe, V: crate::NativeStorageSafe> Dictionary<K, V> {
         /// Iterate the `(key, value)` entries (`for (k, v) in &dict` / `dict.iter()`), driving the
@@ -825,12 +906,6 @@ mod dictionary {
             self.iter()
         }
     }
-
-    impl<K, V> Default for Dictionary<K, V> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
 }
 
 mod hash_set {
@@ -856,79 +931,10 @@ mod hash_set {
         h: Handle<T>,
     }
 
-    impl<T> HashSet<T> {
-        /// `new HashSet<T>()`.
-        pub fn new() -> Self {
-            Self { h: raw_ctor::<T>() }
-        }
-        /// Number of elements (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<T>(self.h)
-        }
-        /// `true` if empty.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
-        /// Insert `item`; returns `true` if it was newly added, `false` if already present (`Add`).
-        pub fn insert(&mut self, item: T) -> bool {
-            raw_add::<T>(self.h, item)
-        }
-        /// Whether `item` is present (`Contains`).
-        pub fn contains(&self, item: T) -> bool {
-            raw_contains::<T>(self.h, item)
-        }
-        /// Remove `item`; returns whether it was present (`Remove`).
-        pub fn remove(&mut self, item: T) -> bool {
-            raw_remove::<T>(self.h, item)
-        }
-        /// Remove all elements (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<T>(self.h)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<T> {
-            self.h
-        }
-    }
-
-    impl<T> Default for HashSet<T> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    // Iteration via the enumerator bridge (order is the .NET set's internal order, as in C#).
-    impl<T> crate::enumerate::Enumerable<T> for HashSet<T> {
-        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            crate::enumerate::as_enum_handle(self.h)
-        }
-    }
-    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a HashSet<T> {
-        type Item = T;
-        type IntoIter = crate::enumerate::Enumerator<T>;
-        fn into_iter(self) -> Self::IntoIter {
-            use crate::enumerate::Enumerable;
-            self.iter_enumerator()
-        }
-    }
-
-    impl<T> FromIterator<T> for HashSet<T> {
-        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-            let mut s = Self::new();
-            for item in iter {
-                s.insert(item);
-            }
-            s
-        }
-    }
-
-    impl<T> Extend<T> for HashSet<T> {
-        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-            for item in iter {
-                self.insert(item);
-            }
-        }
-    }
+    managed_collection_basics!(HashSet<T>, Handle, raw_ctor, raw_count, raw_clear);
+    managed_collection_iter!(HashSet<T>);
+    managed_collection_sequence_traits!(HashSet<T>, insert);
+    managed_set_mutation!(HashSet<T>, raw_add, raw_contains, raw_remove);
 }
 
 mod stack {
@@ -958,19 +964,10 @@ mod stack {
         h: Handle<T>,
     }
 
+    managed_collection_basics!(Stack<T>, Handle, raw_ctor, raw_count, raw_clear);
+    managed_collection_iter!(Stack<T>);
+
     impl<T> Stack<T> {
-        /// `new Stack<T>()`.
-        pub fn new() -> Self {
-            Self { h: raw_ctor::<T>() }
-        }
-        /// Number of elements (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<T>(self.h)
-        }
-        /// `true` if empty.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
         /// Push `item` onto the top (`Push`).
         pub fn push(&mut self, item: T) {
             raw_push::<T>(self.h, item)
@@ -990,35 +987,6 @@ mod stack {
             } else {
                 None
             }
-        }
-        /// Remove all elements (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<T>(self.h)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<T> {
-            self.h
-        }
-    }
-
-    impl<T> Default for Stack<T> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    // Iteration via the enumerator bridge. `Stack<T>` enumerates LIFO (top first), matching C#.
-    impl<T> crate::enumerate::Enumerable<T> for Stack<T> {
-        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            crate::enumerate::as_enum_handle(self.h)
-        }
-    }
-    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a Stack<T> {
-        type Item = T;
-        type IntoIter = crate::enumerate::Enumerator<T>;
-        fn into_iter(self) -> Self::IntoIter {
-            use crate::enumerate::Enumerable;
-            self.iter_enumerator()
         }
     }
 }
@@ -1048,19 +1016,10 @@ mod queue {
         h: Handle<T>,
     }
 
+    managed_collection_basics!(Queue<T>, Handle, raw_ctor, raw_count, raw_clear);
+    managed_collection_iter!(Queue<T>);
+
     impl<T> Queue<T> {
-        /// `new Queue<T>()`.
-        pub fn new() -> Self {
-            Self { h: raw_ctor::<T>() }
-        }
-        /// Number of elements (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<T>(self.h)
-        }
-        /// `true` if empty.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
         /// Add `item` to the back (`Enqueue`).
         pub fn enqueue(&mut self, item: T) {
             raw_enqueue::<T>(self.h, item)
@@ -1080,35 +1039,6 @@ mod queue {
             } else {
                 None
             }
-        }
-        /// Remove all elements (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<T>(self.h)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<T> {
-            self.h
-        }
-    }
-
-    impl<T> Default for Queue<T> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    // Iteration via the enumerator bridge. `Queue<T>` enumerates FIFO (front first), matching C#.
-    impl<T> crate::enumerate::Enumerable<T> for Queue<T> {
-        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            crate::enumerate::as_enum_handle(self.h)
-        }
-    }
-    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a Queue<T> {
-        type Item = T;
-        type IntoIter = crate::enumerate::Enumerator<T>;
-        fn into_iter(self) -> Self::IntoIter {
-            use crate::enumerate::Enumerable;
-            self.iter_enumerator()
         }
     }
 }
@@ -1142,67 +1072,15 @@ mod sorted_dictionary {
         h: Handle<K, V>,
     }
 
-    impl<K, V> SortedDictionary<K, V> {
-        /// `new SortedDictionary<K, V>()`.
-        pub fn new() -> Self {
-            Self {
-                h: raw_ctor::<K, V>(),
-            }
-        }
-        /// Number of entries (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<K, V>(self.h)
-        }
-        /// `true` if empty.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
-        /// Insert or overwrite `key => value` (the indexer `set_Item` — never throws on a duplicate).
-        pub fn insert(&mut self, key: K, value: V) {
-            raw_set::<K, V>(self.h, key, value)
-        }
-        /// Whether `key` is present (`ContainsKey`).
-        pub fn contains_key(&self, key: K) -> bool {
-            raw_contains::<K, V>(self.h, key)
-        }
-        /// Remove `key`; returns whether it was present (`Remove`).
-        pub fn remove(&mut self, key: K) -> bool {
-            raw_remove::<K, V>(self.h, key)
-        }
-        /// Remove all entries (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<K, V>(self.h)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<K, V> {
-            self.h
-        }
-    }
-
-    impl<K: Copy, V> SortedDictionary<K, V> {
-        /// The value for `key`, or `None` if absent (checks `ContainsKey` first, so it never throws).
-        pub fn get(&self, key: K) -> Option<V> {
-            if raw_contains::<K, V>(self.h, key) {
-                Some(raw_get::<K, V>(self.h, key))
-            } else {
-                None
-            }
-        }
-        /// The value for `key`, or `default` if the key is absent (never throws, never inserts).
-        pub fn get_or_default(&self, key: K, default: V) -> V {
-            if raw_contains::<K, V>(self.h, key) {
-                raw_get::<K, V>(self.h, key)
-            } else {
-                default
-            }
-        }
-    }
-
-    impl<K, V> Default for SortedDictionary<K, V> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
+    managed_collection_basics!(
+        SortedDictionary<K, V>,
+        Handle,
+        raw_ctor,
+        raw_count,
+        raw_clear
+    );
+    managed_map_lookup!(SortedDictionary<K, V>, raw_contains, raw_get);
+    managed_map_mutation!(SortedDictionary<K, V>, raw_set, raw_contains, raw_remove);
 }
 
 mod sorted_set {
@@ -1233,79 +1111,10 @@ mod sorted_set {
         h: Handle<T>,
     }
 
-    impl<T> SortedSet<T> {
-        /// `new SortedSet<T>()`.
-        pub fn new() -> Self {
-            Self { h: raw_ctor::<T>() }
-        }
-        /// Number of elements (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<T>(self.h)
-        }
-        /// `true` if empty.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
-        /// Insert `item`; returns `true` if it was newly added, `false` if already present (`Add`).
-        pub fn insert(&mut self, item: T) -> bool {
-            raw_add::<T>(self.h, item)
-        }
-        /// Whether `item` is present (`Contains`).
-        pub fn contains(&self, item: T) -> bool {
-            raw_contains::<T>(self.h, item)
-        }
-        /// Remove `item`; returns whether it was present (`Remove`).
-        pub fn remove(&mut self, item: T) -> bool {
-            raw_remove::<T>(self.h, item)
-        }
-        /// Remove all elements (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<T>(self.h)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<T> {
-            self.h
-        }
-    }
-
-    impl<T> Default for SortedSet<T> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    // Iteration via the enumerator bridge — yields elements in ascending sorted order (as in C#).
-    impl<T> crate::enumerate::Enumerable<T> for SortedSet<T> {
-        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            crate::enumerate::as_enum_handle(self.h)
-        }
-    }
-    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a SortedSet<T> {
-        type Item = T;
-        type IntoIter = crate::enumerate::Enumerator<T>;
-        fn into_iter(self) -> Self::IntoIter {
-            use crate::enumerate::Enumerable;
-            self.iter_enumerator()
-        }
-    }
-
-    impl<T> FromIterator<T> for SortedSet<T> {
-        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-            let mut s = Self::new();
-            for item in iter {
-                s.insert(item);
-            }
-            s
-        }
-    }
-
-    impl<T> Extend<T> for SortedSet<T> {
-        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-            for item in iter {
-                self.insert(item);
-            }
-        }
-    }
+    managed_collection_basics!(SortedSet<T>, Handle, raw_ctor, raw_count, raw_clear);
+    managed_collection_iter!(SortedSet<T>);
+    managed_collection_sequence_traits!(SortedSet<T>, insert);
+    managed_set_mutation!(SortedSet<T>, raw_add, raw_contains, raw_remove);
 }
 
 mod linked_list {
@@ -1375,19 +1184,11 @@ mod linked_list {
         h: Handle<T>,
     }
 
+    managed_collection_basics!(LinkedList<T>, Handle, raw_ctor, raw_count, raw_clear);
+    managed_collection_iter!(LinkedList<T>);
+    managed_collection_sequence_traits!(LinkedList<T>, push_back);
+
     impl<T> LinkedList<T> {
-        /// `new LinkedList<T>()`.
-        pub fn new() -> Self {
-            Self { h: raw_ctor::<T>() }
-        }
-        /// Number of elements (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<T>(self.h)
-        }
-        /// `true` if empty.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
         /// Append `item` at the end (`AddLast`, reached through `ICollection<T>.Add`).
         pub fn push_back(&mut self, item: T) {
             let ic = crate::intrinsics::rustc_clr_interop_managed_checked_cast::<
@@ -1407,53 +1208,6 @@ mod linked_list {
         /// Remove the first node whose value equals `item`; returns whether one was found (`Remove`).
         pub fn remove(&mut self, item: T) -> bool {
             raw_remove::<T>(self.h, item)
-        }
-        /// Remove all elements (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<T>(self.h)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<T> {
-            self.h
-        }
-    }
-
-    impl<T> Default for LinkedList<T> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    // Iteration via the enumerator bridge — front-to-back order (as in C#).
-    impl<T> crate::enumerate::Enumerable<T> for LinkedList<T> {
-        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            crate::enumerate::as_enum_handle(self.h)
-        }
-    }
-    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a LinkedList<T> {
-        type Item = T;
-        type IntoIter = crate::enumerate::Enumerator<T>;
-        fn into_iter(self) -> Self::IntoIter {
-            use crate::enumerate::Enumerable;
-            self.iter_enumerator()
-        }
-    }
-
-    impl<T> FromIterator<T> for LinkedList<T> {
-        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-            let mut l = Self::new();
-            for item in iter {
-                l.push_back(item);
-            }
-            l
-        }
-    }
-
-    impl<T> Extend<T> for LinkedList<T> {
-        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-            for item in iter {
-                self.push_back(item);
-            }
         }
     }
 }
@@ -1484,21 +1238,9 @@ mod priority_queue {
         h: Handle<E, P>,
     }
 
+    managed_collection_basics!(PriorityQueue<E, P>, Handle, raw_ctor, raw_count, raw_clear);
+
     impl<E, P> PriorityQueue<E, P> {
-        /// `new PriorityQueue<TElement, TPriority>()`.
-        pub fn new() -> Self {
-            Self {
-                h: raw_ctor::<E, P>(),
-            }
-        }
-        /// Number of elements (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<E, P>(self.h)
-        }
-        /// `true` if empty.
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
         /// Add `element` with the given `priority` (`Enqueue`).
         pub fn enqueue(&mut self, element: E, priority: P) {
             raw_enqueue::<E, P>(self.h, element, priority)
@@ -1519,20 +1261,6 @@ mod priority_queue {
             } else {
                 None
             }
-        }
-        /// Remove all elements (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<E, P>(self.h)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<E, P> {
-            self.h
-        }
-    }
-
-    impl<E, P> Default for PriorityQueue<E, P> {
-        fn default() -> Self {
-            Self::new()
         }
     }
 }
@@ -1567,21 +1295,17 @@ mod concurrent_dictionary {
         h: Handle<K, V>,
     }
 
+    managed_collection_basics_with_empty!(
+        ConcurrentDictionary<K, V>,
+        Handle,
+        raw_ctor,
+        raw_count,
+        raw_empty,
+        raw_clear
+    );
+    managed_map_lookup!(ConcurrentDictionary<K, V>, raw_contains, raw_get);
+
     impl<K, V> ConcurrentDictionary<K, V> {
-        /// `new ConcurrentDictionary<K, V>()`.
-        pub fn new() -> Self {
-            Self {
-                h: raw_ctor::<K, V>(),
-            }
-        }
-        /// Number of entries (`Count`).
-        pub fn len(&self) -> i32 {
-            raw_count::<K, V>(self.h)
-        }
-        /// `true` if empty (`IsEmpty` — the lock-free property, not `Count == 0`).
-        pub fn is_empty(&self) -> bool {
-            raw_empty::<K, V>(self.h)
-        }
         /// Insert or overwrite `key => value` (the indexer `set_Item`).
         pub fn insert(&mut self, key: K, value: V) {
             raw_set::<K, V>(self.h, key, value)
@@ -1594,39 +1318,6 @@ mod concurrent_dictionary {
         /// Whether `key` is present (`ContainsKey`).
         pub fn contains_key(&self, key: K) -> bool {
             raw_contains::<K, V>(self.h, key)
-        }
-        /// Remove all entries (`Clear`).
-        pub fn clear(&mut self) {
-            raw_clear::<K, V>(self.h)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<K, V> {
-            self.h
-        }
-    }
-
-    impl<K: Copy, V> ConcurrentDictionary<K, V> {
-        /// The value for `key`, or `None` if absent (checks `ContainsKey` first, so it never throws).
-        pub fn get(&self, key: K) -> Option<V> {
-            if raw_contains::<K, V>(self.h, key) {
-                Some(raw_get::<K, V>(self.h, key))
-            } else {
-                None
-            }
-        }
-        /// The value for `key`, or `default` if the key is absent (never throws, never inserts).
-        pub fn get_or_default(&self, key: K, default: V) -> V {
-            if raw_contains::<K, V>(self.h, key) {
-                raw_get::<K, V>(self.h, key)
-            } else {
-                default
-            }
-        }
-    }
-
-    impl<K, V> Default for ConcurrentDictionary<K, V> {
-        fn default() -> Self {
-            Self::new()
         }
     }
 }
@@ -1660,65 +1351,20 @@ mod concurrent_queue {
         h: Handle<T>,
     }
 
+    managed_collection_basics_with_empty_no_clear!(
+        ConcurrentQueue<T>,
+        Handle,
+        raw_ctor,
+        raw_count,
+        raw_empty
+    );
+    managed_collection_iter!(ConcurrentQueue<T>);
+    managed_collection_sequence_traits!(ConcurrentQueue<T>, enqueue);
+
     impl<T> ConcurrentQueue<T> {
-        /// `new ConcurrentQueue<T>()`.
-        pub fn new() -> Self {
-            Self { h: raw_ctor::<T>() }
-        }
-        /// Number of elements at this instant (`Count` — a snapshot for a concurrent collection).
-        pub fn len(&self) -> i32 {
-            raw_count::<T>(self.h)
-        }
-        /// `true` if empty (`IsEmpty` — the lock-free property).
-        pub fn is_empty(&self) -> bool {
-            raw_empty::<T>(self.h)
-        }
         /// Add `item` to the back (`Enqueue`).
         pub fn enqueue(&mut self, item: T) {
             raw_enqueue::<T>(self.h, item)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<T> {
-            self.h
-        }
-    }
-
-    impl<T> Default for ConcurrentQueue<T> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    // Iteration via the enumerator bridge — a moment-in-time snapshot, front-to-back (as in C#).
-    impl<T> crate::enumerate::Enumerable<T> for ConcurrentQueue<T> {
-        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            crate::enumerate::as_enum_handle(self.h)
-        }
-    }
-    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a ConcurrentQueue<T> {
-        type Item = T;
-        type IntoIter = crate::enumerate::Enumerator<T>;
-        fn into_iter(self) -> Self::IntoIter {
-            use crate::enumerate::Enumerable;
-            self.iter_enumerator()
-        }
-    }
-
-    impl<T> FromIterator<T> for ConcurrentQueue<T> {
-        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-            let mut q = Self::new();
-            for item in iter {
-                q.enqueue(item);
-            }
-            q
-        }
-    }
-
-    impl<T> Extend<T> for ConcurrentQueue<T> {
-        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-            for item in iter {
-                self.enqueue(item);
-            }
         }
     }
 }
@@ -1752,65 +1398,20 @@ mod concurrent_bag {
         h: Handle<T>,
     }
 
+    managed_collection_basics_with_empty_no_clear!(
+        ConcurrentBag<T>,
+        Handle,
+        raw_ctor,
+        raw_count,
+        raw_empty
+    );
+    managed_collection_iter!(ConcurrentBag<T>);
+    managed_collection_sequence_traits!(ConcurrentBag<T>, add);
+
     impl<T> ConcurrentBag<T> {
-        /// `new ConcurrentBag<T>()`.
-        pub fn new() -> Self {
-            Self { h: raw_ctor::<T>() }
-        }
-        /// Number of elements at this instant (`Count` — a snapshot for a concurrent collection).
-        pub fn len(&self) -> i32 {
-            raw_count::<T>(self.h)
-        }
-        /// `true` if empty (`IsEmpty`).
-        pub fn is_empty(&self) -> bool {
-            raw_empty::<T>(self.h)
-        }
         /// Add `item` to the bag (`Add`).
         pub fn add(&mut self, item: T) {
             raw_add::<T>(self.h, item)
-        }
-        /// The raw managed handle, for advanced interop.
-        pub fn handle(&self) -> Handle<T> {
-            self.h
-        }
-    }
-
-    impl<T> Default for ConcurrentBag<T> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    // Iteration via the enumerator bridge — a moment-in-time snapshot, unordered (as in C#).
-    impl<T> crate::enumerate::Enumerable<T> for ConcurrentBag<T> {
-        fn enumerable_handle(&self) -> crate::enumerate::IEnumerable<T> {
-            crate::enumerate::as_enum_handle(self.h)
-        }
-    }
-    impl<'a, T: crate::NativeStorageSafe> IntoIterator for &'a ConcurrentBag<T> {
-        type Item = T;
-        type IntoIter = crate::enumerate::Enumerator<T>;
-        fn into_iter(self) -> Self::IntoIter {
-            use crate::enumerate::Enumerable;
-            self.iter_enumerator()
-        }
-    }
-
-    impl<T> FromIterator<T> for ConcurrentBag<T> {
-        fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-            let mut b = Self::new();
-            for item in iter {
-                b.add(item);
-            }
-            b
-        }
-    }
-
-    impl<T> Extend<T> for ConcurrentBag<T> {
-        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-            for item in iter {
-                self.add(item);
-            }
         }
     }
 }

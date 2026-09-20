@@ -30,7 +30,7 @@ cp -R "$fixture_consumer" "$work/metadata-consumer"
 
 # Build a real .crate archive from the committed fixture before measuring the ambient source.
 # The cargo-dotnet invocation below is the subject under test; this setup never shares its cache.
-CARGO_TARGET_DIR="$work/package-target" cargo +nightly-2026-06-17 package \
+CARGO_TARGET_DIR="$work/package-target" cargo +nightly-2026-09-18 package \
     --manifest-path "$fixture_crate/Cargo.toml" --allow-dirty --no-verify > "$work/logs/package.log" 2>&1
 archive="$work/package-target/package/rcl-private-registry-probe-0.1.0.crate"
 [[ -f "$archive" ]]

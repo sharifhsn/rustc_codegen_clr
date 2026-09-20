@@ -49,37 +49,35 @@ fn decall_tuple_ctors(blocks: &mut [BasicBlock], locals: &[LocalDef], asm: &mut 
         let old = std::mem::take(block.roots_mut());
         let mut new_roots = Vec::with_capacity(old.len());
         for rid in old {
-            if let CILRoot::StLoc(t, val) = asm.get_root(rid).clone() {
-                if let CILNode::Call(info) = asm.get_node(val).clone() {
-                    let (mref, args, _pure) = *info;
-                    if asm[mref].name() == ovf_name && args.len() == 2 {
-                        if let Some(cref) = asm[locals[t as usize].1].as_class_ref() {
-                            if let Some(cdef) = asm.class_ref_to_def(cref) {
-                                let it1 = asm[cdef]
-                                    .fields()
-                                    .iter()
-                                    .find(|(_, n, _)| *n == item1_s)
-                                    .map(|(t, _, _)| *t);
-                                let it2 = asm[cdef]
-                                    .fields()
-                                    .iter()
-                                    .find(|(_, n, _)| *n == item2_s)
-                                    .map(|(t, _, _)| *t);
-                                if let (Some(it1), Some(it2)) = (it1, it2) {
-                                    let f1 = asm.alloc_field(FieldDesc::new(cref, item1_s, it1));
-                                    let f2 = asm.alloc_field(FieldDesc::new(cref, item2_s, it2));
-                                    let addr = asm.alloc_node(CILNode::LdLocA(t));
-                                    new_roots.push(asm.alloc_root(CILRoot::SetField(Box::new((
-                                        f1, addr, args[0],
-                                    )))));
-                                    new_roots.push(asm.alloc_root(CILRoot::SetField(Box::new((
-                                        f2, addr, args[1],
-                                    )))));
-                                    changed = true;
-                                    continue;
-                                }
-                            }
-                        }
+            if let CILRoot::StLoc(t, val) = asm.get_root(rid).clone()
+                && let CILNode::Call(info) = asm.get_node(val).clone()
+            {
+                let (mref, args, _pure) = *info;
+                if asm[mref].name() == ovf_name
+                    && args.len() == 2
+                    && let Some(cref) = asm[locals[t as usize].1].as_class_ref()
+                    && let Some(cdef) = asm.class_ref_to_def(cref)
+                {
+                    let it1 = asm[cdef]
+                        .fields()
+                        .iter()
+                        .find(|(_, n, _)| *n == item1_s)
+                        .map(|(t, _, _)| *t);
+                    let it2 = asm[cdef]
+                        .fields()
+                        .iter()
+                        .find(|(_, n, _)| *n == item2_s)
+                        .map(|(t, _, _)| *t);
+                    if let (Some(it1), Some(it2)) = (it1, it2) {
+                        let f1 = asm.alloc_field(FieldDesc::new(cref, item1_s, it1));
+                        let f2 = asm.alloc_field(FieldDesc::new(cref, item2_s, it2));
+                        let addr = asm.alloc_node(CILNode::LdLocA(t));
+                        new_roots
+                            .push(asm.alloc_root(CILRoot::SetField(Box::new((f1, addr, args[0])))));
+                        new_roots
+                            .push(asm.alloc_root(CILRoot::SetField(Box::new((f2, addr, args[1])))));
+                        changed = true;
+                        continue;
                     }
                 }
             }
@@ -140,10 +138,10 @@ fn fields_disjoint(asm: &Assembly, fields: &HashSet<Interned<FieldDesc>>) -> boo
         // A field whose TYPE is an external managed type (a BCL valuetype like `KeyValuePair<K,V>` —
         // only a `ClassRef`, no local `ClassDef`) has a layout the backend can't see, so its size is
         // unknown. Never safe to compute split ranges around it — bail conservatively.
-        if let crate::Type::ClassRef(cr) = fd.tpe() {
-            if asm.class_ref_to_def(cr).is_none() {
-                return false;
-            }
+        if let crate::Type::ClassRef(cr) = fd.tpe()
+            && asm.class_ref_to_def(cr).is_none()
+        {
+            return false;
         }
         let Some(cdef_idx) = asm.class_ref_to_def(fd.owner()) else {
             return false; // can't resolve the owning layout -> bail conservatively
@@ -199,17 +197,17 @@ fn decompose_whole_writes(
     let old = std::mem::take(roots);
     let mut out = Vec::with_capacity(old.len());
     for rid in old {
-        if let CILRoot::StLoc(l, val) = *asm.get_root(rid) {
-            if let Some(&tmp) = decompose_tmp.get(&l) {
-                out.push(asm.alloc_root(CILRoot::StLoc(tmp, val)));
-                for f in ordered_fields(asm, &fields[l as usize]) {
-                    let nl = field_to_nl[&(l, f)];
-                    let addr = asm.alloc_node(CILNode::LdLocA(tmp));
-                    let read = asm.alloc_node(CILNode::LdField { addr, field: f });
-                    out.push(asm.alloc_root(CILRoot::StLoc(nl, read)));
-                }
-                continue;
+        if let CILRoot::StLoc(l, val) = *asm.get_root(rid)
+            && let Some(&tmp) = decompose_tmp.get(&l)
+        {
+            out.push(asm.alloc_root(CILRoot::StLoc(tmp, val)));
+            for f in ordered_fields(asm, &fields[l as usize]) {
+                let nl = field_to_nl[&(l, f)];
+                let addr = asm.alloc_node(CILNode::LdLocA(tmp));
+                let read = asm.alloc_node(CILNode::LdField { addr, field: f });
+                out.push(asm.alloc_root(CILRoot::StLoc(nl, read)));
             }
+            continue;
         }
         out.push(rid);
     }
@@ -338,22 +336,20 @@ pub fn scalarize_aggregates(
         block.map_roots(
             asm,
             &mut |root, asm| {
-                if let CILRoot::SetField(info) = &root {
-                    if let Some(l) = store_addr_local(asm, info.1) {
-                        if let Some(&nl) = field_to_nl.get(&(l, info.0)) {
-                            return CILRoot::StLoc(nl, info.2);
-                        }
-                    }
+                if let CILRoot::SetField(info) = &root
+                    && let Some(l) = store_addr_local(asm, info.1)
+                    && let Some(&nl) = field_to_nl.get(&(l, info.0))
+                {
+                    return CILRoot::StLoc(nl, info.2);
                 }
                 root
             },
             &mut |node, asm| {
-                if let CILNode::LdField { addr, field } = node {
-                    if let Some(l) = load_addr_local(asm, addr) {
-                        if let Some(&nl) = field_to_nl.get(&(l, field)) {
-                            return CILNode::LdLoc(nl);
-                        }
-                    }
+                if let CILNode::LdField { addr, field } = node
+                    && let Some(l) = load_addr_local(asm, addr)
+                    && let Some(&nl) = field_to_nl.get(&(l, field))
+                {
+                    return CILNode::LdLoc(nl);
                 }
                 node
             },

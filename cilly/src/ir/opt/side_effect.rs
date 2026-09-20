@@ -63,6 +63,10 @@ impl EffectInfoCache {
 
         let current = asm.get_node(node);
         let mut summary = match current {
+            CILNode::BinOp(_, _, op) => match op {
+                BinOp::Div | BinOp::DivUn | BinOp::Rem | BinOp::RemUn => EffectSummary::MAY_THROW,
+                _ => EffectSummary::PURE_TOTAL,
+            },
             CILNode::Const(_)
             | CILNode::LdLoc(_)
             | CILNode::LdArg(_)
@@ -76,10 +80,6 @@ impl EffectInfoCache {
             | CILNode::IntCast { .. }
             | CILNode::FloatCast { .. }
             | CILNode::PtrCast(_, _) => EffectSummary::PURE_TOTAL,
-            CILNode::BinOp(_, _, BinOp::Div | BinOp::DivUn | BinOp::Rem | BinOp::RemUn) => {
-                EffectSummary::MAY_THROW
-            }
-            CILNode::BinOp(_, _, _) => EffectSummary::PURE_TOTAL,
             CILNode::Call(info) => {
                 let mut effect = EffectSummary::MAY_THROW
                     | EffectSummary::MAY_RUN_TYPE_INIT
@@ -210,21 +210,13 @@ fn only_pure_total_expressions_are_deletable() {
     let mut asm = Assembly::default();
     let mut cache = EffectInfoCache::default();
     for cst in consts {
-        let node = asm.alloc_node(cst.clone());
+        let node = asm.alloc_node(cst);
         assert!(cache.summary(node, &asm).is_pure_total());
-        let node = asm.biop(cst.clone(), cst.clone(), crate::BinOp::Add);
+        let node = asm.biop(cst, cst, crate::BinOp::Add);
         assert!(cache.summary(node, &asm).is_pure_total());
-        let node = asm.biop(
-            CILNode::LocAlloc { size: node },
-            cst.clone(),
-            crate::BinOp::Add,
-        );
+        let node = asm.biop(CILNode::LocAlloc { size: node }, cst, crate::BinOp::Add);
         assert!(!cache.summary(node, &asm).is_pure_total());
-        let node = asm.biop(
-            cst.clone(),
-            CILNode::LocAlloc { size: node },
-            crate::BinOp::Add,
-        );
+        let node = asm.biop(cst, CILNode::LocAlloc { size: node }, crate::BinOp::Add);
         assert!(!cache.summary(node, &asm).is_pure_total());
     }
 }

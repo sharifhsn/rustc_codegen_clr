@@ -1,6 +1,154 @@
-use crate::{Assembly, BinOp, CILNode, Const, Int, Type, bimap::Interned, cilnode::ExtendKind};
+use fxhash::FxHashMap;
+
+use crate::{
+    Assembly, BasicBlock, BinOp, CILIter, CILIterElem, CILNode, CILRoot, Const, FnSig, Int,
+    MethodDef, MethodImpl, MethodRef, Type,
+    bimap::Interned,
+    cilnode::{ExtendKind, MethodKind},
+    class::ClassDefIdx,
+    method::LocalDef,
+};
 
 use super::{EffectInfoCache, OptFuel, opt_if_fuel};
+
+/// Returns the value of a same-class static method whose whole body is one constant return.
+///
+/// Same-class is important: replacing a cross-type static call could suppress that type's CLR
+/// initializer. Source locations are metadata-only and do not disqualify an otherwise trivial
+/// body. Cleanup/exception regions and legacy nested handlers are rejected rather than analyzed.
+fn constant_static_return(
+    method: Interned<MethodRef>,
+    caller_class: ClassDefIdx,
+    asm: &Assembly,
+) -> Option<Const> {
+    let reference = &asm[method];
+    if reference.kind() != MethodKind::Static
+        || asm.class_ref_to_def(reference.class()) != Some(caller_class)
+    {
+        return None;
+    }
+    let definition = asm.method_def_from_ref(method)?;
+    if definition.kind() != MethodKind::Static || definition.class() != caller_class {
+        return None;
+    }
+    constant_return_from_definition(definition, asm)
+}
+
+fn constant_return_from_definition(definition: &MethodDef, asm: &Assembly) -> Option<Const> {
+    let blocks: &[BasicBlock] = match definition.resolved_implementation(asm) {
+        MethodImpl::MethodBody { blocks, .. } => blocks,
+        MethodImpl::RegionBody {
+            blocks,
+            cleanup_blocks,
+            exception_regions,
+            ..
+        } if cleanup_blocks.is_empty() && exception_regions.is_empty() => blocks,
+        _ => return None,
+    };
+    let [block] = blocks else {
+        return None;
+    };
+    if block.handler().is_some() {
+        return None;
+    }
+    let mut roots = block.meaningfull_roots(asm);
+    let root = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+    let CILRoot::Ret(value) = asm.get_root(root) else {
+        return None;
+    };
+    let CILNode::Const(value) = asm.get_node(*value) else {
+        return None;
+    };
+    Some(**value)
+}
+
+pub(crate) type ConstantReturnMap = FxHashMap<Interned<MethodRef>, (ClassDefIdx, Const)>;
+
+pub(crate) fn constant_return_map(asm: &Assembly) -> ConstantReturnMap {
+    asm.methods_with(|_, _, _| true)
+        .filter_map(|(method, definition)| {
+            if definition.kind() != MethodKind::Static {
+                return None;
+            }
+            constant_return_from_definition(definition, asm)
+                .map(|value| (method.0, (definition.class(), value)))
+        })
+        .collect()
+}
+
+pub(crate) fn has_foldable_constant_call(
+    method: &MethodDef,
+    returns: &ConstantReturnMap,
+    asm: &Assembly,
+) -> bool {
+    let blocks: Box<dyn Iterator<Item = &BasicBlock> + '_> = match method.implementation() {
+        MethodImpl::MethodBody { blocks, .. } => Box::new(blocks.iter()),
+        MethodImpl::RegionBody {
+            blocks,
+            cleanup_blocks,
+            ..
+        } => Box::new(blocks.iter().chain(cleanup_blocks)),
+        _ => return false,
+    };
+    blocks.flat_map(BasicBlock::iter_roots).any(|root| {
+        CILIter::new(asm.get_root(root).clone(), asm).any(|element| {
+            matches!(
+                element,
+                CILIterElem::Node(CILNode::Call(info))
+                    if returns
+                        .get(&info.0)
+                        .is_some_and(|(owner, _)| *owner == method.class())
+            )
+        })
+    })
+}
+
+pub(crate) fn fold_constant_calls(
+    method: &mut MethodDef,
+    returns: &ConstantReturnMap,
+    asm: &mut Assembly,
+    fuel: &mut OptFuel,
+) -> bool {
+    if !has_foldable_constant_call(method, returns, asm) {
+        return false;
+    }
+    let sig = method.sig();
+    let caller_class = method.class();
+    let locals = method
+        .locals()
+        .map(|locals| locals.to_vec())
+        .unwrap_or_default();
+    let changed = std::cell::Cell::new(false);
+    let fuel = std::cell::RefCell::new(fuel);
+    let mut cache = EffectInfoCache::default();
+    method.map_roots(asm, &mut |root, _| root, &mut |node, asm| {
+        let CILNode::Call(ref info) = node else {
+            return node;
+        };
+        let Some((owner, value)) = returns.get(&info.0) else {
+            return node;
+        };
+        if *owner != caller_class
+            || node.clone().typecheck(sig, &locals, asm).is_err()
+            || !info
+                .1
+                .iter()
+                .all(|argument| cache.summary(*argument, asm).is_pure_total())
+        {
+            return node;
+        }
+        let mut fuel = fuel.borrow_mut();
+        if !fuel.consume(1) {
+            return node;
+        }
+        changed.set(true);
+        (*value).into()
+    });
+    changed.get()
+}
 /// Optimizes an intiger cast.
 fn opt_int_cast(
     original: CILNode,
@@ -57,22 +205,9 @@ fn opt_int_cast(
                         fuel,
                     )
                 }
-                (Int::U64 | Int::I64, Int::U64 | Int::I64) => {
-                    // A u64 to i64 cast does nothing, except change the type on the evaulation stack(the bits are unchanged).
-                    // So, we can just create a cast like it.
-                    opt_if_fuel(
-                        CILNode::IntCast {
-                            input: *input2,
-                            target,
-                            extend: *extend2,
-                        },
-                        original,
-                        fuel,
-                    )
-                }
-                (Int::U32 | Int::I32, Int::U32 | Int::I32) => {
-                    // A u64 to i64 cast does nothing, except change the type on the evaulation stack(the bits are unchanged).
-                    // So, we can just create a cast like it.
+                (Int::U64 | Int::I64, Int::U64 | Int::I64)
+                | (Int::U32 | Int::I32, Int::U32 | Int::I32) => {
+                    // Same-width signedness casts preserve the bits and only change stack typing.
                     opt_if_fuel(
                         CILNode::IntCast {
                             input: *input2,
@@ -93,7 +228,10 @@ pub fn opt_node(
     original: CILNode,
     asm: &mut Assembly,
     fuel: &mut OptFuel,
-    _cache: &mut EffectInfoCache,
+    cache: &mut EffectInfoCache,
+    sig: Interned<FnSig>,
+    locals: &[LocalDef],
+    caller_class: ClassDefIdx,
 ) -> CILNode {
     match original {
         CILNode::SizeOf(tpe) => match asm[tpe] {
@@ -123,11 +261,25 @@ pub fn opt_node(
             target,
             extend,
         } => opt_int_cast(original, asm, fuel, input, target, extend),
-        // Calls are deliberately left intact. Substituting the caller's expression trees for
-        // `LdArg` nodes does not preserve call-site evaluation: an unused argument would vanish,
-        // a multiply-used argument would be evaluated more than once, and argument order could
-        // change. rustc's MIR inliner is the sound place to inline Rust calls.
-        CILNode::Call(_) => original,
+        // This is deliberately not general call inlining. A locally resolved same-class static
+        // method that consists solely of `ret <constant>` can be folded only when the original
+        // call typechecks and every argument is pure and total. Those conditions preserve
+        // once-only argument evaluation, keep malformed IR visible to the fatal verifier, and
+        // avoid suppressing another CLR type's initializer.
+        CILNode::Call(ref info) => {
+            let valid_call = original.clone().typecheck(sig, locals, asm).is_ok();
+            let arguments_are_discardable = info
+                .1
+                .iter()
+                .all(|argument| cache.summary(*argument, asm).is_pure_total());
+            match (
+                valid_call && arguments_are_discardable,
+                constant_static_return(info.0, caller_class, asm),
+            ) {
+                (true, Some(value)) => opt_if_fuel(value.into(), original, fuel),
+                _ => original,
+            }
+        }
         CILNode::LdInd {
             addr,
             tpe,
@@ -284,5 +436,104 @@ pub fn opt_node(
             _ => original,
         },
         _ => original,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Access, MethodDef, cilnode::IsPure};
+
+    fn constant_call_fixture() -> (
+        Assembly,
+        CILNode,
+        Interned<FnSig>,
+        ClassDefIdx,
+        Interned<CILNode>,
+    ) {
+        let mut asm = Assembly::default();
+        let owner = asm.main_module();
+        let u8_type = asm.alloc_type(Type::Int(Int::U8));
+        let pointer = Type::Ptr(u8_type);
+        let sig = asm.sig([pointer, pointer], Type::Bool);
+        let value = asm.alloc_node(Const::Bool(false));
+        let ret = asm.alloc_root(CILRoot::Ret(value));
+        let method = MethodDef::new(
+            Access::Private,
+            owner,
+            asm.alloc_string("constant_false"),
+            sig,
+            MethodKind::Static,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None, None],
+        );
+        let method = asm.new_method(method).0;
+        let lhs = asm.alloc_node(CILNode::LdArg(0));
+        let rhs = asm.alloc_node(CILNode::LdArg(1));
+        let call = CILNode::Call(Box::new((method, [lhs, rhs].into(), IsPure::PURE)));
+        (asm, call, sig, owner, value)
+    }
+
+    #[test]
+    fn folds_same_class_constant_return_with_pure_total_arguments() {
+        let (mut asm, call, sig, owner, value) = constant_call_fixture();
+        let mut fuel = OptFuel::new(8);
+        let mut cache = EffectInfoCache::default();
+
+        let optimized = opt_node(call, &mut asm, &mut fuel, &mut cache, sig, &[], owner);
+
+        assert_eq!(optimized, asm.get_node(value).clone());
+    }
+
+    #[test]
+    fn malformed_call_remains_visible_to_the_verifier() {
+        let (mut asm, call, sig, owner, _) = constant_call_fixture();
+        let CILNode::Call(info) = call else {
+            unreachable!()
+        };
+        let invalid = asm.alloc_node(CILNode::LdArg(99));
+        let call = CILNode::Call(Box::new((info.0, [invalid, info.1[1]].into(), info.2)));
+        let mut fuel = OptFuel::new(8);
+        let mut cache = EffectInfoCache::default();
+
+        let optimized = opt_node(
+            call.clone(),
+            &mut asm,
+            &mut fuel,
+            &mut cache,
+            sig,
+            &[],
+            owner,
+        );
+
+        assert_eq!(optimized, call);
+    }
+
+    #[test]
+    fn effectful_argument_evaluation_is_not_discarded() {
+        let (mut asm, call, sig, owner, _) = constant_call_fixture();
+        let CILNode::Call(info) = call else {
+            unreachable!()
+        };
+        let size = asm.alloc_node(Const::USize(1));
+        let allocation = asm.alloc_node(CILNode::LocAlloc { size });
+        let call = CILNode::Call(Box::new((info.0, [allocation, info.1[1]].into(), info.2)));
+        let mut fuel = OptFuel::new(8);
+        let mut cache = EffectInfoCache::default();
+
+        let optimized = opt_node(
+            call.clone(),
+            &mut asm,
+            &mut fuel,
+            &mut cache,
+            sig,
+            &[],
+            owner,
+        );
+
+        assert_eq!(optimized, call);
     }
 }

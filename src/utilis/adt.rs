@@ -1,145 +1,15 @@
 use cilly::{
-    Assembly, BinOp, ClassRef, Const, FieldDesc, Float, Int, Interned, MethodRef, Type,
+    BinOp, ClassRef, Const, FieldDesc, Int, Interned, MethodRef, Type,
     cilnode::{IsPure, MethodKind},
 };
-use rustc_abi::{FieldIdx, FieldsShape, Layout, LayoutData, TagEncoding, VariantIdx, Variants};
+use rustc_abi::{Layout, TagEncoding, VariantIdx, Variants};
 use rustc_middle::ty::Ty;
 
 use crate::fn_ctx::MethodCompileCtx;
 
-#[derive(Clone, Debug)]
-pub(crate) enum FieldOffsetIterator {
-    Explicit { offsets: Box<[u32]>, index: usize },
-    NoOffset { count: u64 },
-    Empty,
-}
-impl Iterator for FieldOffsetIterator {
-    type Item = u32;
-    fn next(&mut self) -> Option<u32> {
-        match self {
-            Self::Explicit { offsets, index } => {
-                let next = offsets.get(*index);
-                *index += 1;
-                next.copied()
-            }
-            Self::NoOffset { count } => {
-                if *count > 0 {
-                    *count -= 1;
-                    Some(0)
-                } else {
-                    None
-                }
-            }
-            Self::Empty => None,
-        }
-    }
-}
-impl FieldOffsetIterator {
-    pub fn from_fields_shape(fields: &rustc_abi::FieldsShape<FieldIdx>) -> Self {
-        match fields {
-            FieldsShape::Arbitrary {
-                offsets,
-                in_memory_order,
-            } => {
-                let offsets: Box<[_]> = in_memory_order
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _mem_idx)| {
-                        u32::try_from(
-                            offsets[FieldIdx::from(u32::try_from(index).unwrap())].bytes(),
-                        )
-                        .unwrap()
-                    })
-                    //TODO: ask what does field offset of 4294967295 means.
-                    .map(|offset| {
-                        if offset > u32::from(u16::MAX) {
-                            0
-                        } else {
-                            offset
-                        }
-                    })
-                    .collect();
-                FieldOffsetIterator::Explicit { offsets, index: 0 }
-            }
-            FieldsShape::Union(count) => FieldOffsetIterator::NoOffset {
-                count: Into::<usize>::into(*count) as u64,
-            },
-            FieldsShape::Primitive => Self::Empty,
-            FieldsShape::Array { stride, count } => {
-                let mut curr: u32 = 0;
-                let mut offsets = Vec::new();
-                for _ in 0..*count {
-                    offsets.push(curr);
-                    curr += std::convert::TryInto::<u32>::try_into(stride.bytes())
-                        .expect("Array stride too large");
-                }
-                FieldOffsetIterator::Explicit {
-                    offsets: offsets.into(),
-                    index: 0,
-                }
-            }
-        }
-    }
-}
-/// Takes layout of an enum as input, and returns the type of its tag(Void if no tag) and the size of the tag(0 if no tag).
-pub fn enum_tag_info(r#enum: Layout<'_>, asm: &mut Assembly) -> (Type, u32) {
-    match r#enum.variants() {
-        Variants::Single { .. } => (
-            Type::Void,
-            FieldOffsetIterator::from_fields_shape(r#enum.fields())
-                .next()
-                .unwrap_or(0),
-        ),
-        Variants::Multiple { tag, tag_field, .. } => (
-            scalr_to_type(*tag, asm),
-            FieldOffsetIterator::from_fields_shape(r#enum.fields())
-                .nth((*tag_field).into())
-                .unwrap_or(0),
-        ),
-        Variants::Empty => (Type::Void, 0),
-    }
-}
-fn scalr_to_type(scalar: rustc_abi::Scalar, asm: &mut Assembly) -> Type {
-    let primitive = match scalar {
-        rustc_abi::Scalar::Union { value } | rustc_abi::Scalar::Initialized { value, .. } => value,
-    };
-    primitive_to_type(primitive, asm)
-}
-fn primitive_to_type(primitive: rustc_abi::Primitive, asm: &mut Assembly) -> Type {
-    use rustc_abi::Integer;
-    use rustc_abi::Primitive;
-    match primitive {
-        Primitive::Int(int, sign) => match (int, sign) {
-            (Integer::I8, true) => Type::Int(Int::I8),
-            (Integer::I16, true) => Type::Int(Int::I16),
-            (Integer::I32, true) => Type::Int(Int::I32),
-            (Integer::I64, true) => Type::Int(Int::I64),
-            (Integer::I128, true) => Type::Int(Int::I128),
-            (Integer::I8, false) => Type::Int(Int::U8),
-            (Integer::I16, false) => Type::Int(Int::U16),
-            (Integer::I32, false) => Type::Int(Int::U32),
-            (Integer::I64, false) => Type::Int(Int::U64),
-            (Integer::I128, false) => Type::Int(Int::U128),
-        },
-        Primitive::Float(rustc_abi::Float::F16) => Type::Float(Float::F16),
-        Primitive::Float(rustc_abi::Float::F32) => Type::Float(Float::F32),
-        Primitive::Float(rustc_abi::Float::F64) => Type::Float(Float::F64),
-        Primitive::Float(rustc_abi::Float::F128) => todo!("No support for 128 bit floats yet!"),
-        Primitive::Pointer(_) => asm.nptr(Type::Void),
-    }
-}
-pub fn get_variant_at_index(
-    variant_index: VariantIdx,
-    layout: LayoutData<FieldIdx, rustc_abi::VariantIdx>,
-) -> LayoutData<FieldIdx, rustc_abi::VariantIdx> {
-    match layout.variants {
-        Variants::Single { .. } => layout,
-        // `Variants::Multiple.variants` now stores reduced `VariantLayout`s rather than full
-        // `LayoutData`s. `LayoutData::for_variant` reconstructs the full per-variant `LayoutData`.
-        Variants::Multiple { .. } => LayoutData::for_variant(&layout, variant_index),
-        Variants::Empty => todo!("Empty variants have no variants."),
-    }
-}
+// Keep this compatibility module focused on discriminant lowering. Layout helpers live in the
+// canonical `type::adt` module; re-exporting them avoids maintaining a second implementation.
+pub use crate::r#type::adt::{enum_tag_info, get_variant_at_index};
 pub fn set_discr<'tcx>(
     layout: Layout<'tcx>,
     variant_index: VariantIdx,
@@ -200,8 +70,6 @@ pub fn set_discr<'tcx>(
                 ctx.alloc_root(cilly::CILRoot::Nop)
             } else {
                 let (tag_tpe, _) = enum_tag_info(layout, ctx);
-                //let niche = self.project_field(bx, tag_field);
-                //let niche_llty = bx.cx().immediate_backend_type(niche.layout);
                 let niche_value = variant_index.as_u32() - niche_variants.start.as_u32();
                 let niche_value = u128::from(niche_value).wrapping_add(niche_start);
                 // niche_value is a u128; for 128-bit tags emit it as a real 128-bit literal.
@@ -231,7 +99,6 @@ pub fn get_discr<'tcx>(
     ty: Ty<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
 ) -> Interned<cilly::ir::CILNode> {
-    //return CILNode::
     assert!(!layout.is_uninhabited(), "UB: enum layout is unanhibited!");
     let (tag_tpe, _) = enum_tag_info(layout, ctx);
     let tag_encoding = match layout.variants {
@@ -265,7 +132,6 @@ pub fn get_discr<'tcx>(
     let discr = match *tag_encoding {
         TagEncoding::Direct => {
             if tag_tpe == Type::Void {
-                //CILNode::LDOb
                 todo!();
             } else {
                 let enum_tag_name = ctx.alloc_string(crate::ENUM_TAG);
@@ -349,7 +215,6 @@ pub fn get_discr<'tcx>(
             } else {
                 // The special cases don't apply, so we'll have to go with
                 // the general algorithm.
-                //let tag = crate::casts::int_to_int(disrc_type.clone(), &Type::Int(Int::U64), tag);
                 // relative_discr = tag - niche_start. For 128-bit tags use the System.[U]Int128
                 // op_Subtraction operator (mirrors the op_GreaterThan arms below); niche_start is
                 // emitted as a real 128-bit literal — never a u64 truncation or IntCast-to-128.

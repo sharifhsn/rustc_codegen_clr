@@ -17,35 +17,38 @@
 //! println!("{sb}"); // Display goes through StringBuilder.ToString()
 //! ```
 //!
-//! **What this maps to.** [`StringBuilder`] is a thin newtype over the raw managed
-//! `System.Text.StringBuilder` handle (a real object on the CLR heap, GC-owned — there is no
-//! `Drop`). Every method delegates straight to the corresponding .NET member via the generated
+//! **What this maps to.** [`StringBuilder`] owns a `GCHandle` root for the managed
+//! `System.Text.StringBuilder` object. Every method delegates straight to the corresponding .NET member via the generated
 //! low-level bindings; nothing is emulated in Rust except the `&str` → `System.String` marshalling
 //! (which reuses [`crate::system::MString`]'s `From<&str>`) and the UTF-16 → Rust `String` decode
 //! used by [`to_rust_string`](StringBuilder::to_rust_string) / [`Display`](core::fmt::Display).
 //!
 //! **Move-only.** Like [`crate::collections::List`], the wrapper is move-only rather than `Copy`: a
 //! `StringBuilder` is mutable managed state, so copying the handle would silently alias one buffer.
-//! Use [`handle`](StringBuilder::handle) to get the raw managed handle for lower-level BCL calls.
+//! Use [`handle`](StringBuilder::handle) to copy out a transient raw managed handle for an immediate
+//! lower-level BCL call.
 
 // The raw, generated low-level binding for `System.Text.StringBuilder`. It is defined in the impl
 // assembly `System.Private.CoreLib` (where `System.String` also physically lives — binding against a
 // forwarding assembly like `System.Runtime` makes the JIT reject the `System.String` methodrefs),
 // which is exactly what an idiomatic wrapper wants to delegate to.
 use crate::System::Text::StringBuilder as Raw;
+use crate::managed_option::ManagedRef;
 use crate::system::{DotNetString, MString};
 
 /// A managed `System.Text.StringBuilder`. See the [module docs](self).
 #[repr(transparent)]
 pub struct StringBuilder {
-    h: Raw,
+    h: ManagedRef<Raw>,
 }
 
 impl StringBuilder {
     /// `new StringBuilder()` — an empty builder with the default capacity.
     #[inline]
     pub fn new() -> Self {
-        Self { h: Raw::new() }
+        Self {
+            h: ManagedRef::from_raw(Raw::new()),
+        }
     }
 
     /// `new StringBuilder(capacity)` — an empty builder pre-sized to at least `capacity` chars.
@@ -53,7 +56,7 @@ impl StringBuilder {
     pub fn with_capacity(capacity: i32) -> Self {
         // The `StringBuilder(int capacity)` ctor.
         Self {
-            h: Raw::ctor1::<i32>(capacity),
+            h: ManagedRef::from_raw(Raw::ctor1::<i32>(capacity)),
         }
     }
 
@@ -61,27 +64,32 @@ impl StringBuilder {
     #[inline]
     pub fn from_str(value: &str) -> Self {
         Self {
-            h: Raw::ctor1::<MString>(MString::from(value)),
+            h: ManagedRef::from_raw(Raw::ctor1::<MString>(MString::from(value))),
         }
     }
 
     /// Wrap a raw managed `System.Text.StringBuilder` handle.
     #[inline]
     pub fn from_handle(h: Raw) -> Self {
-        Self { h }
+        Self {
+            h: ManagedRef::from_raw(h),
+        }
     }
 
-    /// The underlying managed handle, for lower-level BCL calls.
+    /// Copy out the underlying managed handle for an immediate lower-level BCL call.
+    ///
+    /// The returned naked reference is kept alive by `self`; do not retain it in Rust-owned
+    /// storage or use it after `self` is dropped.
     #[inline]
     pub fn handle(&self) -> Raw {
-        self.h
+        self.h.copy_raw()
     }
 
     /// The number of characters currently in the buffer (`Length`), in UTF-16 code units (matching
     /// .NET). This is the *content* length, not the capacity.
     #[inline]
     pub fn len(&self) -> i32 {
-        self.h.get_length()
+        self.h.copy_raw().get_length()
     }
 
     /// `true` if the buffer is empty.
@@ -93,33 +101,33 @@ impl StringBuilder {
     /// Set the content length (`Length`). Growing pads with `'\0'`; shrinking truncates.
     #[inline]
     pub fn set_len(&mut self, length: i32) {
-        self.h.set_length(length)
+        self.h.copy_raw().set_length(length)
     }
 
     /// The current capacity (`Capacity`) — the size the buffer can hold before it must reallocate.
     #[inline]
     pub fn capacity(&self) -> i32 {
-        self.h.get_capacity()
+        self.h.copy_raw().get_capacity()
     }
 
     /// Set the capacity (`Capacity`). Must be at least the current [`len`](StringBuilder::len) or
     /// .NET throws.
     #[inline]
     pub fn set_capacity(&mut self, capacity: i32) {
-        self.h.set_capacity(capacity)
+        self.h.copy_raw().set_capacity(capacity)
     }
 
     /// The maximum capacity this builder can ever reach (`MaxCapacity`).
     #[inline]
     pub fn max_capacity(&self) -> i32 {
-        self.h.get_max_capacity()
+        self.h.copy_raw().get_max_capacity()
     }
 
     /// Ensure the capacity is at least `capacity`, reallocating if needed; returns the new capacity
     /// (`EnsureCapacity`).
     #[inline]
     pub fn ensure_capacity(&mut self, capacity: i32) -> i32 {
-        self.h.ensure_capacity(capacity)
+        self.h.copy_raw().ensure_capacity(capacity)
     }
 
     /// Append a string to the end of the buffer (`Append(string)`).
@@ -127,13 +135,13 @@ impl StringBuilder {
     pub fn append(&mut self, value: &str) {
         // `Append` returns the same builder (for C# chaining); we discard it — the mutation is
         // in-place on the managed object `self.h` points at.
-        let _ = self.h.append(MString::from(value));
+        let _ = self.h.copy_raw().append(MString::from(value));
     }
 
     /// Append a managed [`DotNetString`] without re-marshalling (`Append(string)`).
     #[inline]
     pub fn append_dotnet_string(&mut self, value: DotNetString) {
-        let _ = self.h.append(value.handle());
+        let _ = self.h.copy_raw().append(value.handle());
     }
 
     /// Append a single `char` (`Append(char)`).
@@ -146,13 +154,16 @@ impl StringBuilder {
         // The generated binding only wraps `Append(string)`; call the `Append(char)` overload
         // directly on the raw managed handle (it returns the same builder, which we discard).
         let mc = crate::DotNetChar::single_codepoint_unchecked(ch);
-        let _ = self.h.instance1::<"Append", crate::DotNetChar, Raw>(mc);
+        let _ = self
+            .h
+            .copy_raw()
+            .instance1::<"Append", crate::DotNetChar, Raw>(mc);
     }
 
     /// Append the default line terminator (`AppendLine()`).
     #[inline]
     pub fn append_line(&mut self) {
-        let _ = self.h.append_line();
+        let _ = self.h.copy_raw().append_line();
     }
 
     /// Append a string followed by the default line terminator (`Append(value)` + `AppendLine()`).
@@ -165,31 +176,34 @@ impl StringBuilder {
     /// Insert a string at `index`, shifting the rest right (`Insert(index, value)`).
     #[inline]
     pub fn insert(&mut self, index: i32, value: &str) {
-        let _ = self.h.insert(index, MString::from(value));
+        let _ = self.h.copy_raw().insert(index, MString::from(value));
     }
 
     /// Remove `length` characters starting at `start` (`Remove(start, length)`).
     #[inline]
     pub fn remove(&mut self, start: i32, length: i32) {
-        let _ = self.h.remove(start, length);
+        let _ = self.h.copy_raw().remove(start, length);
     }
 
     /// Replace every occurrence of `old` with `new` throughout the buffer (`Replace(old, new)`).
     #[inline]
     pub fn replace(&mut self, old: &str, new: &str) {
-        let _ = self.h.replace(MString::from(old), MString::from(new));
+        let _ = self
+            .h
+            .copy_raw()
+            .replace(MString::from(old), MString::from(new));
     }
 
     /// Remove all characters, leaving an empty buffer (`Clear()`). Capacity is retained.
     #[inline]
     pub fn clear(&mut self) {
-        let _ = self.h.clear();
+        let _ = self.h.copy_raw().clear();
     }
 
     /// Materialize the built content as a managed [`DotNetString`] (`ToString()`).
     #[inline]
     pub fn to_dotnet_string(&self) -> DotNetString {
-        DotNetString::from_handle(self.h.to_string())
+        DotNetString::from_handle(self.h.copy_raw().to_string())
     }
 
     /// Copy the built content into a Rust [`String`] (`ToString()`, then UTF-16 → UTF-8 decode).
@@ -242,16 +256,9 @@ impl core::fmt::Write for StringBuilder {
     // coercion of `&mut Self` to a `&mut dyn Write` trait object at every `write!(sb, ..)` call
     // site. That coercion builds a fat pointer whose "data" half is type-erased to a raw `void*`
     // (see `src/unsize.rs` and the backend's `fat_ptr_to`). `StringBuilder` is a thin
-    // newtype directly over a managed `System.Text.StringBuilder` handle -- a real GC-tracked
-    // object reference -- so a pointer into it is itself GC-relevant memory; erasing that into an
-    // untracked `void*` field would let the CLR's compacting GC relocate/collect the referent out
-    // from under a stale, untracked address. The CIL type-verifier's `PtrCast` check correctly
-    // refuses to emit that cast (`ManagedPtrCast`, invariant I1 of the absolute-correctness plan)
-    // -- it is not a false positive, it is catching a genuine unsoundness in the generic fat-pointer
-    // erasure path when the pointee transitively carries a managed reference (the same class of gap
-    // documented for `Type::contains_gcref`; a general, sound fix needs a first-class
-    // GC-tracked/byref-like fat-pointer representation, which is a larger architectural change
-    // outside this fix's scope).
+    // newtype over a GCHandle token, not a naked managed reference. Keeping this override still
+    // avoids an unnecessary trait-object coercion and batches one formatted Rust string into one
+    // managed append call.
     //
     // The fix here: override `write_fmt` so `StringBuilder` never needs a `dyn Write` trait object
     // at all. Format into a plain `std::string::String` (an ordinary, gcref-free `Write` sink --

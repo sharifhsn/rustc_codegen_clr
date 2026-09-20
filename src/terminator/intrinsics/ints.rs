@@ -16,12 +16,11 @@ use rustc_span::Spanned;
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
 
-fn ctpop_small_int(asm: &mut cilly::Assembly, operand: Node, int: Int) -> Node {
-    assert!(int.size().is_none_or(|size| size <= 8));
+fn bit_count_call(asm: &mut cilly::Assembly, operand: Node, input: Type, method: &str) -> Node {
     let mref = MethodRef::new(
         ClassRef::bit_operations(asm),
-        asm.alloc_string("PopCount"),
-        asm.sig([Type::Int(int)], Type::Int(Int::I32)),
+        asm.alloc_string(method),
+        asm.sig([input], Type::Int(Int::I32)),
         MethodKind::Static,
         vec![].into(),
     );
@@ -29,6 +28,69 @@ fn ctpop_small_int(asm: &mut cilly::Assembly, operand: Node, int: Int) -> Node {
     let call = asm.call(mref, &[operand], IsPure::NOT);
     asm.int_cast(call, Int::U32, ExtendKind::ZeroExtend)
 }
+
+fn ctpop_small_int(asm: &mut cilly::Assembly, operand: Node, int: Int) -> Node {
+    assert!(int.size().is_none_or(|size| size <= 8));
+    bit_count_call(asm, operand, Type::Int(int), "PopCount")
+}
+
+fn cttz_narrow(
+    operand: Node,
+    cast: Int,
+    extend: ExtendKind,
+    bits: u32,
+    ctx: &mut MethodCompileCtx<'_, '_>,
+) -> Node {
+    let mref = MethodRef::new(
+        ClassRef::bit_operations(ctx),
+        ctx.alloc_string("TrailingZeroCount"),
+        ctx.sig([Type::Int(cast)], Type::Int(Int::I32)),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let mref = ctx.alloc_methodref(mref);
+    let operand = ctx.int_cast(operand, cast, extend);
+    let call = ctx.call(mref, &[operand], IsPure::NOT);
+    let value = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
+    let min = MethodRef::new(
+        ClassRef::math(ctx),
+        ctx.alloc_string("Min"),
+        ctx.sig(
+            [Type::Int(Int::U32), Type::Int(Int::U32)],
+            Type::Int(Int::U32),
+        ),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let min = ctx.alloc_methodref(min);
+    let bits = ctx.alloc_node(bits);
+    ctx.call(min, &[value, bits], IsPure::NOT)
+}
+
+fn wide_bit_count(
+    ctx: &mut MethodCompileCtx<'_, '_>,
+    operand: Node,
+    int: Int,
+    method: &'static str,
+) -> Node {
+    let tpe = Type::Int(int);
+    let class = if int.is_signed() {
+        ClassRef::int_128(ctx)
+    } else {
+        ClassRef::uint_128(ctx)
+    };
+    let mref = MethodRef::new(
+        class,
+        ctx.alloc_string(method),
+        ctx.sig([tpe], tpe),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let mref = ctx.alloc_methodref(mref);
+    let call = ctx.call(mref, &[operand], IsPure::NOT);
+    crate::casts::int_to_int(tpe, Type::Int(Int::U32), call, ctx)
+}
+
 pub fn ctpop<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
@@ -65,30 +127,7 @@ pub fn ctpop<'tcx>(
             let operand = ctx.int_cast(operand, Int::ISize, ExtendKind::SignExtend);
             ctpop_small_int(ctx, operand, Int::USize)
         }
-        Type::Int(Int::U128) => {
-            let mref = MethodRef::new(
-                ClassRef::uint_128(ctx),
-                ctx.alloc_string("PopCount"),
-                ctx.sig([Type::Int(Int::U128)], Type::Int(Int::U128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let call = ctx.call(mref, &[operand], IsPure::NOT);
-            crate::casts::int_to_int(Type::Int(Int::U128), Type::Int(Int::U32), call, ctx)
-        }
-        Type::Int(Int::I128) => {
-            let mref = MethodRef::new(
-                ClassRef::int_128(ctx),
-                ctx.alloc_string("PopCount"),
-                ctx.sig([Type::Int(Int::I128)], Type::Int(Int::I128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let call = ctx.call(mref, &[operand], IsPure::NOT);
-            crate::casts::int_to_int(Type::Int(Int::I128), Type::Int(Int::U32), call, ctx)
-        }
+        Type::Int(int @ (Int::U128 | Int::I128)) => wide_bit_count(ctx, operand, int, "PopCount"),
         _ => todo!("Unsported pop count type {tpe:?}"),
     };
     place_set(destination, value, ctx)
@@ -114,70 +153,23 @@ pub fn ctlz<'tcx>(
     );
     // TODO: this assumes a 64 bit system!
     let sub = match tpe {
-        Type::Int(int @ (Int::ISize | Int::USize)) => {
-            let mref = MethodRef::new(
-                ClassRef::bit_operations(ctx),
-                ctx.alloc_string("LeadingZeroCount"),
-                ctx.sig([Type::Int(int)], Type::Int(Int::I32)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
+        Type::Int(Int::ISize | Int::USize) | Type::Ptr(_) => {
+            let input_type = match tpe {
+                Type::Int(int) => Type::Int(int),
+                Type::Ptr(_) => Type::Int(Int::USize),
+                _ => unreachable!(),
+            };
             let arg = handle_operand(&args[0].node, ctx);
-            let call = ctx.call(mref, &[arg], IsPure::NOT);
-            let value = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
-            return place_set(destination, value, ctx);
-        }
-        Type::Ptr(_) => {
-            let mref = MethodRef::new(
-                ClassRef::bit_operations(ctx),
-                ctx.alloc_string("LeadingZeroCount"),
-                ctx.sig([Type::Int(Int::USize)], Type::Int(Int::I32)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let arg = handle_operand(&args[0].node, ctx);
-            let call = ctx.call(mref, &[arg], IsPure::NOT);
-            let value = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
+            let value = bit_count_call(ctx, arg, input_type, "LeadingZeroCount");
             return place_set(destination, value, ctx);
         }
         Type::Int(Int::I64 | Int::U64) => ctx.alloc_node(0_i32),
         Type::Int(Int::I32 | Int::U32) => ctx.alloc_node(32_i32),
         Type::Int(Int::I16 | Int::U16) => ctx.alloc_node(48_i32),
         Type::Int(Int::I8 | Int::U8) => ctx.alloc_node(56_i32),
-        Type::Int(Int::I128) => {
-            let mref = MethodRef::new(
-                ClassRef::int_128(ctx),
-                ctx.alloc_string("LeadingZeroCount"),
-                ctx.sig([Type::Int(Int::I128)], Type::Int(Int::I128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
+        Type::Int(int @ (Int::I128 | Int::U128)) => {
             let arg = handle_operand(&args[0].node, ctx);
-            let call = ctx.call(mref, &[arg], IsPure::NOT);
-            // `LeadingZeroCount` returns a 128-bit value (`System.Int128`), so the narrowing to
-            // u32 must go through the BCL `op_Explicit` operator (`int_to_int`), NOT a raw
-            // `conv.u4` (`int_cast`) — the latter is invalid IL on a 128-bit struct operand and
-            // yields garbage. (Mirrors the `ctpop`/`PopCount` arms.)
-            let value =
-                crate::casts::int_to_int(Type::Int(Int::I128), Type::Int(Int::U32), call, ctx);
-            return place_set(destination, value, ctx);
-        }
-        Type::Int(Int::U128) => {
-            let mref = MethodRef::new(
-                ClassRef::uint_128(ctx),
-                ctx.alloc_string("LeadingZeroCount"),
-                ctx.sig([Type::Int(Int::U128)], Type::Int(Int::U128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let arg = handle_operand(&args[0].node, ctx);
-            let call = ctx.call(mref, &[arg], IsPure::NOT);
-            let value =
-                crate::casts::int_to_int(Type::Int(Int::U128), Type::Int(Int::U32), call, ctx);
+            let value = wide_bit_count(ctx, arg, int, "LeadingZeroCount");
             return place_set(destination, value, ctx);
         }
         _ => todo!("Can't `ctlz`  type {tpe:?} yet!"),
@@ -208,7 +200,6 @@ pub fn cttz<'tcx>(
         1,
         "The intrinsic `ctlz` MUST take in exactly 1 argument!"
     );
-    let bit_operations = ClassRef::bit_operations(ctx);
     let tpe = ctx.monomorphize(
         call_instance.args[0]
             .as_type()
@@ -216,172 +207,36 @@ pub fn cttz<'tcx>(
     );
     let tpe = ctx.type_from_cache(tpe);
     let operand = handle_operand(&args[0].node, ctx);
-    match tpe {
-        Type::Int(Int::I8) => {
-            let ttc = MethodRef::new(
-                bit_operations,
-                ctx.alloc_string("TrailingZeroCount"),
-                ctx.sig([Type::Int(Int::I32)], Type::Int(Int::I32)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let ttc = ctx.alloc_methodref(ttc);
-            let operand = ctx.int_cast(operand, Int::I32, ExtendKind::SignExtend);
-            let call = ctx.call(ttc, &[operand], IsPure::NOT);
-            let value_calc = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
-            let min = MethodRef::new(
-                ClassRef::math(ctx),
-                ctx.alloc_string("Min"),
-                ctx.sig(
-                    [Type::Int(Int::U32), Type::Int(Int::U32)],
-                    Type::Int(Int::U32),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let min = ctx.alloc_methodref(min);
-            let bits = ctx.alloc_node(i8::BITS);
-            let value = ctx.call(min, &[value_calc, bits], IsPure::NOT);
-            place_set(destination, value, ctx)
+    let value = match tpe {
+        Type::Int(int @ (Int::I8 | Int::I16 | Int::U8 | Int::U16)) => {
+            let (cast, extend, bits) = match int {
+                Int::I8 => (Int::I32, ExtendKind::SignExtend, i8::BITS),
+                Int::I16 => (Int::I32, ExtendKind::SignExtend, i16::BITS),
+                Int::U8 => (Int::U32, ExtendKind::ZeroExtend, u8::BITS),
+                Int::U16 => (Int::U32, ExtendKind::ZeroExtend, u16::BITS),
+                _ => unreachable!(),
+            };
+            cttz_narrow(operand, cast, extend, bits, ctx)
         }
-        Type::Int(Int::I16) => {
-            let mref = MethodRef::new(
-                bit_operations,
-                ctx.alloc_string("TrailingZeroCount"),
-                ctx.sig([Type::Int(Int::I32)], Type::Int(Int::I32)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let operand = ctx.int_cast(operand, Int::I32, ExtendKind::SignExtend);
-            let call = ctx.call(mref, &[operand], IsPure::NOT);
-            let value_calc = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
-            let min = MethodRef::new(
-                ClassRef::math(ctx),
-                ctx.alloc_string("Min"),
-                ctx.sig(
-                    [Type::Int(Int::U32), Type::Int(Int::U32)],
-                    Type::Int(Int::U32),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let min = ctx.alloc_methodref(min);
-            let bits = ctx.alloc_node(i16::BITS);
-            let value = ctx.call(min, &[value_calc, bits], IsPure::NOT);
-            place_set(destination, value, ctx)
+        Type::Int(int @ (Int::I128 | Int::U128)) => {
+            wide_bit_count(ctx, operand, int, "TrailingZeroCount")
         }
-        Type::Int(Int::U8) => {
-            let mref = MethodRef::new(
-                bit_operations,
-                ctx.alloc_string("TrailingZeroCount"),
-                ctx.sig([Type::Int(Int::U32)], Type::Int(Int::I32)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let operand = ctx.int_cast(operand, Int::U32, ExtendKind::ZeroExtend);
-            let call = ctx.call(mref, &[operand], IsPure::NOT);
-            let value_calc = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
-            let min = MethodRef::new(
-                ClassRef::math(ctx),
-                ctx.alloc_string("Min"),
-                ctx.sig(
-                    [Type::Int(Int::U32), Type::Int(Int::U32)],
-                    Type::Int(Int::U32),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let min = ctx.alloc_methodref(min);
-            let bits = ctx.alloc_node(u8::BITS);
-            let value = ctx.call(min, &[value_calc, bits], IsPure::NOT);
-            place_set(destination, value, ctx)
-        }
-        Type::Int(Int::U16) => {
-            let mref = MethodRef::new(
-                bit_operations,
-                ctx.alloc_string("TrailingZeroCount"),
-                ctx.sig([Type::Int(Int::U32)], Type::Int(Int::I32)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let operand = ctx.int_cast(operand, Int::U32, ExtendKind::ZeroExtend);
-            let call = ctx.call(mref, &[operand], IsPure::NOT);
-            let value_calc = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
-            let min = MethodRef::new(
-                ClassRef::math(ctx),
-                ctx.alloc_string("Min"),
-                ctx.sig(
-                    [Type::Int(Int::U32), Type::Int(Int::U32)],
-                    Type::Int(Int::U32),
-                ),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let min = ctx.alloc_methodref(min);
-            let bits = ctx.alloc_node(u16::BITS);
-            let value = ctx.call(min, &[value_calc, bits], IsPure::NOT);
-            place_set(destination, value, ctx)
-        }
-        Type::Int(Int::I128) => {
-            let mref = MethodRef::new(
-                ClassRef::int_128(ctx),
-                ctx.alloc_string("TrailingZeroCount"),
-                ctx.sig([Type::Int(Int::I128)], Type::Int(Int::I128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let arg = handle_operand(&args[0].node, ctx);
-            let call = ctx.call(mref, &[arg], IsPure::NOT);
-            // 128-bit -> u32 must go through `op_Explicit` (`int_to_int`), not a raw `conv.u4`
-            // (`int_cast`), which is invalid IL on a 128-bit struct and yields garbage.
-            let value_calc =
-                crate::casts::int_to_int(Type::Int(Int::I128), Type::Int(Int::U32), call, ctx);
-            place_set(destination, value_calc, ctx)
-        }
-        Type::Int(Int::U128) => {
-            let mref = MethodRef::new(
-                ClassRef::uint_128(ctx),
-                ctx.alloc_string("TrailingZeroCount"),
-                ctx.sig([Type::Int(Int::U128)], Type::Int(Int::U128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let arg = handle_operand(&args[0].node, ctx);
-            let call = ctx.call(mref, &[arg], IsPure::NOT);
-            let value_calc =
-                crate::casts::int_to_int(Type::Int(Int::U128), Type::Int(Int::U32), call, ctx);
-            place_set(destination, value_calc, ctx)
-        }
-        _ => {
-            let mref = MethodRef::new(
-                bit_operations,
-                ctx.alloc_string("TrailingZeroCount"),
-                ctx.sig([tpe], Type::Int(Int::I32)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = ctx.alloc_methodref(mref);
-            let call = ctx.call(mref, &[operand], IsPure::NOT);
-            let value_calc = ctx.int_cast(call, Int::U32, ExtendKind::ZeroExtend);
-            place_set(destination, value_calc, ctx)
-        }
-    }
+        _ => bit_count_call(ctx, operand, tpe, "TrailingZeroCount"),
+    };
+    place_set(destination, value, ctx)
 }
-pub fn rotate_left<'tcx>(
+fn rotate_intrinsic<'tcx>(
     args: &[Spanned<Operand<'tcx>>],
     destination: &Place<'tcx>,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
     call_instance: Instance<'tcx>,
+    intrinsic: &str,
+    method: &str,
 ) -> Root {
     debug_assert_eq!(
         args.len(),
         2,
-        "The  `rotate_left` MUST take in exactly 2 arguments!"
+        "The rotate intrinsic MUST take in exactly 2 arguments!"
     );
     let val_tpe = ctx.monomorphize(
         call_instance.args[0]
@@ -389,9 +244,7 @@ pub fn rotate_left<'tcx>(
             .expect("needs_drop works only on types!"),
     );
     let val_tpe = ctx.type_from_cache(val_tpe);
-    let val = handle_operand(&args[0].node, ctx);
-    let rot = handle_operand(&args[1].node, ctx);
-    match val_tpe {
+    let int = match val_tpe {
         Type::Int(
             int @ (Int::U8
             | Int::I8
@@ -405,77 +258,44 @@ pub fn rotate_left<'tcx>(
             | Int::I128
             | Int::USize
             | Int::ISize),
-        ) => {
-            let rot = ctx.int_cast(rot, Int::I32, ExtendKind::SignExtend);
-            let value = rol_int(val, rot, int, ctx);
-            place_set(destination, value, ctx)
-        }
-        _ => todo!("Can't ror {val_tpe:?}"),
-    }
-}
-pub fn rol_int(val: Node, rot: Node, int: Int, asm: &mut cilly::Assembly) -> Node {
-    let mref = MethodRef::new(
-        int.class(asm),
-        asm.alloc_string("RotateLeft"),
-        asm.sig([Type::Int(int), Type::Int(Int::I32)], Type::Int(int)),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let mref = asm.alloc_methodref(mref);
-    asm.call(mref, &[val, rot], IsPure::NOT)
-}
-pub fn ror_int(val: Node, rot: Node, int: Int, asm: &mut cilly::Assembly) -> Node {
-    let mref = MethodRef::new(
-        int.class(asm),
-        asm.alloc_string("RotateRight"),
-        asm.sig([Type::Int(int), Type::Int(Int::I32)], Type::Int(int)),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let mref = asm.alloc_methodref(mref);
-    asm.call(mref, &[val, rot], IsPure::NOT)
-}
-pub fn rotate_right<'tcx>(
-    args: &[Spanned<Operand<'tcx>>],
-    destination: &Place<'tcx>,
-    ctx: &mut MethodCompileCtx<'tcx, '_>,
-    call_instance: Instance<'tcx>,
-) -> Root {
-    debug_assert_eq!(
-        args.len(),
-        2,
-        "The  `rotate_right` MUST take in exactly 2 arguments!"
-    );
-    let val_tpe = ctx.monomorphize(
-        call_instance.args[0]
-            .as_type()
-            .expect("needs_drop works only on types!"),
-    );
-    let val_tpe = ctx.type_from_cache(val_tpe);
+        ) => int,
+        _ => todo!("Can't {intrinsic} {val_tpe:?}"),
+    };
     let val = handle_operand(&args[0].node, ctx);
     let rot = handle_operand(&args[1].node, ctx);
-    match val_tpe {
-        Type::Int(
-            int @ (Int::U8
-            | Int::I8
-            | Int::U16
-            | Int::I16
-            | Int::U32
-            | Int::I32
-            | Int::U64
-            | Int::I64
-            | Int::U128
-            | Int::I128
-            | Int::USize
-            | Int::ISize),
-        ) => {
-            let rot = ctx.int_cast(rot, Int::I32, ExtendKind::SignExtend);
-            let value = ror_int(val, rot, int, ctx);
-            place_set(destination, value, ctx)
-        }
-        _ => todo!("Can't ror {val_tpe:?}"),
-    }
+    let rot = ctx.int_cast(rot, Int::I32, ExtendKind::SignExtend);
+    let value = rotate_int(val, rot, int, method, ctx);
+    place_set(destination, value, ctx)
 }
+
+macro_rules! rotate_intrinsic_export {
+    ($name:ident, $intrinsic:literal, $method:literal) => {
+        pub fn $name<'tcx>(
+            args: &[Spanned<Operand<'tcx>>],
+            destination: &Place<'tcx>,
+            ctx: &mut MethodCompileCtx<'tcx, '_>,
+            call_instance: Instance<'tcx>,
+        ) -> Root {
+            rotate_intrinsic(args, destination, ctx, call_instance, $intrinsic, $method)
+        }
+    };
+}
+
+rotate_intrinsic_export!(rotate_left, "rotate_left", "RotateLeft");
+
+fn rotate_int(val: Node, rot: Node, int: Int, method: &str, asm: &mut cilly::Assembly) -> Node {
+    let mref = MethodRef::new(
+        int.class(asm),
+        asm.alloc_string(method),
+        asm.sig([Type::Int(int), Type::Int(Int::I32)], Type::Int(int)),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let mref = asm.alloc_methodref(mref);
+    asm.call(mref, &[val, rot], IsPure::NOT)
+}
+
+rotate_intrinsic_export!(rotate_right, "rotate_right", "RotateRight");
 pub fn bitreverse_u8(byte: Node, asm: &mut Assembly) -> Node {
     let byte = asm.int_cast(byte, Int::U64, ExtendKind::ZeroExtend);
     let lhs_rhs = asm.alloc_node(0x0002_0202_0202_u64);
@@ -541,7 +361,7 @@ pub fn bitreverse<'tcx>(
         Type::Int(int @ (Int::I32 | Int::U32 | Int::I64 | Int::U64 | Int::U128 | Int::I128)) => {
             bitreverse_int(val, int, ctx)
         }
-        Type::Int(Int::USize) => {
+        Type::Int(int @ (Int::USize | Int::ISize)) => {
             let physical = if ctx.target_layout().pointer_bits() == 32 {
                 Int::U32
             } else {
@@ -549,17 +369,7 @@ pub fn bitreverse<'tcx>(
             };
             let widened = ctx.int_cast(val, physical, ExtendKind::ZeroExtend);
             let rev = bitreverse_int(widened, physical, ctx);
-            ctx.int_cast(rev, Int::USize, ExtendKind::ZeroExtend)
-        }
-        Type::Int(Int::ISize) => {
-            let physical = if ctx.target_layout().pointer_bits() == 32 {
-                Int::U32
-            } else {
-                Int::U64
-            };
-            let widened = ctx.int_cast(val, physical, ExtendKind::ZeroExtend);
-            let rev = bitreverse_int(widened, physical, ctx);
-            ctx.int_cast(rev, Int::ISize, ExtendKind::ZeroExtend)
+            ctx.int_cast(rev, int, ExtendKind::ZeroExtend)
         }
         _ => todo!("can't yet bitreverse {val_tpe:?}"),
     };

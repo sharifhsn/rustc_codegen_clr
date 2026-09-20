@@ -108,70 +108,11 @@ impl Int {
             Int::U16 => Const::U16(u16::MIN).into(),
             Int::U32 => Const::U32(u32::MIN).into(),
             Int::U64 => Const::U64(u64::MIN).into(),
-            Int::U128 => {
-                let min_value = asm.alloc_string("get_MinValue");
-                let sig = asm.sig([], Type::Int(*self));
-                let class = ClassRef::uint_128(asm);
-                CILNode::call(
-                    asm.alloc_methodref(MethodRef::new(
-                        class,
-                        min_value,
-                        sig,
-                        MethodKind::Static,
-                        [].into(),
-                    )),
-                    [],
-                )
-            }
-            Int::USize => {
-                let min_value = asm.alloc_string("get_MinValue");
-                let sig = asm.sig([], Type::Int(*self));
-                let class = ClassRef::usize_type(asm);
-                CILNode::call(
-                    asm.alloc_methodref(MethodRef::new(
-                        class,
-                        min_value,
-                        sig,
-                        MethodKind::Static,
-                        [].into(),
-                    )),
-                    [],
-                )
-            }
+            Int::U128 | Int::I128 | Int::USize | Int::ISize => self.bcl_bound(asm, "get_MinValue"),
             Int::I8 => Const::I8(i8::MIN).into(),
             Int::I16 => Const::I16(i16::MIN).into(),
             Int::I32 => Const::I32(i32::MIN).into(),
             Int::I64 => Const::I64(i64::MIN).into(),
-            Int::I128 => {
-                let min_value = asm.alloc_string("get_MinValue");
-                let sig = asm.sig([], Type::Int(*self));
-                let class = ClassRef::uint_128(asm);
-                CILNode::call(
-                    asm.alloc_methodref(MethodRef::new(
-                        class,
-                        min_value,
-                        sig,
-                        MethodKind::Static,
-                        [].into(),
-                    )),
-                    [],
-                )
-            }
-            Int::ISize => {
-                let min_value = asm.alloc_string("get_MinValue");
-                let sig = asm.sig([], Type::Int(*self));
-                let class = ClassRef::isize_type(asm);
-                CILNode::call(
-                    asm.alloc_methodref(MethodRef::new(
-                        class,
-                        min_value,
-                        sig,
-                        MethodKind::Static,
-                        [].into(),
-                    )),
-                    [],
-                )
-            }
         }
     }
     /// Returns the maximum value of this int.
@@ -181,71 +122,23 @@ impl Int {
             Int::U16 => Const::U16(u16::MAX).into(),
             Int::U32 => Const::U32(u32::MAX).into(),
             Int::U64 => Const::U64(u64::MAX).into(),
-            Int::U128 => {
-                let max_value = asm.alloc_string("get_MaxValue");
-                let sig = asm.sig([], Type::Int(*self));
-                let class = ClassRef::uint_128(asm);
-                CILNode::call(
-                    asm.alloc_methodref(MethodRef::new(
-                        class,
-                        max_value,
-                        sig,
-                        MethodKind::Static,
-                        [].into(),
-                    )),
-                    [],
-                )
-            }
-            Int::USize => {
-                let max_value = asm.alloc_string("get_MaxValue");
-                let sig = asm.sig([], Type::Int(*self));
-                let class = ClassRef::usize_type(asm);
-                CILNode::call(
-                    asm.alloc_methodref(MethodRef::new(
-                        class,
-                        max_value,
-                        sig,
-                        MethodKind::Static,
-                        [].into(),
-                    )),
-                    [],
-                )
-            }
+            Int::U128 | Int::I128 | Int::USize | Int::ISize => self.bcl_bound(asm, "get_MaxValue"),
             Int::I8 => Const::I8(i8::MAX).into(),
             Int::I16 => Const::I16(i16::MAX).into(),
             Int::I32 => Const::I32(i32::MAX).into(),
             Int::I64 => Const::I64(i64::MAX).into(),
-            Int::I128 => {
-                let max_value = asm.alloc_string("get_MaxValue");
-                let sig = asm.sig([], Type::Int(*self));
-                let class = ClassRef::uint_128(asm);
-                CILNode::call(
-                    asm.alloc_methodref(MethodRef::new(
-                        class,
-                        max_value,
-                        sig,
-                        MethodKind::Static,
-                        [].into(),
-                    )),
-                    [],
-                )
-            }
-            Int::ISize => {
-                let max_value = asm.alloc_string("get_MaxValue");
-                let sig = asm.sig([], Type::Int(*self));
-                let class = ClassRef::isize_type(asm);
-                CILNode::call(
-                    asm.alloc_methodref(MethodRef::new(
-                        class,
-                        max_value,
-                        sig,
-                        MethodKind::Static,
-                        [].into(),
-                    )),
-                    [],
-                )
-            }
         }
+    }
+
+    fn bcl_bound(&self, asm: &mut Assembly, name: &'static str) -> CILNode {
+        let method = MethodRef::new(
+            self.class(asm),
+            asm.alloc_string(name),
+            asm.sig([], Type::Int(*self)),
+            MethodKind::Static,
+            [].into(),
+        );
+        CILNode::call(asm.alloc_methodref(method), [])
     }
     /// Returns a short name of this int.
     #[must_use]

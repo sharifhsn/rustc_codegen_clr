@@ -449,58 +449,6 @@ pub mod safe_fs {
         identity: (u64, u64),
     }
 
-    /// A directory moved to a private sibling name while both its parent and the moved object
-    /// remain open. Removal uses those retained handles instead of resolving the quarantine path.
-    #[derive(Debug)]
-    pub struct QuarantinedDirectory {
-        #[cfg(unix)]
-        parent: File,
-        directory: File,
-        #[cfg(unix)]
-        name: OsString,
-        display_path: PathBuf,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-    pub struct FileIdentity {
-        pub volume: u64,
-        pub file: u64,
-    }
-
-    #[derive(Debug)]
-    pub struct QuarantinedRegular {
-        #[cfg(unix)]
-        parent: File,
-        file: File,
-        #[cfg(unix)]
-        name: OsString,
-    }
-
-    pub fn retained_file_identity(file: &File) -> Result<FileIdentity> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let metadata = file.metadata()?;
-            Ok(FileIdentity {
-                volume: metadata.dev(),
-                file: metadata.ino(),
-            })
-        }
-        #[cfg(windows)]
-        {
-            let (volume, file) = windows_file_identity(file)?;
-            Ok(FileIdentity { volume, file })
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let metadata = file.metadata()?;
-            Ok(FileIdentity {
-                volume: metadata.len(),
-                file: 0,
-            })
-        }
-    }
-
     /// A node yielded by [`DirectoryCapability::walk_regular_tree`]. Directory events bracket all
     /// of their descendants; file handles are opened no-follow and remain the only byte authority.
     pub enum TreeWalkNode<'a> {
@@ -511,10 +459,6 @@ pub mod safe_fs {
 
     impl DirectoryCapability {
         pub fn open(root: &Path) -> Result<Self> {
-            Self::open_with_hook(root, || {})
-        }
-
-        fn open_with_hook(root: &Path, before_open: impl FnOnce()) -> Result<Self> {
             let before = std::fs::symlink_metadata(root)
                 .with_context(|| format!("inspecting capability root {}", root.display()))?;
             if metadata_is_link_or_reparse(&before) || !before.is_dir() {
@@ -526,8 +470,6 @@ pub mod safe_fs {
 
             #[cfg(windows)]
             let before_identity = windows_file_identity(&open_directory_nofollow(root)?)?;
-            before_open();
-
             #[cfg(unix)]
             let handle = {
                 use rustix::fs::{Mode, OFlags, openat};
@@ -569,10 +511,6 @@ pub mod safe_fs {
 
         pub fn root(&self) -> &Path {
             &self.root
-        }
-
-        pub fn identity(&self) -> Result<FileIdentity> {
-            retained_file_identity(&self.handle)
         }
 
         /// Derive a retained descendant-directory authority from this capability. The descendant
@@ -653,680 +591,93 @@ pub mod safe_fs {
             self.ensure_root_path_bound()
         }
 
-        /// Move a retained descendant directory out of its public pathname and verify that the
-        /// quarantined name still denotes the directory that was opened no-follow. Callers can
-        /// then remove only the quarantined object, never a replacement installed at the source
-        /// pathname during recovery.
-        pub fn quarantine_subdirectory(&self, relative: &Path) -> Result<QuarantinedDirectory> {
-            self.quarantine_subdirectory_with_hook(relative, || {})
-        }
-
-        fn quarantine_subdirectory_with_hook(
-            &self,
-            relative: &Path,
-            before_move: impl FnOnce(),
-        ) -> Result<QuarantinedDirectory> {
-            use std::sync::atomic::{AtomicU64, Ordering};
-
-            static NEXT_QUARANTINE: AtomicU64 = AtomicU64::new(0);
-            validate_single_normal_component(relative)?;
-            let Component::Normal(source_name) = relative.components().next().unwrap() else {
-                unreachable!("single relative component was validated above")
-            };
-            #[cfg(unix)]
-            let source_handle = {
-                use rustix::fs::{Mode, OFlags, openat};
-                File::from(openat(
-                    &self.handle,
-                    source_name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )?)
-            };
-            #[cfg(windows)]
-            let source_handle = open_windows_child_directory_for_delete(&self.handle, source_name)?;
-            #[cfg(not(any(unix, windows)))]
-            let source_handle = open_directory_nofollow(&self.root.join(relative))?;
-            let source_metadata = source_handle.metadata()?;
-            if metadata_is_link_or_reparse(&source_metadata) || !source_metadata.is_dir() {
-                bail!("capability quarantine source is not a regular directory");
-            }
-            #[cfg(unix)]
-            let parent_handle = self.handle.try_clone()?;
-            before_move();
-            let quarantined_name = loop {
-                let candidate = OsString::from(format!(
-                    ".cargo-dotnet-quarantine-dir-{}--q-{}-{}",
-                    source_name.to_string_lossy(),
-                    std::process::id(),
-                    NEXT_QUARANTINE.fetch_add(1, Ordering::Relaxed)
-                ));
-                #[cfg(unix)]
-                let moved: Result<()> = {
-                    use rustix::fs::{RenameFlags, renameat_with};
-                    renameat_with(
-                        &self.handle,
-                        source_name,
-                        &self.handle,
-                        &candidate,
-                        RenameFlags::NOREPLACE,
-                    )
-                    .map_err(std::io::Error::from)
-                    .map_err(anyhow::Error::from)
-                };
-                #[cfg(windows)]
-                let moved = rename_open_windows_file_within(
-                    &source_handle,
-                    &self.handle,
-                    &candidate,
-                    false,
-                );
-                #[cfg(not(any(unix, windows)))]
-                let moved: Result<()> =
-                    std::fs::rename(self.root.join(relative), self.root.join(&candidate))
-                        .map_err(anyhow::Error::from);
-                match moved {
-                    Ok(()) => break candidate,
-                    Err(error)
-                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                            error.kind() == std::io::ErrorKind::AlreadyExists
-                        }) =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error).context("quarantining retained directory"),
-                }
-            };
-            #[cfg(unix)]
-            let opened = {
-                use rustix::fs::{Mode, OFlags, openat};
-                File::from(openat(
-                    &self.handle,
-                    &quarantined_name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )?)
-            };
-            #[cfg(windows)]
-            let opened = open_windows_child_directory_for_delete(&self.handle, &quarantined_name)?;
-            #[cfg(not(any(unix, windows)))]
-            let opened = open_directory_nofollow(&self.root.join(&quarantined_name))?;
-            #[cfg(windows)]
-            let same = windows_file_identity(&source_handle)? == windows_file_identity(&opened)?;
-            #[cfg(not(windows))]
-            let same = same_file(&source_handle.metadata()?, &opened.metadata()?);
-            if !same {
-                #[cfg(unix)]
-                {
-                    use rustix::fs::{RenameFlags, renameat_with};
-                    let _ = renameat_with(
-                        &self.handle,
-                        &quarantined_name,
-                        &self.handle,
-                        source_name,
-                        RenameFlags::NOREPLACE,
-                    );
-                }
-                bail!("capability quarantine entry was rebound while it was moved");
-            }
-            self.ensure_path_still_bound()?;
-            Ok(QuarantinedDirectory {
-                #[cfg(unix)]
-                parent: parent_handle,
-                directory: opened,
-                #[cfg(unix)]
-                name: quarantined_name.clone(),
-                display_path: self.root.join(quarantined_name),
-            })
-        }
-
-        /// Retain a direct-child directory that is already under a private quarantine name so
-        /// crash recovery can finish its handle-relative removal.
-        pub fn retain_subdirectory_for_removal(
-            &self,
-            relative: &Path,
-        ) -> Result<QuarantinedDirectory> {
-            validate_single_normal_component(relative)?;
-            let Component::Normal(name) = relative.components().next().unwrap() else {
-                unreachable!("single relative component was validated above")
-            };
-            #[cfg(unix)]
-            let directory = open_unix_directory_at(&self.handle, name)?;
-            #[cfg(windows)]
-            let directory = open_windows_child_directory_for_delete(&self.handle, name)?;
-            #[cfg(not(any(unix, windows)))]
-            let directory = open_directory_nofollow(&self.root.join(relative))?;
-            let metadata = directory.metadata()?;
-            if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
-                bail!("retained quarantine entry is not a regular directory");
-            }
-            Ok(QuarantinedDirectory {
-                #[cfg(unix)]
-                parent: self.handle.try_clone()?,
-                directory,
-                #[cfg(unix)]
-                name: name.to_owned(),
-                display_path: self.root.join(relative),
-            })
-        }
-
-        pub fn direct_child_directory_identity(&self, relative: &Path) -> Result<FileIdentity> {
-            validate_single_normal_component(relative)?;
-            let Component::Normal(name) = relative.components().next().unwrap() else {
-                unreachable!("single relative component was validated above")
-            };
-            #[cfg(unix)]
-            let directory = open_unix_directory_at(&self.handle, name)?;
-            #[cfg(windows)]
-            let directory = open_windows_child_directory_for_delete(&self.handle, name)?;
-            #[cfg(not(any(unix, windows)))]
-            let directory = open_directory_nofollow(&self.root.join(relative))?;
-            retained_file_identity(&directory)
-        }
-
-        pub fn direct_subdirectory_for_move(&self, relative: &Path) -> Result<Self> {
-            validate_single_normal_component(relative)?;
-            let Component::Normal(name) = relative.components().next().unwrap() else {
-                unreachable!()
-            };
-            #[cfg(unix)]
-            let handle = open_unix_directory_at(&self.handle, name)?;
-            #[cfg(windows)]
-            let handle = open_windows_child_directory_for_delete(&self.handle, name)?;
-            #[cfg(not(any(unix, windows)))]
-            let handle = open_directory_nofollow(&self.root.join(relative))?;
-            let metadata = handle.metadata()?;
-            if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
-                bail!("direct move source is not a regular directory");
-            }
-            Ok(Self {
-                root: self.root.join(relative),
-                #[cfg(windows)]
-                identity: windows_file_identity(&handle)?,
-                handle,
-            })
-        }
-
-        pub fn quarantine_retained_subdirectory_bound(
-            &self,
-            source_name: &Path,
-            source: &DirectoryCapability,
-            destination: &Path,
-            expected: FileIdentity,
-        ) -> Result<QuarantinedDirectory> {
-            validate_single_normal_component(source_name)?;
-            validate_single_normal_component(destination)?;
-            if source.identity()? != expected {
-                bail!("retained move source identity does not match durable authority");
-            }
-            let Component::Normal(source_name) = source_name.components().next().unwrap() else {
-                unreachable!()
-            };
-            let Component::Normal(destination_name) = destination.components().next().unwrap()
-            else {
-                unreachable!()
-            };
-            #[cfg(windows)]
-            let _ = source_name;
-            #[cfg(unix)]
-            rustix::fs::renameat_with(
-                &self.handle,
-                source_name,
-                &self.handle,
-                destination_name,
-                rustix::fs::RenameFlags::NOREPLACE,
-            )?;
-            #[cfg(windows)]
-            rename_open_windows_file_within(&source.handle, &self.handle, destination_name, false)?;
-            #[cfg(not(any(unix, windows)))]
-            std::fs::rename(self.root.join(source_name), self.root.join(destination))?;
-            let retained = self.retain_subdirectory_for_removal(destination)?;
-            if retained_file_identity(&retained.directory)? != expected {
-                #[cfg(unix)]
-                let _ = rustix::fs::renameat_with(
-                    &self.handle,
-                    destination_name,
-                    &self.handle,
-                    source_name,
-                    rustix::fs::RenameFlags::NOREPLACE,
-                );
-                bail!("retained move destination identity does not match durable authority");
-            }
-            Ok(retained)
-        }
-
-        /// Move the exact identity named by a direct child to an exact, create-new quarantine
-        /// name. The caller durably records `expected` before invoking this operation.
-        pub fn quarantine_subdirectory_bound(
-            &self,
-            source: &Path,
-            destination: &Path,
-            expected: FileIdentity,
-        ) -> Result<QuarantinedDirectory> {
-            validate_single_normal_component(source)?;
-            validate_single_normal_component(destination)?;
-            let Component::Normal(source_name) = source.components().next().unwrap() else {
-                unreachable!()
-            };
-            #[cfg(windows)]
-            let _ = source_name;
-            let Component::Normal(destination_name) = destination.components().next().unwrap()
-            else {
-                unreachable!()
-            };
-            #[cfg(unix)]
-            let opened = open_unix_directory_at(&self.handle, source_name)?;
-            #[cfg(windows)]
-            let opened = open_windows_child_directory_for_delete(&self.handle, source_name)?;
-            #[cfg(not(any(unix, windows)))]
-            let opened = open_directory_nofollow(&self.root.join(source))?;
-            if retained_file_identity(&opened)? != expected {
-                bail!("quarantine source directory identity does not match durable authority");
-            }
-            #[cfg(unix)]
-            rustix::fs::renameat_with(
-                &self.handle,
-                source_name,
-                &self.handle,
-                destination_name,
-                rustix::fs::RenameFlags::NOREPLACE,
-            )?;
-            #[cfg(windows)]
-            rename_open_windows_file_within(&opened, &self.handle, destination_name, false)?;
-            #[cfg(not(any(unix, windows)))]
-            std::fs::rename(self.root.join(source), self.root.join(destination))?;
-            let retained = self.retain_subdirectory_for_removal(destination)?;
-            if retained_file_identity(&retained.directory)? != expected {
-                #[cfg(unix)]
-                let _ = rustix::fs::renameat_with(
-                    &self.handle,
-                    destination_name,
-                    &self.handle,
-                    source_name,
-                    rustix::fs::RenameFlags::NOREPLACE,
-                );
-                bail!("quarantined directory identity does not match durable authority");
-            }
-            Ok(retained)
-        }
-
-        pub fn retain_bound_subdirectory(
-            &self,
-            relative: &Path,
-            expected: FileIdentity,
-        ) -> Result<QuarantinedDirectory> {
-            let retained = self.retain_subdirectory_for_removal(relative)?;
-            if retained_file_identity(&retained.directory)? != expected {
-                bail!("retained quarantine directory identity does not match durable authority");
-            }
-            Ok(retained)
-        }
-
-        /// Atomically create an empty ownership marker relative to this retained directory.
-        /// Empty markers have no partial-write state: after a crash they are either absent or
-        /// complete.
-        pub fn create_empty_regular(&self, relative: &Path) -> Result<File> {
-            validate_single_normal_component(relative)?;
-            let Component::Normal(name) = relative.components().next().unwrap() else {
-                unreachable!("single relative component was validated above")
-            };
-            #[cfg(unix)]
-            let file = {
-                use rustix::fs::{Mode, OFlags, openat};
-                File::from(openat(
-                    &self.handle,
-                    name,
-                    OFlags::RDWR
-                        | OFlags::CREATE
-                        | OFlags::EXCL
-                        | OFlags::NOFOLLOW
-                        | OFlags::CLOEXEC,
-                    Mode::from_raw_mode(0o600),
-                )?)
-            };
-            #[cfg(windows)]
-            let file = create_windows_empty_file_within(&self.handle, name)?;
-            #[cfg(not(any(unix, windows)))]
-            let file = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(self.root.join(relative))?;
-            file.sync_all()?;
-            self.handle.sync_all()?;
-            Ok(file)
-        }
-
-        pub fn quarantine_regular_bound(
-            &self,
-            source: &Path,
-            opened: &File,
-            destination: &Path,
-            expected: FileIdentity,
-        ) -> Result<QuarantinedRegular> {
-            validate_single_normal_component(source)?;
-            validate_single_normal_component(destination)?;
-            if retained_file_identity(opened)? != expected {
-                bail!("quarantine source file identity does not match durable authority");
-            }
-            let Component::Normal(source_name) = source.components().next().unwrap() else {
-                unreachable!()
-            };
-            let Component::Normal(destination_name) = destination.components().next().unwrap()
-            else {
-                unreachable!()
-            };
-            #[cfg(windows)]
-            let _ = source_name;
-            #[cfg(unix)]
-            rustix::fs::renameat_with(
-                &self.handle,
-                source_name,
-                &self.handle,
-                destination_name,
-                rustix::fs::RenameFlags::NOREPLACE,
-            )?;
-            #[cfg(windows)]
-            rename_open_windows_file_within(opened, &self.handle, destination_name, false)?;
-            #[cfg(not(any(unix, windows)))]
-            std::fs::rename(self.root.join(source), self.root.join(destination))?;
-            self.retain_bound_regular(destination, expected)
-        }
-
-        pub fn retain_bound_regular(
-            &self,
-            relative: &Path,
-            expected: FileIdentity,
-        ) -> Result<QuarantinedRegular> {
-            validate_single_normal_component(relative)?;
-            let Component::Normal(name) = relative.components().next().unwrap() else {
-                unreachable!()
-            };
-            #[cfg(unix)]
-            let file = {
-                use rustix::fs::{Mode, OFlags, openat};
-                File::from(openat(
-                    &self.handle,
-                    name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                    Mode::empty(),
-                )?)
-            };
-            #[cfg(windows)]
-            let file = open_windows_child_file_for_delete(&self.handle, name)?;
-            #[cfg(not(any(unix, windows)))]
-            let file = open_regular_nofollow(&self.root.join(relative))?;
-            if retained_file_identity(&file)? != expected {
-                bail!("retained quarantine file identity does not match durable authority");
-            }
-            Ok(QuarantinedRegular {
-                #[cfg(unix)]
-                parent: self.handle.try_clone()?,
-                file,
-                #[cfg(unix)]
-                name: name.to_owned(),
-            })
-        }
-
-        /// Remove a direct-child regular file only if its public name still denotes the retained
-        /// handle supplied by the caller. A replacement installed after validation is preserved.
-        pub fn remove_open_regular(&self, relative: &Path, opened: &File) -> Result<bool> {
-            self.remove_open_regular_with_hook(relative, opened, || {})
-        }
-
-        fn remove_open_regular_with_hook(
-            &self,
-            relative: &Path,
-            opened: &File,
-            before_move: impl FnOnce(),
-        ) -> Result<bool> {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static NEXT_QUARANTINE: AtomicU64 = AtomicU64::new(0);
-
-            validate_single_normal_component(relative)?;
-            let Component::Normal(source_name) = relative.components().next().unwrap() else {
-                unreachable!("single relative component was validated above")
-            };
-            before_move();
-            #[cfg(unix)]
-            {
-                use rustix::fs::{
-                    AtFlags, Mode, OFlags, RenameFlags, openat, renameat_with, unlinkat,
-                };
-                let current = File::from(openat(
-                    &self.handle,
-                    source_name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                    Mode::empty(),
-                )?);
-                if !same_file(&current.metadata()?, &opened.metadata()?) {
-                    return Ok(false);
-                }
-                loop {
-                    let candidate = OsString::from(format!(
-                        ".cargo-dotnet-quarantine-file-{}--q-{}-{}",
-                        source_name.to_string_lossy(),
-                        std::process::id(),
-                        NEXT_QUARANTINE.fetch_add(1, Ordering::Relaxed)
-                    ));
-                    match renameat_with(
-                        &self.handle,
-                        source_name,
-                        &self.handle,
-                        &candidate,
-                        RenameFlags::NOREPLACE,
-                    ) {
-                        Ok(()) => {
-                            let quarantined = File::from(openat(
-                                &self.handle,
-                                &candidate,
-                                OFlags::RDONLY
-                                    | OFlags::NOFOLLOW
-                                    | OFlags::CLOEXEC
-                                    | OFlags::NONBLOCK,
-                                Mode::empty(),
-                            )?);
-                            if !same_file(&quarantined.metadata()?, &opened.metadata()?) {
-                                let _ = renameat_with(
-                                    &self.handle,
-                                    &candidate,
-                                    &self.handle,
-                                    source_name,
-                                    RenameFlags::NOREPLACE,
-                                );
-                                return Ok(false);
-                            }
-                            unlinkat(&self.handle, &candidate, AtFlags::empty())?;
-                            File::from(rustix::io::dup(&self.handle)?).sync_all()?;
-                            return Ok(true);
-                        }
-                        Err(rustix::io::Errno::EXIST) => continue,
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-            }
-            #[cfg(windows)]
-            {
-                let current = open_windows_child_file_for_delete(&self.handle, source_name)?;
-                if windows_file_identity(&current)? != windows_file_identity(opened)? {
-                    return Ok(false);
-                }
-                loop {
-                    let candidate = OsString::from(format!(
-                        ".cargo-dotnet-quarantine-file-{}--q-{}-{}",
-                        source_name.to_string_lossy(),
-                        std::process::id(),
-                        NEXT_QUARANTINE.fetch_add(1, Ordering::Relaxed)
-                    ));
-                    match rename_open_windows_file_within(opened, &self.handle, &candidate, false) {
-                        Ok(()) => {
-                            mark_open_windows_file_for_deletion(opened)?;
-                            return Ok(true);
-                        }
-                        Err(error)
-                            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                                error.kind() == std::io::ErrorKind::AlreadyExists
-                            }) =>
-                        {
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                let current = open_regular_nofollow(&self.root.join(relative))?;
-                if !same_file(&current.metadata()?, &opened.metadata()?) {
-                    return Ok(false);
-                }
-                std::fs::remove_file(self.root.join(relative))?;
-                Ok(true)
-            }
-        }
-
-        /// Finish removal of a file that is already under an unpredictable private quarantine
-        /// name. The retained file identity is checked immediately before the fd-relative unlink.
-        pub fn remove_retained_regular(&self, relative: &Path, opened: &File) -> Result<bool> {
-            validate_single_normal_component(relative)?;
-            let Component::Normal(name) = relative.components().next().unwrap() else {
-                unreachable!("single relative component was validated above")
-            };
-            #[cfg(unix)]
-            {
-                use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
-                let current = File::from(openat(
-                    &self.handle,
-                    name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                    Mode::empty(),
-                )?);
-                if !same_file(&current.metadata()?, &opened.metadata()?) {
-                    return Ok(false);
-                }
-                unlinkat(&self.handle, name, AtFlags::empty())?;
-                File::from(rustix::io::dup(&self.handle)?).sync_all()?;
-                Ok(true)
-            }
-            #[cfg(windows)]
-            {
-                let current = open_windows_child_file_for_delete(&self.handle, name)?;
-                if windows_file_identity(&current)? != windows_file_identity(opened)? {
-                    return Ok(false);
-                }
-                mark_open_windows_file_for_deletion(opened)?;
-                Ok(true)
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                let current = open_regular_nofollow(&self.root.join(relative))?;
-                if !same_file(&current.metadata()?, &opened.metadata()?) {
-                    return Ok(false);
-                }
-                std::fs::remove_file(self.root.join(relative))?;
-                Ok(true)
-            }
-        }
-
         pub fn open_regular(&self, relative: &Path) -> Result<(PathBuf, File)> {
-            self.open_regular_with_hook(relative, || {})
-        }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt as _;
 
-        #[cfg(unix)]
-        fn open_regular_with_hook(
-            &self,
-            relative: &Path,
-            before_leaf_open: impl FnOnce(),
-        ) -> Result<(PathBuf, File)> {
-            use std::os::unix::fs::FileTypeExt as _;
+                use rustix::fs::{Mode, OFlags, openat};
 
-            use rustix::fs::{Mode, OFlags, openat};
-
-            validate_normalized_relative(relative)?;
-            let mut directory: std::os::fd::OwnedFd = self.handle.try_clone()?.into();
-            let components = relative.components().collect::<Vec<_>>();
-            for component in &components[..components.len() - 1] {
-                let Component::Normal(name) = component else {
+                validate_normalized_relative(relative)?;
+                let mut directory: std::os::fd::OwnedFd = self.handle.try_clone()?.into();
+                let components = relative.components().collect::<Vec<_>>();
+                for component in &components[..components.len() - 1] {
+                    let Component::Normal(name) = component else {
+                        unreachable!("relative path was validated above")
+                    };
+                    directory = openat(
+                        &directory,
+                        *name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "opening capability directory without following links: {}",
+                            self.root.join(relative).display()
+                        )
+                    })?;
+                }
+                let Component::Normal(name) = components.last().expect("relative path is nonempty")
+                else {
                     unreachable!("relative path was validated above")
                 };
-                directory = openat(
-                    &directory,
-                    *name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .with_context(|| {
-                    format!(
-                        "opening capability directory without following links: {}",
-                        self.root.join(relative).display()
+                let file = File::from(
+                    openat(
+                        &directory,
+                        *name,
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                        Mode::empty(),
                     )
-                })?;
-            }
-            before_leaf_open();
-            let Component::Normal(name) = components.last().expect("relative path is nonempty")
-            else {
-                unreachable!("relative path was validated above")
-            };
-            let file = File::from(
-                openat(
-                    &directory,
-                    *name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                    Mode::empty(),
-                )
-                .with_context(|| {
-                    format!(
-                        "opening capability file without following links: {}",
-                        self.root.join(relative).display()
-                    )
-                })?,
-            );
-            let metadata = file.metadata()?;
-            if metadata_is_link_or_reparse(&metadata)
-                || !metadata.is_file()
-                || metadata.file_type().is_socket()
-                || metadata.file_type().is_fifo()
-            {
-                bail!(
-                    "capability path is not a regular file: {}",
-                    self.root.join(relative).display()
+                    .with_context(|| {
+                        format!(
+                            "opening capability file without following links: {}",
+                            self.root.join(relative).display()
+                        )
+                    })?,
                 );
-            }
-            Ok((self.root.join(relative), file))
-        }
-
-        #[cfg(not(unix))]
-        fn open_regular_with_hook(
-            &self,
-            relative: &Path,
-            before_leaf_open: impl FnOnce(),
-        ) -> Result<(PathBuf, File)> {
-            validate_normalized_relative(relative)?;
-            self.ensure_root_path_bound()?;
-            let mut ancestor = PathBuf::new();
-            for component in relative
-                .components()
-                .take(relative.components().count() - 1)
-            {
-                let Component::Normal(name) = component else {
-                    unreachable!("relative path was validated above")
-                };
-                ancestor.push(name);
-                let opened = self.open_directory(&ancestor)?;
-                let metadata = opened.metadata()?;
-                if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+                let metadata = file.metadata()?;
+                if metadata_is_link_or_reparse(&metadata)
+                    || !metadata.is_file()
+                    || metadata.file_type().is_socket()
+                    || metadata.file_type().is_fifo()
+                {
                     bail!(
-                        "capability ancestor is not a regular directory: {}",
-                        self.root.join(&ancestor).display()
+                        "capability path is not a regular file: {}",
+                        self.root.join(relative).display()
                     );
                 }
+                Ok((self.root.join(relative), file))
             }
-            before_leaf_open();
-            let candidate = self.root.join(relative);
-            let file = open_regular_nofollow(&candidate)?;
-            validate_final_handle_within(&self.handle, &file)?;
-            self.ensure_root_path_bound()?;
-            Ok((candidate, file))
+
+            #[cfg(not(unix))]
+            {
+                validate_normalized_relative(relative)?;
+                self.ensure_root_path_bound()?;
+                let mut ancestor = PathBuf::new();
+                for component in relative
+                    .components()
+                    .take(relative.components().count() - 1)
+                {
+                    let Component::Normal(name) = component else {
+                        unreachable!("relative path was validated above")
+                    };
+                    ancestor.push(name);
+                    let opened = self.open_directory(&ancestor)?;
+                    let metadata = opened.metadata()?;
+                    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+                        bail!(
+                            "capability ancestor is not a regular directory: {}",
+                            self.root.join(&ancestor).display()
+                        );
+                    }
+                }
+                let candidate = self.root.join(relative);
+                let file = open_regular_nofollow(&candidate)?;
+                validate_final_handle_within(&self.handle, &file)?;
+                self.ensure_root_path_bound()?;
+                Ok((candidate, file))
+            }
         }
 
         pub fn snapshot_regular(&self, relative: &Path) -> Result<(PathBuf, Vec<u8>)> {
@@ -1449,23 +800,11 @@ pub mod safe_fs {
 
         #[cfg(windows)]
         pub fn publish_bytes(&self, relative: &Path, bytes: &[u8]) -> Result<PathBuf> {
-            self.publish_bytes_with_hooks(relative, bytes, || {}, || {})
-        }
-
-        #[cfg(windows)]
-        fn publish_bytes_with_hooks(
-            &self,
-            relative: &Path,
-            bytes: &[u8],
-            before_ancestor_create: impl FnOnce(),
-            before_stage_create: impl FnOnce(),
-        ) -> Result<PathBuf> {
             validate_normalized_relative(relative)?;
             self.ensure_root_path_bound()?;
             let mut parent = self.root.clone();
             let mut retained = vec![(self.root.clone(), self.handle.try_clone()?)];
             let components = relative.components().collect::<Vec<_>>();
-            before_ancestor_create();
             for component in &components[..components.len() - 1] {
                 let Component::Normal(name) = component else {
                     unreachable!("relative path was validated above")
@@ -1496,7 +835,6 @@ pub mod safe_fs {
             else {
                 unreachable!("relative path was validated above")
             };
-            before_stage_create();
             let retained_parent = &retained.last().expect("parent retained").1;
             let mut temporary =
                 create_windows_staged_file_within(retained_parent).with_context(|| {
@@ -1594,26 +932,12 @@ pub mod safe_fs {
         where
             F: for<'a> FnMut(&Path, TreeWalkNode<'a>) -> Result<()>,
         {
-            self.walk_regular_tree_with_hook(excluded_root_entries, &mut |_| {}, visitor)
-        }
-
-        pub fn walk_regular_tree_with_hook<F, H>(
-            &self,
-            excluded_root_entries: &[&str],
-            before_entry_open: &mut H,
-            visitor: &mut F,
-        ) -> Result<()>
-        where
-            F: for<'a> FnMut(&Path, TreeWalkNode<'a>) -> Result<()>,
-            H: FnMut(&Path),
-        {
             #[cfg(unix)]
             {
                 self.walk_unix_directory(
                     Path::new(""),
                     &self.handle,
                     excluded_root_entries,
-                    before_entry_open,
                     visitor,
                 )
             }
@@ -1623,24 +947,21 @@ pub mod safe_fs {
                     Path::new(""),
                     &self.handle,
                     excluded_root_entries,
-                    before_entry_open,
                     visitor,
                 )
             }
         }
 
         #[cfg(unix)]
-        fn walk_unix_directory<F, H>(
+        fn walk_unix_directory<F>(
             &self,
             relative: &Path,
             directory: &File,
             excluded_root_entries: &[&str],
-            before_entry_open: &mut H,
             visitor: &mut F,
         ) -> Result<()>
         where
             F: for<'a> FnMut(&Path, TreeWalkNode<'a>) -> Result<()>,
-            H: FnMut(&Path),
         {
             use std::os::unix::ffi::OsStrExt as _;
             use std::os::unix::fs::FileTypeExt as _;
@@ -1666,7 +987,6 @@ pub mod safe_fs {
                     continue;
                 }
                 let child_relative = relative.join(&name);
-                before_entry_open(&child_relative);
                 let opened_directory = openat(
                     directory,
                     &name,
@@ -1687,7 +1007,6 @@ pub mod safe_fs {
                         &child_relative,
                         &child,
                         excluded_root_entries,
-                        before_entry_open,
                         visitor,
                     )?;
                     visitor(&child_relative, TreeWalkNode::DirectoryLeave(&child))?;
@@ -1726,17 +1045,15 @@ pub mod safe_fs {
         }
 
         #[cfg(not(unix))]
-        fn walk_path_directory<F, H>(
+        fn walk_path_directory<F>(
             &self,
             relative: &Path,
             directory: &File,
             excluded_root_entries: &[&str],
-            before_entry_open: &mut H,
             visitor: &mut F,
         ) -> Result<()>
         where
             F: for<'a> FnMut(&Path, TreeWalkNode<'a>) -> Result<()>,
-            H: FnMut(&Path),
         {
             self.ensure_root_path_bound()?;
             self.ensure_directory_path_bound(relative, directory)?;
@@ -1758,14 +1075,12 @@ pub mod safe_fs {
                     continue;
                 }
                 let child_relative = relative.join(&name);
-                before_entry_open(&child_relative);
                 if let Ok(child) = self.open_directory(&child_relative) {
                     visitor(&child_relative, TreeWalkNode::DirectoryEnter(&child))?;
                     self.walk_path_directory(
                         &child_relative,
                         &child,
                         excluded_root_entries,
-                        before_entry_open,
                         visitor,
                     )?;
                     visitor(&child_relative, TreeWalkNode::DirectoryLeave(&child))?;
@@ -1853,214 +1168,11 @@ pub mod safe_fs {
         }
     }
 
-    impl QuarantinedDirectory {
-        pub fn path(&self) -> &Path {
-            &self.display_path
-        }
-
-        pub fn identity(&self) -> Result<FileIdentity> {
-            retained_file_identity(&self.directory)
-        }
-
-        pub fn is_empty(&self) -> Result<bool> {
-            #[cfg(unix)]
-            {
-                let mut entries = rustix::fs::Dir::read_from(&self.directory)?;
-                while let Some(entry) = entries.read() {
-                    let entry = entry?;
-                    let name = entry.file_name().to_bytes();
-                    if name != b"." && name != b".." {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            #[cfg(windows)]
-            {
-                let before = open_directory_nofollow(&self.display_path)?;
-                if retained_file_identity(&before)? != retained_file_identity(&self.directory)? {
-                    return Ok(false);
-                }
-                let empty = std::fs::read_dir(&self.display_path)?.next().is_none();
-                let after = open_directory_nofollow(&self.display_path)?;
-                Ok(empty
-                    && retained_file_identity(&after)? == retained_file_identity(&self.directory)?)
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                Ok(std::fs::read_dir(&self.display_path)?.next().is_none())
-            }
-        }
-
-        pub fn remove(self) -> Result<()> {
-            #[cfg(unix)]
-            {
-                remove_unix_directory_contents(&self.directory, &self.display_path)?;
-                let current = open_unix_directory_at(&self.parent, &self.name)?;
-                if !same_file(&current.metadata()?, &self.directory.metadata()?) {
-                    bail!("quarantined directory was rebound before removal");
-                }
-                rustix::fs::unlinkat(&self.parent, &self.name, rustix::fs::AtFlags::REMOVEDIR)?;
-                File::from(rustix::io::dup(&self.parent)?).sync_all()?;
-                Ok(())
-            }
-            #[cfg(windows)]
-            {
-                remove_windows_directory_contents(&self.directory, &self.display_path)?;
-                mark_open_windows_file_for_deletion(&self.directory)
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                std::fs::remove_dir_all(&self.display_path)?;
-                Ok(())
-            }
-        }
-    }
-
-    impl QuarantinedRegular {
-        pub fn remove(self) -> Result<()> {
-            #[cfg(unix)]
-            {
-                use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
-                let current = File::from(openat(
-                    &self.parent,
-                    &self.name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                    Mode::empty(),
-                )?);
-                if retained_file_identity(&current)? != retained_file_identity(&self.file)? {
-                    bail!("quarantined file was rebound before removal");
-                }
-                unlinkat(&self.parent, &self.name, AtFlags::empty())?;
-                File::from(rustix::io::dup(&self.parent)?).sync_all()?;
-                Ok(())
-            }
-            #[cfg(windows)]
-            {
-                mark_open_windows_file_for_deletion(&self.file)
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                bail!("retained quarantine removal is unsupported on this host")
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn open_unix_directory_at(parent: &File, name: &std::ffi::OsStr) -> Result<File> {
-        use rustix::fs::{Mode, OFlags, openat};
-        Ok(File::from(openat(
-            parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?))
-    }
-
-    #[cfg(unix)]
-    fn remove_unix_directory_contents(directory: &File, display: &Path) -> Result<()> {
-        use rustix::fs::{AtFlags, Dir, Mode, OFlags, openat, unlinkat};
-        use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::FileTypeExt as _;
-
-        let mut stream = Dir::read_from(directory)?;
-        let mut names = Vec::<OsString>::new();
-        while let Some(entry) = stream.read() {
-            let entry = entry?;
-            let bytes = entry.file_name().to_bytes();
-            if bytes != b"." && bytes != b".." {
-                names.push(std::ffi::OsStr::from_bytes(bytes).to_owned());
-            }
-        }
-        names.sort();
-        for name in names {
-            if let Ok(child) = open_unix_directory_at(directory, &name) {
-                remove_unix_directory_contents(&child, &display.join(&name))?;
-                let current = open_unix_directory_at(directory, &name)?;
-                if !same_file(&current.metadata()?, &child.metadata()?) {
-                    bail!("owned directory entry was rebound during removal");
-                }
-                unlinkat(directory, &name, AtFlags::REMOVEDIR)?;
-                continue;
-            }
-            let child = File::from(openat(
-                directory,
-                &name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                Mode::empty(),
-            )?);
-            let metadata = child.metadata()?;
-            if metadata_is_link_or_reparse(&metadata)
-                || !metadata.is_file()
-                || metadata.file_type().is_socket()
-                || metadata.file_type().is_fifo()
-            {
-                bail!(
-                    "owned quarantine contains an unsupported entry: {}",
-                    display.join(&name).display()
-                );
-            }
-            let current = File::from(openat(
-                directory,
-                &name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                Mode::empty(),
-            )?);
-            if !same_file(&current.metadata()?, &metadata) {
-                bail!("owned file entry was rebound during removal");
-            }
-            unlinkat(directory, &name, AtFlags::empty())?;
-        }
-        File::from(rustix::io::dup(directory)?).sync_all()?;
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn remove_windows_directory_contents(directory: &File, display: &Path) -> Result<()> {
-        let current = open_directory_nofollow(display)?;
-        if windows_file_identity(&current)? != windows_file_identity(directory)? {
-            bail!("quarantined Windows directory pathname was rebound");
-        }
-        let mut names = std::fs::read_dir(display)?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        let current = open_directory_nofollow(display)?;
-        if windows_file_identity(&current)? != windows_file_identity(directory)? {
-            bail!("quarantined Windows directory changed while it was enumerated");
-        }
-        names.sort();
-        for name in names {
-            match open_windows_child_directory_for_delete(directory, &name) {
-                Ok(child) => {
-                    remove_windows_directory_contents(&child, &display.join(&name))?;
-                    mark_open_windows_file_for_deletion(&child)?;
-                }
-                Err(_) => {
-                    let child = open_windows_child_file_for_delete(directory, &name)?;
-                    let metadata = child.metadata()?;
-                    if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
-                        bail!("owned Windows quarantine contains an unsupported entry");
-                    }
-                    mark_open_windows_file_for_deletion(&child)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub fn publish_bytes_within(root: &Path, relative: &Path, bytes: &[u8]) -> Result<PathBuf> {
         DirectoryCapability::open(root)?.publish_bytes(relative, bytes)
     }
 
     fn open_regular_nofollow_with(path: &Path, write: bool) -> Result<File> {
-        open_regular_nofollow_with_hook(path, write, || {})
-    }
-
-    fn open_regular_nofollow_with_hook(
-        path: &Path,
-        write: bool,
-        before_open: impl FnOnce(),
-    ) -> Result<File> {
         let before = std::fs::symlink_metadata(path)
             .with_context(|| format!("inspecting regular file {}", path.display()))?;
         if metadata_is_link_or_reparse(&before) || !before.is_file() {
@@ -2079,7 +1191,6 @@ pub mod safe_fs {
             })?;
             windows_file_identity(&validation)?
         };
-        before_open();
         let mut options = OpenOptions::new();
         options.read(true).write(write);
         configure_nofollow(&mut options);
@@ -2132,7 +1243,7 @@ pub mod safe_fs {
     /// pathname validation. Other platforms retain an opened leaf handle and validate both its
     /// stable file identity and its final resolved path against the root before returning it.
     pub fn open_regular_within(root: &Path, relative: &Path) -> Result<(PathBuf, File)> {
-        open_regular_within_hook(root, relative, || {})
+        open_regular_within_impl(root, relative)
     }
 
     fn validate_normalized_relative(relative: &Path) -> Result<()> {
@@ -2164,30 +1275,13 @@ pub mod safe_fs {
         Ok(())
     }
 
-    fn validate_single_normal_component(relative: &Path) -> Result<()> {
-        validate_normalized_relative(relative)?;
-        if relative.components().count() != 1 {
-            bail!("capability operation requires one direct child name");
-        }
-        Ok(())
+    #[cfg(unix)]
+    fn open_regular_within_impl(root: &Path, relative: &Path) -> Result<(PathBuf, File)> {
+        open_regular_within_unix(root, relative)
     }
 
     #[cfg(unix)]
-    fn open_regular_within_hook(
-        root: &Path,
-        relative: &Path,
-        before_leaf_open: impl FnOnce(),
-    ) -> Result<(PathBuf, File)> {
-        open_regular_within_hooks(root, relative, || {}, before_leaf_open)
-    }
-
-    #[cfg(unix)]
-    fn open_regular_within_hooks(
-        root: &Path,
-        relative: &Path,
-        before_root_open: impl FnOnce(),
-        before_leaf_open: impl FnOnce(),
-    ) -> Result<(PathBuf, File)> {
+    fn open_regular_within_unix(root: &Path, relative: &Path) -> Result<(PathBuf, File)> {
         use std::os::unix::fs::FileTypeExt as _;
 
         use rustix::fs::{Mode, OFlags, openat};
@@ -2201,7 +1295,6 @@ pub mod safe_fs {
                 root.display()
             );
         }
-        before_root_open();
         let root_descriptor = openat(
             rustix::fs::CWD,
             root,
@@ -2239,7 +1332,6 @@ pub mod safe_fs {
                 )
             })?;
         }
-        before_leaf_open();
         let Component::Normal(name) = components.last().expect("relative path is nonempty") else {
             unreachable!("relative path was validated above")
         };
@@ -2271,21 +1363,12 @@ pub mod safe_fs {
     }
 
     #[cfg(not(unix))]
-    fn open_regular_within_hook(
-        root: &Path,
-        relative: &Path,
-        before_leaf_open: impl FnOnce(),
-    ) -> Result<(PathBuf, File)> {
-        open_regular_within_hooks(root, relative, || {}, before_leaf_open)
+    fn open_regular_within_impl(root: &Path, relative: &Path) -> Result<(PathBuf, File)> {
+        open_regular_within_other(root, relative)
     }
 
     #[cfg(not(unix))]
-    fn open_regular_within_hooks(
-        root: &Path,
-        relative: &Path,
-        before_root_open: impl FnOnce(),
-        before_leaf_open: impl FnOnce(),
-    ) -> Result<(PathBuf, File)> {
+    fn open_regular_within_other(root: &Path, relative: &Path) -> Result<(PathBuf, File)> {
         validate_normalized_relative(relative)?;
         let root_metadata = std::fs::symlink_metadata(root)
             .with_context(|| format!("inspecting containing root {}", root.display()))?;
@@ -2300,7 +1383,6 @@ pub mod safe_fs {
             let validation = open_directory_nofollow(root)?;
             windows_file_identity(&validation)?
         };
-        before_root_open();
         let root_handle = open_directory_nofollow(root)?;
         let opened_root_metadata = root_handle.metadata()?;
         #[cfg(windows)]
@@ -2334,7 +1416,6 @@ pub mod safe_fs {
                 );
             }
         }
-        before_leaf_open();
         let candidate = root.join(relative);
         let file = open_regular_nofollow(&candidate)?;
         validate_final_handle_within(&root_handle, &file)?;
@@ -2385,64 +1466,6 @@ pub mod safe_fs {
             );
         }
         Ok(file)
-    }
-
-    #[cfg(windows)]
-    fn open_windows_child_directory_for_delete(parent: &File, name: &OsStr) -> Result<File> {
-        const DELETE: u32 = 0x0001_0000;
-        const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
-        const FILE_TRAVERSE: u32 = 0x0000_0020;
-        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
-        const SYNCHRONIZE: u32 = 0x0010_0000;
-        const FILE_OPEN: u32 = 1;
-        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
-        const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
-        nt_create_relative(
-            parent,
-            name,
-            DELETE | FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_OPEN,
-            FILE_ATTRIBUTE_DIRECTORY,
-            FILE_DIRECTORY_FILE,
-        )
-    }
-
-    #[cfg(windows)]
-    fn open_windows_child_file_for_delete(parent: &File, name: &OsStr) -> Result<File> {
-        const DELETE: u32 = 0x0001_0000;
-        const FILE_READ_DATA: u32 = 0x0000_0001;
-        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
-        const SYNCHRONIZE: u32 = 0x0010_0000;
-        const FILE_OPEN: u32 = 1;
-        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
-        const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
-        nt_create_relative(
-            parent,
-            name,
-            DELETE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_OPEN,
-            FILE_ATTRIBUTE_NORMAL,
-            FILE_NON_DIRECTORY_FILE,
-        )
-    }
-
-    #[cfg(windows)]
-    fn create_windows_empty_file_within(parent: &File, name: &OsStr) -> Result<File> {
-        const DELETE: u32 = 0x0001_0000;
-        const SYNCHRONIZE: u32 = 0x0010_0000;
-        const GENERIC_READ: u32 = 0x8000_0000;
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const FILE_CREATE: u32 = 2;
-        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
-        const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
-        nt_create_relative(
-            parent,
-            name,
-            GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
-            FILE_CREATE,
-            FILE_ATTRIBUTE_NORMAL,
-            FILE_NON_DIRECTORY_FILE,
-        )
     }
 
     #[cfg(windows)]
@@ -2778,15 +1801,7 @@ pub mod safe_fs {
     /// it has been resolved. The opened handle is the source of the returned bytes; pathname and
     /// root identities are rechecked before those bytes are released to the caller.
     pub fn snapshot_regular_within(root: &Path, relative: &Path) -> Result<(PathBuf, Vec<u8>)> {
-        snapshot_regular_within_hook(root, relative, || {})
-    }
-
-    fn snapshot_regular_within_hook(
-        root: &Path,
-        relative: &Path,
-        before_open: impl FnOnce(),
-    ) -> Result<(PathBuf, Vec<u8>)> {
-        let (candidate, mut file) = open_regular_within_hook(root, relative, before_open)?;
+        let (candidate, mut file) = open_regular_within(root, relative)?;
         let bytes = read_opened_regular(&mut file, &candidate)?;
         Ok((candidate, bytes))
     }
@@ -3024,88 +2039,6 @@ pub mod safe_fs {
 
         #[cfg(unix)]
         #[test]
-        fn deterministic_leaf_swap_never_reads_symlink_target() {
-            use std::os::unix::fs::symlink;
-
-            let temp = tempfile::tempdir().unwrap();
-            let victim = temp.path().join("victim");
-            let outside = temp.path().join("outside");
-            std::fs::write(&victim, b"inside").unwrap();
-            std::fs::write(&outside, b"outside-secret").unwrap();
-            let error = open_regular_nofollow_with_hook(&victim, false, || {
-                std::fs::remove_file(&victim).unwrap();
-                symlink(&outside, &victim).unwrap();
-            })
-            .unwrap_err();
-            assert!(format!("{error:#}").contains("without following links"));
-            assert_eq!(std::fs::read(outside).unwrap(), b"outside-secret");
-        }
-
-        #[cfg(unix)]
-        #[test]
-        fn deterministic_ancestor_swap_never_returns_outside_bytes() {
-            use std::os::unix::fs::symlink;
-
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("root");
-            let owned = root.join("owned");
-            let outside = temp.path().join("outside");
-            std::fs::create_dir_all(&owned).unwrap();
-            std::fs::create_dir(&outside).unwrap();
-            std::fs::write(owned.join("payload"), b"inside").unwrap();
-            std::fs::write(outside.join("payload"), b"outside-secret").unwrap();
-
-            let (_, bytes) =
-                snapshot_regular_within_hook(&root, Path::new("owned/payload"), || {
-                    std::fs::rename(&owned, root.join("owned.backup")).unwrap();
-                    symlink(&outside, &owned).unwrap();
-                })
-                .unwrap();
-            // The opened ancestor capability remains attached to the original directory even
-            // after its pathname is replaced. Returning those owned bytes is safe; following the
-            // replacement symlink would expose `outside-secret` and is the forbidden outcome.
-            assert_eq!(bytes, b"inside");
-            assert_eq!(
-                std::fs::read(outside.join("payload")).unwrap(),
-                b"outside-secret"
-            );
-        }
-
-        #[cfg(unix)]
-        #[test]
-        fn deterministic_root_swap_cannot_rebind_the_capability_root() {
-            use std::os::unix::fs::symlink;
-
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("root");
-            let outside = temp.path().join("outside");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::create_dir(&outside).unwrap();
-            std::fs::write(root.join("payload"), b"inside").unwrap();
-            std::fs::write(outside.join("payload"), b"outside-secret").unwrap();
-
-            let error = open_regular_within_hooks(
-                &root,
-                Path::new("payload"),
-                || {
-                    std::fs::rename(&root, temp.path().join("root.backup")).unwrap();
-                    symlink(&outside, &root).unwrap();
-                },
-                || {},
-            )
-            .unwrap_err();
-            assert!(
-                format!("{error:#}").contains("containing root"),
-                "{error:#}"
-            );
-            assert_eq!(
-                std::fs::read(outside.join("payload")).unwrap(),
-                b"outside-secret"
-            );
-        }
-
-        #[cfg(unix)]
-        #[test]
         fn capability_publication_replaces_leaf_symlink_and_rejects_linked_ancestor() {
             use std::os::unix::fs::symlink;
 
@@ -3135,77 +2068,6 @@ pub mod safe_fs {
             assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
         }
 
-        #[cfg(unix)]
-        #[test]
-        fn quarantine_rebind_preserves_the_replacement_at_its_public_name() {
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("root");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::create_dir(root.join("owned")).unwrap();
-            std::fs::write(root.join("owned/payload"), b"owned").unwrap();
-            let capability = DirectoryCapability::open(&root).unwrap();
-
-            let error = capability
-                .quarantine_subdirectory_with_hook(Path::new("owned"), || {
-                    std::fs::rename(root.join("owned"), root.join("owned-original")).unwrap();
-                    std::fs::create_dir(root.join("owned")).unwrap();
-                    std::fs::write(root.join("owned/payload"), b"replacement").unwrap();
-                })
-                .unwrap_err();
-
-            assert!(format!("{error:#}").contains("rebound"), "{error:#}");
-            assert_eq!(
-                std::fs::read(root.join("owned/payload")).unwrap(),
-                b"replacement"
-            );
-            assert_eq!(
-                std::fs::read(root.join("owned-original/payload")).unwrap(),
-                b"owned"
-            );
-        }
-
-        #[cfg(unix)]
-        #[test]
-        fn retained_file_removal_preserves_a_rebound_sidecar() {
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("root");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::write(root.join("marker"), b"owned").unwrap();
-            let capability = DirectoryCapability::open(&root).unwrap();
-            let (_, marker) = capability.open_regular(Path::new("marker")).unwrap();
-
-            let removed = capability
-                .remove_open_regular_with_hook(Path::new("marker"), &marker, || {
-                    std::fs::rename(root.join("marker"), root.join("marker-original")).unwrap();
-                    std::fs::write(root.join("marker"), b"replacement").unwrap();
-                })
-                .unwrap();
-
-            assert!(!removed);
-            assert_eq!(std::fs::read(root.join("marker")).unwrap(), b"replacement");
-            assert_eq!(
-                std::fs::read(root.join("marker-original")).unwrap(),
-                b"owned"
-            );
-        }
-
-        #[cfg(windows)]
-        fn create_junction(link: &Path, target: &Path) {
-            let status = std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(link)
-                .arg(target)
-                .status()
-                .expect("launch cmd.exe to create a test junction");
-            assert!(
-                status.success(),
-                "Windows test host must support same-volume directory junctions"
-            );
-            assert!(metadata_is_link_or_reparse(
-                &std::fs::symlink_metadata(link).unwrap()
-            ));
-        }
-
         #[cfg(windows)]
         fn assert_no_publish_temporaries(root: &Path) {
             for entry in std::fs::read_dir(root).unwrap() {
@@ -3226,132 +2088,6 @@ pub mod safe_fs {
                     assert_no_publish_temporaries(&entry.path());
                 }
             }
-        }
-
-        #[cfg(windows)]
-        #[test]
-        fn windows_rejects_reparse_ancestors_and_file_identity_replacement() {
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("root");
-            let outside = temp.path().join("outside");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::create_dir(&outside).unwrap();
-            std::fs::write(outside.join("payload"), b"outside").unwrap();
-            let junction = root.join("linked");
-            create_junction(&junction, &outside);
-            assert!(snapshot_regular_within(&root, Path::new("linked/payload")).is_err());
-
-            let victim = root.join("victim");
-            let replacement = root.join("replacement");
-            std::fs::write(&victim, b"first").unwrap();
-            std::fs::write(&replacement, b"other").unwrap();
-            let error = open_regular_nofollow_with_hook(&victim, false, || {
-                std::fs::remove_file(&victim).unwrap();
-                std::fs::hard_link(&replacement, &victim).unwrap();
-            })
-            .unwrap_err();
-            assert!(format!("{error:#}").contains("changed while it was opened"));
-        }
-
-        #[cfg(windows)]
-        #[test]
-        fn windows_publication_rejects_parent_junction_replacement() {
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("root");
-            let parent = root.join("owned");
-            let outside = temp.path().join("outside");
-            std::fs::create_dir_all(&parent).unwrap();
-            std::fs::create_dir(&outside).unwrap();
-            let capability = DirectoryCapability::open(&root).unwrap();
-            let backup = root.join("owned-original");
-
-            let error = capability
-                .publish_bytes_with_hooks(
-                    Path::new("owned/payload"),
-                    b"must stay owned",
-                    || {},
-                    || {
-                        std::fs::rename(&parent, &backup).unwrap();
-                        create_junction(&parent, &outside);
-                    },
-                )
-                .unwrap_err();
-
-            assert!(
-                format!("{error:#}").contains("reparse")
-                    || format!("{error:#}").contains("rebound"),
-                "{error:#}"
-            );
-            assert!(!outside.join("payload").exists());
-            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
-        }
-
-        #[cfg(windows)]
-        #[test]
-        fn windows_publication_creates_missing_ancestors_from_retained_root_handle() {
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("root");
-            let backup = temp.path().join("root-original");
-            let outside = temp.path().join("outside");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::create_dir(&outside).unwrap();
-            let capability = DirectoryCapability::open(&root).unwrap();
-
-            let error = capability
-                .publish_bytes_with_hooks(
-                    Path::new("new-parent/payload"),
-                    b"must stay owned",
-                    || {
-                        std::fs::rename(&root, &backup).unwrap();
-                        create_junction(&root, &outside);
-                    },
-                    || {},
-                )
-                .unwrap_err();
-
-            assert!(
-                format!("{error:#}").contains("reparse")
-                    || format!("{error:#}").contains("rebound"),
-                "{error:#}"
-            );
-            assert!(!outside.join("new-parent").exists());
-            assert!(backup.join("new-parent").is_dir());
-        }
-
-        #[cfg(windows)]
-        #[test]
-        fn windows_walk_rejects_child_replaced_after_directory_enter() {
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("root");
-            let child = root.join("child");
-            let backup = root.join("child-original");
-            let replacement = temp.path().join("replacement");
-            std::fs::create_dir_all(&child).unwrap();
-            std::fs::create_dir(&replacement).unwrap();
-            std::fs::write(child.join("owned"), b"owned").unwrap();
-            std::fs::write(replacement.join("foreign"), b"foreign").unwrap();
-            let capability = DirectoryCapability::open(&root).unwrap();
-            let mut saw_file = false;
-
-            let error = capability
-                .walk_regular_tree(&[], &mut |relative, node| {
-                    match node {
-                        TreeWalkNode::DirectoryEnter(_) if relative == Path::new("child") => {
-                            std::fs::rename(&child, &backup).unwrap();
-                            std::fs::rename(&replacement, &child).unwrap();
-                        }
-                        TreeWalkNode::File(_) => saw_file = true,
-                        _ => {}
-                    }
-                    Ok(())
-                })
-                .unwrap_err();
-
-            assert!(format!("{error:#}").contains("rebound"), "{error:#}");
-            assert!(
-                !saw_file,
-                "replacement directory contributed bytes to the walk"
-            );
         }
 
         #[cfg(windows)]
@@ -3397,57 +2133,6 @@ pub mod safe_fs {
                 &std::fs::symlink_metadata(&leaf).unwrap()
             ));
             assert_no_publish_temporaries(&root);
-        }
-
-        #[cfg(windows)]
-        #[test]
-        fn windows_identity_bound_quarantine_is_handle_relative_and_no_replace() {
-            let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("root");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::create_dir(root.join("owned")).unwrap();
-            std::fs::write(root.join("owned/payload"), b"owned").unwrap();
-            let capability = DirectoryCapability::open(&root).unwrap();
-            let identity = capability
-                .direct_child_directory_identity(Path::new("owned"))
-                .unwrap();
-            std::fs::create_dir(root.join("occupied")).unwrap();
-            assert!(
-                capability
-                    .quarantine_subdirectory_bound(
-                        Path::new("owned"),
-                        Path::new("occupied"),
-                        identity,
-                    )
-                    .is_err()
-            );
-            assert_eq!(std::fs::read(root.join("owned/payload")).unwrap(), b"owned");
-            capability
-                .quarantine_subdirectory_bound(
-                    Path::new("owned"),
-                    Path::new("quarantined-dir"),
-                    identity,
-                )
-                .unwrap()
-                .remove()
-                .unwrap();
-            assert!(!root.join("quarantined-dir").exists());
-
-            let marker = capability
-                .create_empty_regular(Path::new("marker"))
-                .unwrap();
-            let marker_identity = retained_file_identity(&marker).unwrap();
-            capability
-                .quarantine_regular_bound(
-                    Path::new("marker"),
-                    &marker,
-                    Path::new("quarantined-marker"),
-                    marker_identity,
-                )
-                .unwrap()
-                .remove()
-                .unwrap();
-            assert!(!root.join("quarantined-marker").exists());
         }
     }
 }

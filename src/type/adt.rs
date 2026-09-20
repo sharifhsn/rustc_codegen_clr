@@ -1,6 +1,6 @@
 use crate::fn_ctx::MethodCompileCtx;
-use crate::r#type::{GetTypeExt, utilis::simple_tuple};
-use cilly::{Assembly, FieldDesc, Float, Int, Type, bimap::Interned};
+use crate::r#type::GetTypeExt;
+use cilly::{Assembly, ClassRef, FieldDesc, Float, Int, Type, bimap::Interned};
 use rustc_abi::{FieldIdx, FieldsShape, Layout, LayoutData, VariantIdx, Variants};
 use rustc_middle::ty::List;
 use rustc_middle::ty::{AdtDef, CoroutineArgsExt, GenericArg, Ty, TyKind};
@@ -265,7 +265,20 @@ pub fn field_descrptor<'tcx>(
             })
             .collect::<Vec<_>>();
         let field_name = ctx.alloc_string(format!("Item{}", field_idx + 1));
-        let tuple_type = simple_tuple(&elements, ctx);
+        let owner_ty = ctx.monomorphize(owner_ty);
+        let layout = ctx.layout_of(owner_ty).layout;
+        let field_offsets = (0..elements.len())
+            .map(|index| layout.fields.offset(index).bytes())
+            .collect::<Vec<_>>();
+        let tuple_name = super::utilis::rust_tuple_name(
+            &elements,
+            ctx,
+            layout.size().bytes(),
+            layout.align().abi.bytes(),
+            &field_offsets,
+        );
+        let tuple_name = ctx.alloc_string(tuple_name);
+        let tuple_type = ctx.alloc_class_ref(ClassRef::new(tuple_name, None, true, [].into()));
         return ctx.alloc_field(FieldDesc::new(tuple_type, field_name, element));
     } else if let TyKind::Closure(_, args) = owner_ty.kind() {
         let closure = args.as_closure();

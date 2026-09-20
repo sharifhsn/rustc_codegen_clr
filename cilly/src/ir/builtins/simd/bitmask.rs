@@ -77,10 +77,7 @@ pub(super) fn register_most_significant_bits(
     patcher: &mut MissingMethodPatcher,
 ) {
     let name = asm.alloc_string("simd_get_most_significant_bits");
-    patcher.insert(
-        name,
-        Box::new(|mref, asm| most_significant_bits_body(mref, asm)),
-    );
+    patcher.insert(name, Box::new(most_significant_bits_body));
 }
 
 #[cfg(test)]

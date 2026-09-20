@@ -243,12 +243,7 @@ pub trait CILIterMutTrait {
     #[allow(clippy::type_complexity)]
     fn next(&mut self) -> Option<(&mut Self::Ctx, Either<&mut Self::A, &mut Self::B>)> {
         self.advance();
-        let got = self.get();
-        /*match &got {
-            Some((_, got)) => eprintln!("got:{got:?}"),
-            _ => eprintln!("got:None"),
-        }*/
-        got
+        self.get()
     }
 }
 impl CILIterMutTrait for CILIterMut<'_> {
@@ -390,17 +385,16 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                     CILNode::Call(info) => Some(Box::new(asm[info.0].iter_types(asm))),
                     CILNode::LdFtn(method) => Some(Box::new(asm[method].iter_types(asm))),
                     CILNode::PtrCast(_, res) => match res.as_ref() {
-                        crate::cilnode::PtrCastRes::Ptr(inner) => {
-                            Some(Box::new(std::iter::once(asm[*inner])))
-                        }
-                        crate::cilnode::PtrCastRes::Ref(inner) => {
+                        crate::cilnode::PtrCastRes::Ptr(inner)
+                        | crate::cilnode::PtrCastRes::Ref(inner) => {
                             Some(Box::new(std::iter::once(asm[*inner])))
                         }
                         crate::cilnode::PtrCastRes::FnPtr(sig) => {
                             Some(Box::new(asm[*sig].iter_types()))
                         }
-                        crate::cilnode::PtrCastRes::USize => None,
-                        crate::cilnode::PtrCastRes::ISize => None,
+                        crate::cilnode::PtrCastRes::USize | crate::cilnode::PtrCastRes::ISize => {
+                            None
+                        }
                     },
                     CILNode::LdFieldAddress { field, .. } | CILNode::LdField { field, .. } => {
                         let field = asm.get_field(field);
@@ -421,13 +415,7 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                         Some(Box::new(std::iter::once(asm[tpe])))
                     }
                     CILNode::CallI(info) => Some(Box::new(asm[info.1].iter_types())),
-                    CILNode::LdStaticField(sfld) => {
-                        let field = asm.get_static_field(sfld);
-                        let class = Type::ClassRef(field.owner());
-                        let tpe = field.tpe();
-                        Some(Box::new([class, tpe].into_iter()))
-                    }
-                    CILNode::LdStaticFieldAddress(sfld) => {
+                    CILNode::LdStaticField(sfld) | CILNode::LdStaticFieldAddress(sfld) => {
                         let field = asm.get_static_field(sfld);
                         let class = Type::ClassRef(field.owner());
                         let tpe = field.tpe();
@@ -453,7 +441,8 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                     // The protected child root is yielded separately by the iterator (see the
                     // `TerminateRegion` arm in `next`), so this region itself contributes no types.
                     | CILRoot::TerminateRegion { .. }
-                    | CILRoot::Unreachable(_) => None,
+                    | CILRoot::Unreachable(_)
+                    | CILRoot::CallI(_) => None,
                     CILRoot::SetStaticField { field, .. } => {
                         let field = asm.get_static_field(field);
                         let class = Type::ClassRef(field.owner());
@@ -472,7 +461,6 @@ impl<'this, T: Iterator<Item = CILIterElem> + 'this> TpeIter<'this> for T {
                         Some(Box::new(std::iter::once(asm[tpe])))
                     }
                     CILRoot::Call(info) => Some(Box::new(asm[info.0].iter_types(asm))),
-                    CILRoot::CallI(_) => None,
                     CILRoot::StInd(info) => Some(Box::new(std::iter::once(info.2))),
                 },
             };

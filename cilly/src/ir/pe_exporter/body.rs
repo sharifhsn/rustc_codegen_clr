@@ -45,7 +45,7 @@ use crate::ir::cilnode::UnOp;
 use crate::ir::cilroot::{BranchCond, CmpKind};
 use crate::ir::method::{LocalDef, MethodImpl};
 use crate::ir::{
-    Assembly, CILNode, CILRoot, ClassRef, Const, Float, Int, Interned, MethodDefIdx, Type,
+    Assembly, CILNode, CILRoot, ClassRef, Const, Float, FnSig, Int, Interned, MethodDefIdx, Type,
 };
 use std::collections::HashMap;
 
@@ -150,6 +150,43 @@ struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
+    fn emit_token_op(&mut self, opcode: u8, tpe: Type) {
+        let tok = self.tokens.type_token(self.asm, tpe);
+        self.push_u8(opcode);
+        self.push_token(tok);
+    }
+
+    fn emit_bcl_obj(&mut self, opcode: u8, name: &'static str) {
+        let cref = self.bcl_valuetype_ref(name);
+        self.emit_token_op(opcode, Type::ClassRef(cref));
+    }
+
+    fn emit_calli(
+        &mut self,
+        calli: Box<(Interned<CILNode>, Interned<FnSig>, Box<[Interned<CILNode>]>)>,
+    ) {
+        let (fn_ptr, fn_sig, args) = *calli;
+        for arg in args.iter() {
+            self.emit_node(*arg);
+        }
+        self.emit_node(fn_ptr);
+        let tok = self.calli_sig_token(fn_sig);
+        self.push_u8(0x29); // calli
+        self.push_token(tok);
+    }
+
+    fn emit_binary_branch(
+        &mut self,
+        lhs: Interned<CILNode>,
+        rhs: Interned<CILNode>,
+        opcode: u8,
+        label: Label,
+    ) {
+        self.emit_node(lhs);
+        self.emit_node(rhs);
+        self.push_branch(opcode, label);
+    }
+
     fn define_label(&mut self, label: Label) {
         let off = u32::try_from(self.out.len()).expect("method body exceeds 4 GiB");
         self.label_offsets.insert(label, off);
@@ -330,28 +367,13 @@ impl<'a> Emitter<'a> {
             }
             CILNode::IsInst(val, tpe) => {
                 self.emit_node(val);
-                let tpe_val = self.asm[tpe];
-                let tok = self.tokens.type_token(self.asm, tpe_val);
-                self.push_u8(0x75); // isinst
-                self.push_token(tok);
+                self.emit_token_op(0x75, self.asm[tpe]); // isinst
             }
             CILNode::CheckedCast(val, tpe) => {
                 self.emit_node(val);
-                let tpe_val = self.asm[tpe];
-                let tok = self.tokens.type_token(self.asm, tpe_val);
-                self.push_u8(0x74); // castclass
-                self.push_token(tok);
+                self.emit_token_op(0x74, self.asm[tpe]); // castclass
             }
-            CILNode::CallI(calli) => {
-                let (fn_ptr, fn_sig, args) = *calli;
-                for arg in args.iter() {
-                    self.emit_node(*arg);
-                }
-                self.emit_node(fn_ptr);
-                let tok = self.calli_sig_token(fn_sig);
-                self.push_u8(0x29); // calli
-                self.push_token(tok);
-            }
+            CILNode::CallI(calli) => self.emit_calli(calli),
             CILNode::LocAlloc { size } => {
                 self.emit_node(size);
                 self.push_ext(0x0F); // localloc
@@ -372,10 +394,7 @@ impl<'a> Emitter<'a> {
                 self.push_token(tok);
             }
             CILNode::LdTypeToken(tok_ty) => {
-                let tpe_val = self.asm[tok_ty];
-                let tok = self.tokens.type_token(self.asm, tpe_val);
-                self.push_u8(0xD0); // ldtoken
-                self.push_token(tok);
+                self.emit_token_op(0xD0, self.asm[tok_ty]); // ldtoken
             }
             CILNode::LdLen(array) => {
                 self.emit_node(array);
@@ -390,108 +409,69 @@ impl<'a> Emitter<'a> {
             CILNode::LdElem { array, index, elem } => {
                 self.emit_node(array);
                 self.emit_node(index);
-                let tok = self.tokens.type_token(self.asm, self.asm[elem]);
-                self.push_u8(0xA3); // ldelem <typeTok>
-                self.push_token(tok);
+                self.emit_token_op(0xA3, self.asm[elem]); // ldelem <typeTok>
             }
             CILNode::UnboxAny { object, tpe } => {
                 self.emit_node(object);
-                let tpe_val = self.asm[tpe];
-                let tok = self.tokens.type_token(self.asm, tpe_val);
-                self.push_u8(0xA5); // unbox.any
-                self.push_token(tok);
+                self.emit_token_op(0xA5, self.asm[tpe]); // unbox.any
             }
             CILNode::Box { value, tpe } => {
                 self.emit_node(value);
-                let tpe_val = self.asm[tpe];
-                let tok = self.tokens.type_token(self.asm, tpe_val);
-                self.push_u8(0x8C); // box
-                self.push_token(tok);
+                self.emit_token_op(0x8C, self.asm[tpe]); // box
             }
             CILNode::NewArr { elem, len } => {
                 self.emit_node(len);
-                let tpe_val = self.asm[elem];
-                let tok = self.tokens.type_token(self.asm, tpe_val);
-                self.push_u8(0x8D); // newarr
-                self.push_token(tok);
+                self.emit_token_op(0x8D, self.asm[elem]); // newarr
             }
         }
     }
 
+    fn emit_compact_index(&mut self, index: u32, compact: [u8; 4], short: u8, wide: u8) {
+        match index {
+            0..=3 => self.push_u8(compact[index as usize]),
+            4..=255 => {
+                self.push_u8(short);
+                self.push_u8(index as u8);
+            }
+            _ => {
+                self.push_ext(wide);
+                self.push_u32(index);
+            }
+        }
+    }
+
+    fn emit_short_index(&mut self, index: u32, short: u8, wide: u8) {
+        if index <= 255 {
+            self.push_u8(short);
+            self.push_u8(index as u8);
+        } else {
+            self.push_ext(wide);
+            self.push_u32(index);
+        }
+    }
+
     fn emit_ldloc(&mut self, loc: u32) {
-        match loc {
-            0 => self.push_u8(0x06),
-            1 => self.push_u8(0x07),
-            2 => self.push_u8(0x08),
-            3 => self.push_u8(0x09),
-            4..=255 => {
-                self.push_u8(0x11); // ldloc.s
-                self.push_u8(loc as u8);
-            }
-            _ => {
-                self.push_ext(0x0C); // ldloc
-                self.push_u32(loc);
-            }
-        }
+        self.emit_compact_index(loc, [0x06, 0x07, 0x08, 0x09], 0x11, 0x0C);
     }
+
     fn emit_ldloca(&mut self, loc: u32) {
-        if loc <= 255 {
-            self.push_u8(0x12); // ldloca.s
-            self.push_u8(loc as u8);
-        } else {
-            self.push_ext(0x0D); // ldloca
-            self.push_u32(loc);
-        }
+        self.emit_short_index(loc, 0x12, 0x0D);
     }
+
     fn emit_ldarg(&mut self, arg: u32) {
-        match arg {
-            0 => self.push_u8(0x02),
-            1 => self.push_u8(0x03),
-            2 => self.push_u8(0x04),
-            3 => self.push_u8(0x05),
-            4..=255 => {
-                self.push_u8(0x0E); // ldarg.s
-                self.push_u8(arg as u8);
-            }
-            _ => {
-                self.push_ext(0x09); // ldarg
-                self.push_u32(arg);
-            }
-        }
+        self.emit_compact_index(arg, [0x02, 0x03, 0x04, 0x05], 0x0E, 0x09);
     }
+
     fn emit_ldarga(&mut self, arg: u32) {
-        if arg <= 255 {
-            self.push_u8(0x0F); // ldarga.s
-            self.push_u8(arg as u8);
-        } else {
-            self.push_ext(0x0A); // ldarga
-            self.push_u32(arg);
-        }
+        self.emit_short_index(arg, 0x0F, 0x0A);
     }
+
     fn emit_stloc(&mut self, loc: u32) {
-        match loc {
-            0 => self.push_u8(0x0A),
-            1 => self.push_u8(0x0B),
-            2 => self.push_u8(0x0C),
-            3 => self.push_u8(0x0D),
-            4..=255 => {
-                self.push_u8(0x13); // stloc.s
-                self.push_u8(loc as u8);
-            }
-            _ => {
-                self.push_ext(0x0E); // stloc
-                self.push_u32(loc);
-            }
-        }
+        self.emit_compact_index(loc, [0x0A, 0x0B, 0x0C, 0x0D], 0x13, 0x0E);
     }
+
     fn emit_starg(&mut self, arg: u32) {
-        if arg <= 255 {
-            self.push_u8(0x10); // starg.s
-            self.push_u8(arg as u8);
-        } else {
-            self.push_ext(0x0B); // starg
-            self.push_u32(arg);
-        }
+        self.emit_short_index(arg, 0x10, 0x0B);
     }
 
     /// `ldc.i4` short-form ladder + the widening constant forms (§III.3.39/III.3.40), mirroring
@@ -870,56 +850,35 @@ impl<'a> Emitter<'a> {
             self.push_volatile_prefix();
         }
         match tpe {
-            Type::Ptr(_) => self.push_u8(0x4D), // ldind.i
+            Type::Ptr(_) | Type::FnPtr(_) => self.push_u8(0x4D), // ldind.i
             Type::Ref(_) => {
                 todo!("§III ldind of a Ref — il_exporter itself has no encoding for this arm")
             }
             Type::Int(int) => match int {
-                Int::U8 => self.push_u8(0x47),  // ldind.u1
-                Int::U16 => self.push_u8(0x49), // ldind.u2
-                Int::U32 => self.push_u8(0x4B), // ldind.u4
-                Int::U64 => self.push_u8(0x4C), // ldind.u8 (alias of ldind.i8)
-                Int::U128 => {
-                    let cref = self.bcl_valuetype_ref("System.UInt128");
-                    let tok = self.tokens.type_token(self.asm, Type::ClassRef(cref));
-                    self.push_u8(0x71); // ldobj
-                    self.push_token(tok);
-                }
-                Int::USize => self.push_u8(0x4D), // ldind.i
-                Int::I8 => self.push_u8(0x46),    // ldind.i1
-                Int::I16 => self.push_u8(0x48),   // ldind.i2
-                Int::I32 => self.push_u8(0x4A),   // ldind.i4
-                Int::I64 => self.push_u8(0x4C),   // ldind.i8
-                Int::I128 => {
-                    let cref = self.bcl_valuetype_ref("System.Int128");
-                    let tok = self.tokens.type_token(self.asm, Type::ClassRef(cref));
-                    self.push_u8(0x71); // ldobj
-                    self.push_token(tok);
-                }
-                Int::ISize => self.push_u8(0x4D), // ldind.i
+                Int::U8 => self.push_u8(0x47),                          // ldind.u1
+                Int::U16 => self.push_u8(0x49),                         // ldind.u2
+                Int::U32 => self.push_u8(0x4B),                         // ldind.u4
+                Int::U64 | Int::I64 => self.push_u8(0x4C), // ldind.u8 (alias of ldind.i8)
+                Int::U128 => self.emit_bcl_obj(0x71, "System.UInt128"), // ldobj
+                Int::USize | Int::ISize => self.push_u8(0x4D), // ldind.i
+                Int::I8 => self.push_u8(0x46),             // ldind.i1
+                Int::I16 => self.push_u8(0x48),            // ldind.i2
+                Int::I32 => self.push_u8(0x4A),            // ldind.i4
+                Int::I128 => self.emit_bcl_obj(0x71, "System.Int128"), // ldobj
             },
             Type::ClassRef(_) => {
-                let tok = self.tokens.type_token(self.asm, tpe);
-                self.push_u8(0x71); // ldobj
-                self.push_token(tok);
+                self.emit_token_op(0x71, tpe); // ldobj
             }
             Type::Float(float) => match float {
-                Float::F16 => {
-                    let cref = self.bcl_valuetype_ref("System.Half");
-                    let tok = self.tokens.type_token(self.asm, Type::ClassRef(cref));
-                    self.push_u8(0x71);
-                    self.push_token(tok);
-                }
+                Float::F16 => self.emit_bcl_obj(0x71, "System.Half"),
                 Float::F32 => self.push_u8(0x4E), // ldind.r4
                 Float::F64 => self.push_u8(0x4F), // ldind.r8
-                Float::F128 => {
-                    let tok = self.tokens.type_token(self.asm, tpe);
-                    self.push_u8(0x71);
-                    self.push_token(tok);
-                }
+                Float::F128 => self.emit_token_op(0x71, tpe),
             },
-            Type::PlatformString | Type::PlatformObject => self.push_u8(0x50), // ldind.ref
-            Type::PlatformChar => self.push_u8(0x49),                          // ldind.u2
+            Type::PlatformString | Type::PlatformObject | Type::PlatformArray { .. } => {
+                self.push_u8(0x50)
+            } // ldind.ref
+            Type::PlatformChar => self.push_u8(0x49), // ldind.u2
             Type::PlatformGeneric(_, _) => {
                 todo!(
                     "§III ldind of a generic-parameter type — il_exporter itself has no encoding for this arm"
@@ -927,8 +886,6 @@ impl<'a> Emitter<'a> {
             }
             Type::Bool => self.push_u8(0x46), // ldind.i1
             Type::Void => panic!("Void can't be dereferenced!"),
-            Type::PlatformArray { .. } => self.push_u8(0x50), // ldind.ref
-            Type::FnPtr(_) => self.push_u8(0x4D),             // ldind.i
             Type::SIMDVector(_) => {
                 let tok = self.tokens.type_token(self.asm, tpe);
                 self.push_u8(0x71);
@@ -974,8 +931,9 @@ impl<'a> Emitter<'a> {
         }
         let tok = self.method_token_for_mref(mref);
         match kind {
-            crate::ir::cilnode::MethodKind::Static => self.push_u8(0x28), // call
-            crate::ir::cilnode::MethodKind::Instance => self.push_u8(0x28), // call instance
+            crate::ir::cilnode::MethodKind::Static | crate::ir::cilnode::MethodKind::Instance => {
+                self.push_u8(0x28)
+            } // call
             crate::ir::cilnode::MethodKind::Virtual => self.push_u8(0x6F), // callvirt
             crate::ir::cilnode::MethodKind::Constructor => self.push_u8(0x73), // newobj
         }
@@ -1001,22 +959,14 @@ impl<'a> Emitter<'a> {
             sig_val.output().mangle(self.asm)
         );
         let mut blob = Vec::new();
-        // Reuse `self` as the resolver: `TokenSink::type_token` already knows how to resolve a
-        // `ClassRef` to a `TypeDef`/`TypeRef`/`TypeSpec` token, which is exactly the shape a
-        // `TypeDefOrRef` coded index needs (tag 0/1/2 for those three tables respectively).
+        // Reuse `self` as the resolver. A `GENERICINST` signature must point at the OPEN
+        // `TypeDef`/`TypeRef` shape; `TokenSink::type_token` intentionally returns a `TypeSpec`
+        // for a closed generic instruction operand, and using that coded tag here produces a
+        // PE which CoreCLR rejects with "a valid typedef or typeref token is expected".
         struct Resolver<'x, 'y>(&'x mut &'y mut dyn TokenSink);
         impl super::sig::TypeDefOrRefResolver for Resolver<'_, '_> {
             fn type_def_or_ref(&mut self, cref: Interned<ClassRef>, asm: &mut Assembly) -> u32 {
-                let tok = self.0.type_token(asm, Type::ClassRef(cref));
-                let tag = match tok.table() {
-                    Token::TABLE_TYPE_DEF => 0,
-                    Token::TABLE_TYPE_REF => 1,
-                    Token::TABLE_TYPE_SPEC => 2,
-                    other => {
-                        panic!("type_token returned table id {other:#x}, not a TypeDefOrRef member")
-                    }
-                };
-                (tok.rid() << 2) | tag
+                self.0.type_def_or_ref_token(asm, cref)
             }
         }
         let mut resolver = Resolver(&mut self.tokens);
@@ -1109,15 +1059,11 @@ impl<'a> Emitter<'a> {
             CILRoot::CpObj { src, dst, tpe } => {
                 self.emit_node(src);
                 self.emit_node(dst);
-                let tpe_val = self.asm[tpe];
-                let tok = self.tokens.type_token(self.asm, tpe_val);
-                self.push_u8(0x70); // cpobj
-                self.push_token(tok);
+                self.emit_token_op(0x70, self.asm[tpe]); // cpobj
             }
             CILRoot::InitObj(addr, tpe) => {
                 self.emit_node(addr);
-                let tpe_val = self.asm[tpe];
-                let tok = self.tokens.type_token(self.asm, tpe_val);
+                let tok = self.tokens.type_token(self.asm, self.asm[tpe]);
                 self.push_ext(0x15); // initobj
                 self.push_token(tok);
             }
@@ -1141,16 +1087,7 @@ impl<'a> Emitter<'a> {
                 self.emit_node(len);
                 self.push_ext(0x17); // cpblk
             }
-            CILRoot::CallI(calli) => {
-                let (fn_ptr, fn_sig, args) = *calli;
-                for arg in args.iter() {
-                    self.emit_node(*arg);
-                }
-                self.emit_node(fn_ptr);
-                let tok = self.calli_sig_token(fn_sig);
-                self.push_u8(0x29); // calli
-                self.push_token(tok);
-            }
+            CILRoot::CallI(calli) => self.emit_calli(calli),
             CILRoot::TerminateRegion { protected, reason } => {
                 self.emit_terminate_region(protected, reason, is_handler, has_handler);
             }
@@ -1186,14 +1123,13 @@ impl<'a> Emitter<'a> {
                 self.emit_node(value);
                 let elem_val = self.asm[elem];
                 match elem_val {
-                    Type::Int(Int::I8 | Int::U8) => self.push_u8(0x9C), // stelem.i1
-                    Type::Int(Int::I16 | Int::U16) => self.push_u8(0x9D), // stelem.i2
-                    Type::Int(Int::I32 | Int::U32) => self.push_u8(0x9E), // stelem.i4
-                    Type::Int(Int::I64 | Int::U64) => self.push_u8(0x9F), // stelem.i8
-                    Type::Int(Int::ISize | Int::USize) => self.push_u8(0x9B), // stelem.i
-                    Type::Bool => self.push_u8(0x9C),                   // stelem.i1
-                    Type::Float(Float::F32) => self.push_u8(0xA0),      // stelem.r4
-                    Type::Float(Float::F64) => self.push_u8(0xA1),      // stelem.r8
+                    Type::Int(Int::I8 | Int::U8) | Type::Bool => self.push_u8(0x9C), // stelem.i1
+                    Type::Int(Int::I16 | Int::U16) => self.push_u8(0x9D),            // stelem.i2
+                    Type::Int(Int::I32 | Int::U32) => self.push_u8(0x9E),            // stelem.i4
+                    Type::Int(Int::I64 | Int::U64) => self.push_u8(0x9F),            // stelem.i8
+                    Type::Int(Int::ISize | Int::USize) => self.push_u8(0x9B),        // stelem.i
+                    Type::Float(Float::F32) => self.push_u8(0xA0),                   // stelem.r4
+                    Type::Float(Float::F64) => self.push_u8(0xA1),                   // stelem.r8
                     _ => {
                         let tok = self.tokens.type_token(self.asm, elem_val);
                         self.push_u8(0xA4); // stelem <type>
@@ -1213,51 +1149,35 @@ impl<'a> Emitter<'a> {
         let (target, sub_target, cond) = branch;
         let label = branch_label(target, sub_target, has_handler, is_handler);
         match cond {
-            Some(BranchCond::Eq(a, b)) => {
-                self.emit_node(a);
-                self.emit_node(b);
-                self.push_branch(0x3B, label); // beq
-            }
-            Some(BranchCond::Ne(a, b)) => {
-                self.emit_node(a);
-                self.emit_node(b);
-                self.push_branch(0x40, label); // bne.un
-            }
+            Some(BranchCond::Eq(a, b)) => self.emit_binary_branch(a, b, 0x3B, label), // beq
+            Some(BranchCond::Ne(a, b)) => self.emit_binary_branch(a, b, 0x40, label), // bne.un
             Some(BranchCond::Lt(a, b, kind)) => {
-                self.emit_node(a);
-                self.emit_node(b);
                 let op = match kind {
                     CmpKind::Ordered | CmpKind::Signed => 0x3F,     // blt
                     CmpKind::Unordered | CmpKind::Unsigned => 0x44, // blt.un
                 };
-                self.push_branch(op, label);
+                self.emit_binary_branch(a, b, op, label);
             }
             Some(BranchCond::Gt(a, b, kind)) => {
-                self.emit_node(a);
-                self.emit_node(b);
                 let op = match kind {
                     CmpKind::Ordered | CmpKind::Signed => 0x3D,     // bgt
                     CmpKind::Unordered | CmpKind::Unsigned => 0x42, // bgt.un
                 };
-                self.push_branch(op, label);
+                self.emit_binary_branch(a, b, op, label);
             }
             Some(BranchCond::Le(a, b, kind)) => {
-                self.emit_node(a);
-                self.emit_node(b);
                 let op = match kind {
                     CmpKind::Ordered | CmpKind::Signed => 0x3E,     // ble
                     CmpKind::Unordered | CmpKind::Unsigned => 0x43, // ble.un
                 };
-                self.push_branch(op, label);
+                self.emit_binary_branch(a, b, op, label);
             }
             Some(BranchCond::Ge(a, b, kind)) => {
-                self.emit_node(a);
-                self.emit_node(b);
                 let op = match kind {
                     CmpKind::Ordered | CmpKind::Signed => 0x3C,     // bge
                     CmpKind::Unordered | CmpKind::Unsigned => 0x41, // bge.un
                 };
-                self.push_branch(op, label);
+                self.emit_binary_branch(a, b, op, label);
             }
             Some(BranchCond::True(c)) => {
                 self.emit_node(c);
@@ -1276,7 +1196,7 @@ impl<'a> Emitter<'a> {
             self.push_volatile_prefix();
         }
         match tpe {
-            Type::Ptr(_) => self.push_u8(0xDF), // stind.i
+            Type::Ptr(_) | Type::FnPtr(_) => self.push_u8(0xDF), // stind.i
             Type::Ref(_) => {
                 todo!("§III stind of a Ref — il_exporter itself has no encoding for this arm")
             }
@@ -1285,47 +1205,28 @@ impl<'a> Emitter<'a> {
                 Int::U16 | Int::I16 => self.push_u8(0x53), // stind.i2
                 Int::U32 | Int::I32 => self.push_u8(0x54), // stind.i4
                 Int::U64 | Int::I64 => self.push_u8(0x55), // stind.i8
-                Int::U128 => {
-                    let cref = self.bcl_valuetype_ref("System.UInt128");
-                    let tok = self.tokens.type_token(self.asm, Type::ClassRef(cref));
-                    self.push_u8(0x81); // stobj
-                    self.push_token(tok);
-                }
-                Int::I128 => {
-                    let cref = self.bcl_valuetype_ref("System.Int128");
-                    let tok = self.tokens.type_token(self.asm, Type::ClassRef(cref));
-                    self.push_u8(0x81);
-                    self.push_token(tok);
-                }
+                Int::U128 => self.emit_bcl_obj(0x81, "System.UInt128"), // stobj
+                Int::I128 => self.emit_bcl_obj(0x81, "System.Int128"),
                 Int::USize | Int::ISize => self.push_u8(0xDF), // stind.i
             },
             Type::ClassRef(cref_idx) => {
                 let is_valuetype = self.asm[cref_idx].is_valuetype();
                 if is_valuetype {
-                    let tok = self.tokens.type_token(self.asm, tpe);
-                    self.push_u8(0x81); // stobj
-                    self.push_token(tok);
+                    self.emit_token_op(0x81, tpe); // stobj
                 } else {
                     self.push_u8(0x51); // stind.ref
                 }
             }
             Type::Float(float) => match float {
-                Float::F16 => {
-                    let cref = self.bcl_valuetype_ref("System.Half");
-                    let tok = self.tokens.type_token(self.asm, Type::ClassRef(cref));
-                    self.push_u8(0x81);
-                    self.push_token(tok);
-                }
+                Float::F16 => self.emit_bcl_obj(0x81, "System.Half"),
                 Float::F32 => self.push_u8(0x56), // stind.r4
                 Float::F64 => self.push_u8(0x57), // stind.r8
-                Float::F128 => {
-                    let tok = self.tokens.type_token(self.asm, tpe);
-                    self.push_u8(0x81);
-                    self.push_token(tok);
-                }
+                Float::F128 => self.emit_token_op(0x81, tpe),
             },
-            Type::PlatformString | Type::PlatformObject => self.push_u8(0x51), // stind.ref
-            Type::PlatformChar => self.push_u8(0x53),                          // stind.i2
+            Type::PlatformString | Type::PlatformObject | Type::PlatformArray { .. } => {
+                self.push_u8(0x51)
+            } // stind.ref
+            Type::PlatformChar => self.push_u8(0x53), // stind.i2
             Type::PlatformGeneric(_, _) => {
                 todo!(
                     "§III stind of a generic-parameter type — il_exporter itself has no encoding for this arm"
@@ -1339,8 +1240,6 @@ impl<'a> Emitter<'a> {
                 self.push_u8(0x26); // pop
                 self.emit_throw_new_exception("Attempted to wrtie to a zero-sized type(void).");
             }
-            Type::PlatformArray { .. } => self.push_u8(0x51), // stind.ref
-            Type::FnPtr(_) => self.push_u8(0xDF),             // stind.i
             Type::SIMDVector(_) => {
                 let tok = self.tokens.type_token(self.asm, tpe);
                 self.push_u8(0x81);
@@ -1529,7 +1428,7 @@ fn assemble_method_body(
     let mut emitter = new_emitter(asm, tokens);
 
     let mut blocks_iter = blocks.iter().peekable();
-    while let Some(block) = blocks_iter.next() {
+    for block in blocks_iter.by_ref() {
         let try_start = if block.handler().is_some() {
             Some(emitter.here())
         } else {
@@ -1801,6 +1700,11 @@ mod tests {
         fn type_token(&mut self, _asm: &mut Assembly, _tpe: Type) -> Token {
             self.next_type_rid += 1;
             Token::new(Token::TABLE_TYPE_REF, self.next_type_rid)
+        }
+
+        fn type_def_or_ref_token(&mut self, _asm: &mut Assembly, _cref: Interned<ClassRef>) -> u32 {
+            self.next_type_rid += 1;
+            (self.next_type_rid << 2) | 1
         }
     }
 
@@ -2227,7 +2131,7 @@ mod tests {
             u32::from_le_bytes([body.bytes[4], body.bytes[5], body.bytes[6], body.bytes[7]])
                 as usize;
         let mut eh_off = 12 + code_size;
-        while eh_off % 4 != 0 {
+        while !eh_off.is_multiple_of(4) {
             eh_off += 1;
         }
         assert_eq!(

@@ -150,86 +150,29 @@ impl ClassRef {
         let cref = ClassRef::new(name, None, true, [].into());
         asm.alloc_class_ref(cref)
     }
-    /// Returns a reference to the constructor of this class  - `.ctor`. The explict inputs of the constructor should not include `this` - that parameter will be automaticaly provided.
-    pub fn ctor(&self, explict_inputs: &[Type], asm: &mut Assembly) -> Interned<MethodRef> {
-        let this = asm.alloc_class_ref(self.clone());
-        let mut inputs = vec![Type::ClassRef(this)];
-        inputs.extend(explict_inputs);
-        let sig = asm.sig(inputs, Type::Void);
-        let fn_name = asm.alloc_string(".ctor");
-        asm.alloc_methodref(MethodRef::new(
-            this,
-            fn_name,
-            sig,
-            super::cilnode::MethodKind::Constructor,
-            [].into(),
-        ))
-    }
-    /// Returns a reference to an instance method of this class, with a given name. The explict inputs of the method should not include `this` - that parameter will be automaticaly provided.
-    pub fn instance(
-        &self,
-        explict_inputs: &[Type],
-        output: Type,
-        fn_name: Interned<IString>,
-        asm: &mut Assembly,
-    ) -> Interned<MethodRef> {
-        let this = asm.alloc_class_ref(self.clone());
-        let mut inputs = if self.is_valuetype() {
-            vec![asm.nref(Type::ClassRef(this))]
-        } else {
-            vec![Type::ClassRef(this)]
-        };
 
-        inputs.extend(explict_inputs);
-        let sig = asm.sig(inputs, output);
-        asm.alloc_methodref(MethodRef::new(
-            this,
-            fn_name,
-            sig,
-            super::cilnode::MethodKind::Instance,
-            [].into(),
-        ))
-    }
-    /// Returns a reference to an virtual method of this class, with a given name. The explict inputs of the method should not include `this` - that parameter will be automaticaly provided.
-    pub fn virtual_mref(
+    fn instance_method_ref(
         &self,
-        explict_inputs: &[Type],
+        explicit_inputs: &[Type],
         output: Type,
         fn_name: Interned<IString>,
         asm: &mut Assembly,
+        kind: super::cilnode::MethodKind,
+        byref_value_receiver: bool,
     ) -> Interned<MethodRef> {
         let this = asm.alloc_class_ref(self.clone());
-        let mut inputs = vec![Type::ClassRef(this)];
-        inputs.extend(explict_inputs);
+        let receiver = if byref_value_receiver && self.is_valuetype() {
+            asm.nref(Type::ClassRef(this))
+        } else {
+            Type::ClassRef(this)
+        };
+        let mut inputs = vec![receiver];
+        inputs.extend(explicit_inputs);
         let sig = asm.sig(inputs, output);
-        asm.alloc_methodref(MethodRef::new(
-            this,
-            fn_name,
-            sig,
-            super::cilnode::MethodKind::Virtual,
-            [].into(),
-        ))
+        asm.alloc_methodref(MethodRef::new(this, fn_name, sig, kind, [].into()))
     }
-    /// Returns a reference to an static method of this class, with a given name.
-    pub fn static_mref(
-        &self,
-        inputs: &[Type],
-        output: Type,
-        fn_name: Interned<IString>,
-        asm: &mut Assembly,
-    ) -> Interned<MethodRef> {
-        let this = asm.alloc_class_ref(self.clone());
-        let sig = asm.sig(inputs, output);
-        asm.alloc_methodref(MethodRef::new(
-            this,
-            fn_name,
-            sig,
-            super::cilnode::MethodKind::Static,
-            [].into(),
-        ))
-    }
-    /// Returns a reference to an static method of this class, with a given name.
-    pub fn static_mref_generic(
+
+    fn static_method_ref(
         &self,
         inputs: &[Type],
         output: Type,
@@ -246,6 +189,74 @@ impl ClassRef {
             super::cilnode::MethodKind::Static,
             generics,
         ))
+    }
+
+    /// Returns a reference to the constructor of this class  - `.ctor`. The explict inputs of the constructor should not include `this` - that parameter will be automaticaly provided.
+    pub fn ctor(&self, explict_inputs: &[Type], asm: &mut Assembly) -> Interned<MethodRef> {
+        let fn_name = asm.alloc_string(".ctor");
+        self.instance_method_ref(
+            explict_inputs,
+            Type::Void,
+            fn_name,
+            asm,
+            super::cilnode::MethodKind::Constructor,
+            false,
+        )
+    }
+    /// Returns a reference to an instance method of this class, with a given name. The explict inputs of the method should not include `this` - that parameter will be automaticaly provided.
+    pub fn instance(
+        &self,
+        explict_inputs: &[Type],
+        output: Type,
+        fn_name: Interned<IString>,
+        asm: &mut Assembly,
+    ) -> Interned<MethodRef> {
+        self.instance_method_ref(
+            explict_inputs,
+            output,
+            fn_name,
+            asm,
+            super::cilnode::MethodKind::Instance,
+            true,
+        )
+    }
+    /// Returns a reference to an virtual method of this class, with a given name. The explict inputs of the method should not include `this` - that parameter will be automaticaly provided.
+    pub fn virtual_mref(
+        &self,
+        explict_inputs: &[Type],
+        output: Type,
+        fn_name: Interned<IString>,
+        asm: &mut Assembly,
+    ) -> Interned<MethodRef> {
+        self.instance_method_ref(
+            explict_inputs,
+            output,
+            fn_name,
+            asm,
+            super::cilnode::MethodKind::Virtual,
+            false,
+        )
+    }
+    /// Returns a reference to an static method of this class, with a given name.
+    pub fn static_mref(
+        &self,
+        inputs: &[Type],
+        output: Type,
+        fn_name: Interned<IString>,
+        asm: &mut Assembly,
+    ) -> Interned<MethodRef> {
+        self.static_method_ref(inputs, output, fn_name, asm, [].into())
+    }
+    /// Returns a reference to an static method of this class, with a given name.
+    pub fn static_mref_generic(
+        &self,
+        inputs: &[Type],
+        output: Type,
+        fn_name: Interned<IString>,
+        asm: &mut Assembly,
+        generics: Box<[Type]>,
+    ) -> Interned<MethodRef> {
+        self.static_method_ref(inputs, output, fn_name, asm, generics)
     }
     // Returns a `System.Collections.Concurrent.ConcurrentDictionary` of key,value
     // NOTE: kept hand-written (not folded into the `bcl_class!` table) because its
@@ -296,6 +307,8 @@ crate::bcl_class! {
         /// Returns a reference to the class `System.MathF`
         #[must_use]
         mathf => "System.MathF", class;
+        /// Returns a reference to the .NET bit-preserving floating-point conversion helpers.
+        bit_converter => "System.BitConverter", class;
         /// Returns a reference to the `System.UInt128` type.
         uint_128 => "System.UInt128", value;
         /// Returns a reference to the `System.Int128` type.
@@ -501,6 +514,16 @@ crate::bcl_class! {
         /// Unix-host and Windows-host CoreCLR. A reference type, in `System.Runtime`.
         #[must_use]
         file_not_found_exception => "System.IO.FileNotFoundException", class;
+        /// Returns a reference to `System.ArgumentException` — thrown by BCL APIs when a
+        /// path or other argument is structurally invalid (including an interior NUL in
+        /// `System.IO` paths). The POSIX shim maps it to `EINVAL` so Rust's
+        /// `io::ErrorKind::InvalidInput` remains faithful.
+        #[must_use]
+        argument_exception => "System.ArgumentException", class;
+        /// Returns a reference to `System.ArgumentOutOfRangeException`, a more specific
+        /// `ArgumentException` used by some BCL overloads. It shares the `EINVAL` mapping.
+        #[must_use]
+        argument_out_of_range_exception => "System.ArgumentOutOfRangeException", class;
         /// Returns a reference to `System.IO.DirectoryNotFoundException` — thrown by
         /// the BCL when a directory in a path does not exist. Maps to `ENOENT`.
         /// HOST-AGNOSTIC. A reference type, in `System.Runtime`.
@@ -709,7 +732,7 @@ impl FixedArrayLayout {
 
     #[must_use]
     pub fn semantic_element_stride(&self) -> Option<u64> {
-        (self.length != 0 && self.semantic_size % self.length == 0)
+        (self.length != 0 && self.semantic_size.is_multiple_of(self.length))
             .then_some(self.semantic_size / self.length)
     }
 }
@@ -1784,7 +1807,6 @@ impl ClassDef {
         }
     }
 
-    #[must_use]
     pub fn field_custom_attributes(
         &self,
         name: Interned<IString>,
@@ -2122,10 +2144,6 @@ impl ClassDef {
     pub fn has_nonveralpping_layout(&self) -> bool {
         self.has_nonveralpping_layout
     }
-    /*
-    /// Optimizes this class definition, consuming fuel
-    pub fn opt(&mut self, fuel: &mut OptFuel, asm: &mut Assembly, cache: &mut EffectInfoCache) {
-    } */
 }
 #[test]
 fn static_field_default_value_participates_in_equality_and_hash() {

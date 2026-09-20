@@ -34,25 +34,31 @@ fn dotnet_vec_cast(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Int;
-
-    #[test]
-    fn signedness_only_vector_cast_is_an_explicit_reinterpret() {
-        let mut asm = Assembly::default();
-        let src_ty = SIMDVector::new(Int::U8.into(), 16);
-        let dst_ty = SIMDVector::new(Int::I8.into(), 16);
-        let src = asm.alloc_node(CILNode::LdArg(0));
-
-        let cast = dotnet_vec_cast(src, src_ty, dst_ty, &mut asm);
-        let CILNode::Call(call) = &asm[cast] else {
-            panic!("SIMD signedness reinterpret did not use the typed transmute helper");
-        };
-        let sig = asm[asm[call.0].sig()].clone();
-        assert_eq!(*sig.output(), Type::SIMDVector(dst_ty));
-        assert_eq!(sig.inputs(), &[Type::SIMDVector(src_ty)]);
+fn managed_unary_body(vec_type: SIMDVector, method: &str, asm: &mut Assembly) -> MethodImpl {
+    let elem: Type = vec_type.elem().into();
+    let extension_class = vec_type.extension_class(asm);
+    let extension_class = asm[extension_class].clone();
+    let method = asm.alloc_string(method);
+    let generic_class = vec_type.class(asm);
+    let mut generic_class = asm[generic_class].clone();
+    generic_class.set_generics(vec![Type::PlatformGeneric(
+        0,
+        crate::tpe::GenericKind::CallGeneric,
+    )]);
+    let generic_class = asm.alloc_class_ref(generic_class);
+    let method = extension_class.static_mref_generic(
+        &[Type::ClassRef(generic_class)],
+        Type::ClassRef(generic_class),
+        method,
+        asm,
+        [elem].into(),
+    );
+    let val = asm.alloc_node(CILNode::LdArg(0));
+    let res = asm.alloc_node(CILNode::call(method, [val]));
+    let ret = asm.alloc_root(CILRoot::Ret(res));
+    MethodImpl::MethodBody {
+        blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+        locals: vec![],
     }
 }
 
@@ -65,32 +71,16 @@ fn simd_ones_compliment(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) 
             // Array fallback (unsupported vector size): per-lane bitwise NOT.
             return binop::lane_unop_body(mref, asm, &|asm, x, _, _| asm.not(x));
         };
-        let elem: Type = vec_type.elem().into();
-        let extension_class = vec_type.extension_class(asm);
-        let extension_class = asm[extension_class].clone();
-        let ones_compliment = asm.alloc_string("OnesComplement");
-        // Generic vec
-        let generic_class = vec_type.class(asm);
-        let mut generic_class = asm[generic_class].clone();
-        generic_class.set_generics(vec![Type::PlatformGeneric(
-            0,
-            crate::tpe::GenericKind::CallGeneric,
-        )]);
-        let generic_class = asm.alloc_class_ref(generic_class);
-        let ones_compliment = extension_class.static_mref_generic(
-            &[Type::ClassRef(generic_class)],
-            Type::ClassRef(generic_class),
-            ones_compliment,
-            asm,
-            [elem].into(),
-        );
-        let val = asm.alloc_node(CILNode::LdArg(0));
-        let res = asm.alloc_node(CILNode::call(ones_compliment, [val]));
-        let ret = asm.alloc_root(CILRoot::Ret(res));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
+        // CoreCLR currently rejects the generic `VectorN<Half>` bitwise surface.  Keep the
+        // operation available for callers that reach it by using the same lane representation as
+        // the unsupported-width fallback.
+        if matches!(
+            vec_type.elem(),
+            crate::tpe::simd::SIMDElem::Float(crate::Float::F16)
+        ) {
+            return binop::lane_unop_body(mref, asm, &|asm, x, _, _| asm.not(x));
         }
+        managed_unary_body(*vec_type, "OnesComplement", asm)
     };
     patcher.insert(name, Box::new(generator));
 }
@@ -102,40 +92,25 @@ fn simd_neg(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
 
         let Some(vec_type) = sig.inputs()[0].as_simdvector() else {
             // Array fallback (unsupported vector size): negate per lane.
-            return binop::lane_unop_body(mref, asm, &|asm, x, _, _| asm.neg(x));
+            return binop::lane_unop_body(mref, asm, &|asm, x, elem, _| match elem {
+                crate::tpe::simd::SIMDElem::Float(crate::Float::F16) => {
+                    binop::half_unop(asm, x, "op_UnaryNegation", Type::Float(crate::Float::F16))
+                }
+                _ => asm.neg(x),
+            });
         };
         // IL `neg` (sign-flip) preserves the sign of zero/NaN, matching Rust `-x`; the BCL
         // `Vector{bits}.Negate` computes `0 - x`, which turns `+0.0` into `+0.0` instead of `-0.0`.
         // Negate FLOAT lanes per-lane (correct signed zero); ints keep the hardware `Negate`.
         if matches!(vec_type.elem(), crate::tpe::simd::SIMDElem::Float(_)) {
-            return binop::lane_unop_body(mref, asm, &|asm, x, _, _| asm.neg(x));
+            return binop::lane_unop_body(mref, asm, &|asm, x, elem, _| match elem {
+                crate::tpe::simd::SIMDElem::Float(crate::Float::F16) => {
+                    binop::half_unop(asm, x, "op_UnaryNegation", Type::Float(crate::Float::F16))
+                }
+                _ => asm.neg(x),
+            });
         }
-        let elem: Type = vec_type.elem().into();
-        let extension_class = vec_type.extension_class(asm);
-        let extension_class = asm[extension_class].clone();
-        let ones_compliment = asm.alloc_string("Negate");
-        // Generic vec
-        let generic_class = vec_type.class(asm);
-        let mut generic_class = asm[generic_class].clone();
-        generic_class.set_generics(vec![Type::PlatformGeneric(
-            0,
-            crate::tpe::GenericKind::CallGeneric,
-        )]);
-        let generic_class = asm.alloc_class_ref(generic_class);
-        let ones_compliment = extension_class.static_mref_generic(
-            &[Type::ClassRef(generic_class)],
-            Type::ClassRef(generic_class),
-            ones_compliment,
-            asm,
-            [elem].into(),
-        );
-        let val = asm.alloc_node(CILNode::LdArg(0));
-        let res = asm.alloc_node(CILNode::call(ones_compliment, [val]));
-        let ret = asm.alloc_root(CILRoot::Ret(res));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
-        }
+        managed_unary_body(*vec_type, "Negate", asm)
     };
     patcher.insert(name, Box::new(generator));
 }
@@ -159,32 +134,19 @@ fn simd_abs(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
                 crate::tpe::simd::SIMDElem::Float(f) => f.math1(x, asm, "Abs"),
             });
         };
-        let elem: Type = vec_type.elem().into();
-        let extension_class = vec_type.extension_class(asm);
-        let extension_class = asm[extension_class].clone();
-        let ones_compliment = asm.alloc_string("Abs");
-        // Generic vec
-        let generic_class = vec_type.class(asm);
-        let mut generic_class = asm[generic_class].clone();
-        generic_class.set_generics(vec![Type::PlatformGeneric(
-            0,
-            crate::tpe::GenericKind::CallGeneric,
-        )]);
-        let generic_class = asm.alloc_class_ref(generic_class);
-        let ones_compliment = extension_class.static_mref_generic(
-            &[Type::ClassRef(generic_class)],
-            Type::ClassRef(generic_class),
-            ones_compliment,
-            asm,
-            [elem].into(),
-        );
-        let val = asm.alloc_node(CILNode::LdArg(0));
-        let res = asm.alloc_node(CILNode::call(ones_compliment, [val]));
-        let ret = asm.alloc_root(CILRoot::Ret(res));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
+        // Unlike f32/f64, `VectorN<Half>.Abs` throws `NotSupportedException` on the supported
+        // CoreCLR runtime.  The scalar BCL method is available, so lower only the f16 vector lane
+        // by lane and keep the vector fast path for other element types.
+        if matches!(
+            vec_type.elem(),
+            crate::tpe::simd::SIMDElem::Float(crate::Float::F16)
+        ) {
+            return binop::lane_unop_body(mref, asm, &|asm, x, elem, _| match elem {
+                crate::tpe::simd::SIMDElem::Float(f) => f.math1(x, asm, "Abs"),
+                _ => unreachable!("f16 SIMD abs fallback received a non-float lane"),
+            });
         }
+        managed_unary_body(*vec_type, "Abs", asm)
     };
     patcher.insert(name, Box::new(generator));
 }
@@ -198,6 +160,15 @@ fn simd_vec_from_val(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
             // Array fallback (unsupported vector size): splat the scalar into every lane.
             return binop::lane_splat_body(mref, asm);
         };
+        // `VectorN<Half>.Create` is also unsupported by the current CoreCLR implementation.  A
+        // managed vector has the same contiguous lane layout as the fixed-array fallback, so the
+        // scalar splat body is a valid representation-preserving implementation.
+        if matches!(
+            vec_type.elem(),
+            crate::tpe::simd::SIMDElem::Float(crate::Float::F16)
+        ) {
+            return binop::lane_splat_body(mref, asm);
+        }
         let extension_class = vec_type.extension_class(asm);
         let extension_class = asm[extension_class].clone();
         let create = asm.alloc_string("Create");
@@ -289,4 +260,26 @@ pub fn simd(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     simd_mul(asm, patcher);
     // Per-lane value ops with no BCL-static equivalent here (xor/shl/shr/div/cast).
     binop::register_value_lane_ops(asm, patcher);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Int;
+
+    #[test]
+    fn signedness_only_vector_cast_is_an_explicit_reinterpret() {
+        let mut asm = Assembly::default();
+        let src_ty = SIMDVector::new(Int::U8.into(), 16);
+        let dst_ty = SIMDVector::new(Int::I8.into(), 16);
+        let src = asm.alloc_node(CILNode::LdArg(0));
+
+        let cast = dotnet_vec_cast(src, src_ty, dst_ty, &mut asm);
+        let CILNode::Call(call) = &asm[cast] else {
+            panic!("SIMD signedness reinterpret did not use the typed transmute helper");
+        };
+        let sig = asm[asm[call.0].sig()].clone();
+        assert_eq!(*sig.output(), Type::SIMDVector(dst_ty));
+        assert_eq!(sig.inputs(), &[Type::SIMDVector(src_ty)]);
+    }
 }

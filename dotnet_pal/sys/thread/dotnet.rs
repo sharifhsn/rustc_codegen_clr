@@ -88,6 +88,11 @@ impl Thread {
             // handed back to us once, on the new thread.
             let init = unsafe { Box::from_raw(arg as *mut ThreadInit) };
             init.init_dotnet();
+            // `ThreadLocal<T>` has no managed thread-exit callback. Run the
+            // Rust-side key list before returning to `System.Threading.Thread`
+            // so `Join` observes the same destructor-before-completion ordering
+            // as native Rust.
+            crate::sys::thread_local::run_dtors();
             ptr::null_mut()
         }
 

@@ -144,21 +144,19 @@ impl MethodRef {
     /// Returns the inputs of this methods, excluding this for constructors.
     pub fn stack_inputs<'s, 'asm: 's>(&'s self, asm: &'asm Assembly) -> &'s [Type] {
         let sig = &asm[self.sig];
-        match self.kind() {
-            MethodKind::Static => sig.inputs(),
-            MethodKind::Instance => sig.inputs(),
-            MethodKind::Virtual => sig.inputs(),
-            MethodKind::Constructor => &sig.inputs()[1..],
+        if matches!(self.kind(), MethodKind::Constructor) {
+            &sig.inputs()[1..]
+        } else {
+            sig.inputs()
         }
     }
     /// Returns the output of this method.
     pub fn output(&self, asm: &Assembly) -> Type {
         let sig = &asm[self.sig];
-        match self.kind() {
-            MethodKind::Static => *sig.output(),
-            MethodKind::Instance => *sig.output(),
-            MethodKind::Virtual => *sig.output(),
-            MethodKind::Constructor => Type::ClassRef(self.class()),
+        if matches!(self.kind(), MethodKind::Constructor) {
+            Type::ClassRef(self.class())
+        } else {
+            *sig.output()
         }
     }
 
@@ -406,12 +404,43 @@ impl MethodDef {
                     .flat_map(super::basic_block::BasicBlock::iter_roots)
                     .flat_map(|root| super::CILIter::new(asm.get_root(root).clone(), asm)),
             )),
-            MethodImpl::Extern { .. } => None,
+            MethodImpl::Extern { .. } | MethodImpl::Missing => None,
             MethodImpl::AliasFor(_) => {
                 panic!("Unresolved alias returned by MethodDef::resolved_implementation")
             }
-            MethodImpl::Missing => None,
         }
+    }
+
+    /// Returns whether this method contains a BCL bit-preserving float reinterpretation. CoreCLR
+    /// may canonicalize a signaling NaN when an optimized method carries the resulting `float32`
+    /// or `float64` through a local, even though `System.BitConverter` itself is bit-preserving.
+    /// The PE exporter marks such methods `NoOptimization|NoInlining` so Rust's
+    /// `from_bits`/`to_bits` contract survives the managed boundary. This is deliberately scoped
+    /// to methods that actually use the BCL helpers; ordinary floating-point code keeps normal JIT
+    /// optimization.
+    #[must_use]
+    pub fn uses_bit_preserving_float_reinterpretation(&self, asm: &Assembly) -> bool {
+        let Some(mut nodes) = self.iter_cil(asm) else {
+            return false;
+        };
+        nodes.any(|element| {
+            let CILIterElem::Node(CILNode::Call(call)) = element else {
+                return false;
+            };
+            let (method, _, _) = call.as_ref();
+            let method = &asm[*method];
+            let class = &asm[method.class()];
+            let class_name = &asm[class.name()];
+            let method_name = &asm[method.name()];
+            class_name == "System.BitConverter"
+                && matches!(
+                    method_name.as_ref(),
+                    "Int32BitsToSingle"
+                        | "SingleToInt32Bits"
+                        | "Int64BitsToDouble"
+                        | "DoubleToInt64Bits"
+                )
+        })
     }
     #[must_use]
     pub fn ref_to(&self) -> MethodRef {
@@ -1327,8 +1356,7 @@ impl MethodImpl {
                 .chain(cleanup_blocks)
                 .map(|block| block.iter_roots().count())
                 .sum(),
-            MethodImpl::Extern { .. } => 0,
-            MethodImpl::AliasFor(_) => 0,
+            MethodImpl::Extern { .. } | MethodImpl::AliasFor(_) => 0,
             MethodImpl::Missing => 3,
         }
     }
@@ -1684,6 +1712,12 @@ impl MethodImpl {
         let Some((blocks, mut cleanup_blocks, locals)) = self.body_parts_mut() else {
             return;
         };
+        // A valid body cannot reference a local when its signature declares none. Avoid walking
+        // and re-interning every CIL tree for the overwhelmingly common no-locals case; malformed
+        // references remain the fatal verifier's responsibility.
+        if locals.is_empty() {
+            return;
+        }
         // `BasicBlock::map_roots` accepts separate root/node closures even though traversal is
         // strictly local and single-threaded. Keep their shared state in one explicit local owner;
         // `RefCell` supplies only the closure-aliasing needed by that API, without a synchronization
@@ -1743,7 +1777,6 @@ impl MethodImpl {
 
         for block in blocks.iter_mut().chain(
             cleanup_blocks
-                .as_deref_mut()
                 .into_iter()
                 .flat_map(|blocks| blocks.iter_mut()),
         ) {

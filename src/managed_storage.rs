@@ -16,7 +16,7 @@ use crate::{
 };
 use rustc_abi::ExternAbi;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_hir::{LangItem, def::DefKind};
+use rustc_hir::{attrs::lang_items::LangItem, def::DefKind};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::{
     mir::{
@@ -105,7 +105,6 @@ fn native_storage_capability_argument_is_region_free<'tcx>(
     seen: &mut FxHashSet<Ty<'tcx>>,
 ) -> bool {
     match ty.kind() {
-        TyKind::Ref(..) | TyKind::Dynamic(..) => false,
         TyKind::Adt(..) => native_storage_capability_shape_is_exact(ty, ctx, seen),
         TyKind::Array(element, _)
         | TyKind::Slice(element)
@@ -119,7 +118,9 @@ fn native_storage_capability_argument_is_region_free<'tcx>(
         // The real capability implementations use concrete ADTs, primitives, and const identity
         // arguments. Unresolved/bound/function shapes are not needed by the public contract, so
         // refusing them is the sound fail-closed boundary.
-        TyKind::Alias(..)
+        TyKind::Ref(..)
+        | TyKind::Dynamic(..)
+        | TyKind::Alias(..)
         | TyKind::Param(..)
         | TyKind::Bound(..)
         | TyKind::Placeholder(..)
@@ -204,13 +205,10 @@ fn direct_managed_kind<'tcx>(
             ManagedStorageKind::NakedReference
         }
         INTEROP_BYREF_TPE_NAME => ManagedStorageKind::ManagedByRef,
-        INTEROP_STRUCT_TPE_NAME | INTEROP_GENERIC_STRUCT_TPE_NAME => {
-            ManagedStorageKind::OpaqueManagedValue
-        }
-        // These are signature-only markers, never runtime storage.
-        INTEROP_TYPE_GENERIC_TPE_NAME | INTEROP_METHOD_GENERIC_TPE_NAME => {
-            ManagedStorageKind::OpaqueManagedValue
-        }
+        INTEROP_STRUCT_TPE_NAME
+        | INTEROP_GENERIC_STRUCT_TPE_NAME
+        | INTEROP_TYPE_GENERIC_TPE_NAME
+        | INTEROP_METHOD_GENERIC_TPE_NAME => ManagedStorageKind::OpaqueManagedValue,
         _ => return None,
     };
     Some(DirectManagedKind::Unsafe(kind))
@@ -756,10 +754,18 @@ fn transient_rust_call_tuple_locals<'tcx>(
             statement_index: data.statements.len(),
         };
         place_uses.visit_terminator(terminator, location);
-        let (function, args) = match &terminator.kind {
-            TerminatorKind::Call { func, args, .. }
-            | TerminatorKind::TailCall { func, args, .. } => (func, args),
-            _ => continue,
+        let (TerminatorKind::Call {
+            func: function,
+            args,
+            ..
+        }
+        | TerminatorKind::TailCall {
+            func: function,
+            args,
+            ..
+        }) = &terminator.kind
+        else {
+            continue;
         };
         let function_ty = ctx.monomorphize(function.ty(body, ctx.tcx()));
         if !matches!(function_ty.kind(), TyKind::FnDef(..) | TyKind::FnPtr(..))
@@ -1039,10 +1045,18 @@ pub fn validate_body<'tcx>(
         let Some(terminator) = &block.terminator else {
             continue;
         };
-        let (function, call_args) = match &terminator.kind {
-            TerminatorKind::Call { func, args, .. }
-            | TerminatorKind::TailCall { func, args, .. } => (func, args),
-            _ => continue,
+        let (TerminatorKind::Call {
+            func: function,
+            args: call_args,
+            ..
+        }
+        | TerminatorKind::TailCall {
+            func: function,
+            args: call_args,
+            ..
+        }) = &terminator.kind
+        else {
+            continue;
         };
         let fn_ty = ctx.monomorphize(function.ty(body, ctx.tcx()));
         let signature = match fn_ty.kind() {
@@ -1081,7 +1095,9 @@ pub fn validate_body<'tcx>(
         let TyKind::FnDef(def_id, args) = fn_ty.kind() else {
             continue;
         };
-        let args = ctx.monomorphize(*args);
+        let args = args
+            .no_bound_vars()
+            .expect("managed_reference_storage: function definition had bound generic arguments");
         let Some(instance) = Instance::try_resolve(
             ctx.tcx(),
             rustc_middle::ty::TypingEnv::fully_monomorphized(),

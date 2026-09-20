@@ -395,7 +395,6 @@ impl PdbBuilder {
             &strings,
             &blobs,
             &guids,
-            &user_strings,
             document_rows.len(),
             method_def_row_count,
             local_variable_rows.len(),
@@ -442,11 +441,11 @@ impl PdbBuilder {
 fn dedupe_same_offset_points(points: Vec<SequencePoint>) -> Vec<SequencePoint> {
     let mut out: Vec<SequencePoint> = Vec::with_capacity(points.len());
     for point in points {
-        if let Some(last) = out.last_mut() {
-            if last.il_offset == point.il_offset {
-                *last = point;
-                continue;
-            }
+        if let Some(last) = out.last_mut()
+            && last.il_offset == point.il_offset
+        {
+            *last = point;
+            continue;
         }
         out.push(point);
     }
@@ -562,7 +561,6 @@ impl PdbWidths {
         strings: &StringsHeap,
         blobs: &BlobHeap,
         guids: &GuidHeap,
-        user_strings: &UserStringHeap,
         document_rows: usize,
         method_def_row_count: u32,
         local_variable_rows: usize,
@@ -579,7 +577,6 @@ impl PdbWidths {
         if blobs.as_bytes().len() > 0xFFFF {
             heap_sizes |= 0x4;
         }
-        let _us_wide = user_strings.as_bytes().len() > 0xFFFF;
         Self {
             heap_sizes,
             blob_wide: blobs.as_bytes().len() > 0xFFFF,
@@ -1036,7 +1033,7 @@ fn serialize_standalone_pdb(
     const VERSION: &str = "v4.0.30319";
     let mut version_bytes = VERSION.as_bytes().to_vec();
     version_bytes.push(0);
-    while version_bytes.len() % 4 != 0 {
+    while !version_bytes.len().is_multiple_of(4) {
         version_bytes.push(0);
     }
     out.extend_from_slice(&(version_bytes.len() as u32).to_le_bytes());
@@ -1084,7 +1081,7 @@ fn serialize_standalone_pdb(
 
 fn pad4(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
     out
@@ -1423,7 +1420,7 @@ mod tests {
                     .unwrap()
                     .to_string();
                 let mut name_len = name_end - name_start + 1;
-                while name_len % 4 != 0 {
+                while !name_len.is_multiple_of(4) {
                     name_len += 1;
                 }
                 cursor = name_start + name_len;

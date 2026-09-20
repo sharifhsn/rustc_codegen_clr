@@ -17,7 +17,7 @@
 #   dev.sh sh '<bash>'           Run bash in the container (repo at /work, color off, no cwd-drift).
 #   dev.sh backend               Force clean-rebuild of cilly + linker + backend (defeat mtime skew).
 #   dev.sh run <crate> [--clean] Build (forced relink) + run cargo_tests/<crate>; prints stdout+exit.
-#                                --clean does a full `cargo clean` first (rebuilds std; bulletproof).
+#                                --clean does a full `cargo clean` first (rebuilds std).
 #   dev.sh buildstd [--clean]    Shorthand for `run build_std`.
 #   dev.sh il <crate> <symbol>   Disassemble method(s) whose (mangled) name contains <symbol> from
 #                                the crate's built .dll (ikdasm). e.g. `il build_std rust_alloc`.
@@ -88,7 +88,7 @@ TT=x86_64-unknown-linux-gnu
 out="target/$TT/release/$DEV_CRATE"
 start=$(date +%s)
 if [ "$DEV_CLEAN" = 1 ]; then
-  echo "==> cargo clean (full, bulletproof)"; cargo clean
+  echo "==> cargo clean"; cargo clean
 else
   # Force a relink despite mtime skew: future-date the sources (always newer than any cached
   # artifact) and drop the stale outputs, so cargo recompiles main + re-invokes the linker.

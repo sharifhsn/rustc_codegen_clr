@@ -108,7 +108,12 @@ pub fn size_of_val<'tcx>(
                 };
                 return place_set(destination, value_calc, ctx);
             }
-            // `dyn Trait`: the metadata is the vtable pointer; size lives in vtable slot 1.
+            // `dyn Trait`: the metadata is the vtable pointer; the dynamic tail's size lives in
+            // vtable slot 1.  A DST-tailed struct (for example `RcInner<dyn Trait>` or
+            // `ArcInner<dyn Trait>`) also has a statically-sized prefix, which must be included
+            // before rounding to the dynamic tail alignment.  Reading only the vtable size makes
+            // `Layout::for_value_raw` under-report the allocation by the prefix (the alloc
+            // `Rc::from(Box<dyn Trait>)` and `Arc::from(Box<dyn Trait>)` checks catch this).
             _ => {
                 let fat_tpe = ctx.type_from_cache(ptr_ty).as_class_ref().unwrap();
 
@@ -124,7 +129,36 @@ pub fn size_of_val<'tcx>(
                 let size = ctx.size_of(Int::ISize);
                 let size = ctx.int_cast(size, Int::USize, ExtendKind::ZeroExtend);
                 let ptr = ctx.biop(meta, size, BinOp::Add);
-                let value_calc = ctx.load(ptr, Type::Int(Int::USize));
+                let value_size = ctx.load(ptr, Type::Int(Int::USize));
+                let prefix = ctx.layout_of(pointed_ty).layout.size().bytes();
+                if prefix == 0 {
+                    return place_set(destination, value_size, ctx);
+                }
+
+                // `Layout::extend` rounds the combined size up to the tail alignment.  The
+                // vtable's alignment slot is the correct dynamic alignment for that operation.
+                let two = ctx.alloc_node(2_i32);
+                let align_offset = ctx.biop(size, two, BinOp::Mul);
+                let align_addr = ctx.biop(meta, align_offset, BinOp::Add);
+                let align_ptr = ctx.cast_ptr(align_addr, Type::Int(Int::USize));
+                let dynamic_align = ctx.load(align_ptr, Type::Int(Int::USize));
+                let static_align = ctx.layout_of(pointed_ty).layout.align().abi.bytes();
+                let static_align_node = ctx.alloc_node(Const::USize(static_align));
+                let dynamic_is_larger = ctx.biop(dynamic_align, static_align_node, BinOp::GtUn);
+                let align = ctx.select(
+                    Type::Int(Int::USize),
+                    dynamic_align,
+                    static_align_node,
+                    dynamic_is_larger,
+                );
+                let prefix = ctx.alloc_node(Const::USize(prefix));
+                let total = ctx.biop(value_size, prefix, BinOp::Add);
+                let one = ctx.alloc_node(Const::USize(1));
+                let align_m1 = ctx.biop(align, one, BinOp::Sub);
+                let rounded = ctx.biop(total, align_m1, BinOp::Add);
+                let all_ones = ctx.alloc_node(Const::USize(!0));
+                let mask = ctx.biop(align_m1, all_ones, BinOp::XOr);
+                let value_calc = ctx.biop(rounded, mask, BinOp::And);
                 return place_set(destination, value_calc, ctx);
             }
         }
@@ -192,7 +226,20 @@ pub fn align_of_val<'tcx>(
         let offset = ctx.int_cast(offset, Int::USize, ExtendKind::ZeroExtend);
         let sum = ctx.biop(vtable, offset, BinOp::Add);
         let align_ptr = ctx.cast_ptr(sum, Type::Int(Int::USize));
-        let value_calc: Node = ctx.load(align_ptr, Type::Int(Int::USize));
+        let dynamic_align: Node = ctx.load(align_ptr, Type::Int(Int::USize));
+        // A DST-tailed struct's alignment is the maximum of its statically-sized prefix and
+        // the dynamic tail.  Bare `dyn Trait` has a zero-sized prefix, while `RcInner<dyn Trait>`
+        // and `ArcInner<dyn Trait>` have an 8-byte atomic-count prefix; returning only the vtable
+        // slot under-reports the latter and makes `Layout::for_value_raw` reject the allocation.
+        let static_align = crate::r#type::align_of(pointed_ty, ctx.tcx());
+        let static_align_node = ctx.alloc_node(Const::USize(static_align));
+        let dynamic_is_larger = ctx.biop(dynamic_align, static_align_node, BinOp::GtUn);
+        let value_calc = ctx.select(
+            Type::Int(Int::USize),
+            dynamic_align,
+            static_align_node,
+            dynamic_is_larger,
+        );
         return place_set(destination, value_calc, ctx);
     }
     let align = crate::r#type::align_of(pointed_ty, ctx.tcx());

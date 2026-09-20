@@ -21,6 +21,7 @@
 //! * `rcl_dotnet_fs_flush(handle)`
 //! * `rcl_dotnet_fs_close(handle)`
 //! * `rcl_dotnet_fs_len(handle) -> i64`
+//! * `rcl_dotnet_fs_copy(from_ptr, from_len, to_ptr, to_len) -> i64`
 //! * `rcl_dotnet_fs_stat(path_ptr, path_len, out_size, out_is_dir) -> i32`
 //! * `rcl_dotnet_fs_exists(path_ptr, path_len) -> i32`
 //! * `rcl_dotnet_fs_mkdir(path_ptr, path_len) -> i32`
@@ -36,8 +37,9 @@
 //! REAL (BCL-backed): `open`, `read`, `write`, `seek`, `flush`, `close`, file
 //! length (`size`/`tell`), `stat`/`lstat`/`metadata`, `exists`, `mkdir`
 //! (`create_dir`), `rmdir`, `unlink` (`remove_file`), `rename`, `readdir`
-//! (`read_dir`). `copy` and `remove_dir_all` are delegated to the shared
-//! `common` arm (they compose the primitives above).
+//! (`read_dir`). `copy` uses the BCL's native `File.Copy` primitive so Unix
+//! executable bits survive a copy; `remove_dir_all` is delegated to the shared
+//! `common` arm (it composes the primitives above).
 //!
 //! STUBBED to `Err(Unsupported)` (cfg-gated os=dotnet-only; none are exercised
 //! by the Phase-4 probe, and being os=dotnet-only they cannot affect the
@@ -83,27 +85,37 @@ use crate::sys::FromInner;
 
 // `Dir` lives in the shared `common` arm; `remove_dir_all` is delegated there too (it composes
 // `read_dir` / `remove_file` / `remove_dir`, all real on this arm). `copy` is NOT taken from
-// `common`: `common::copy` finishes with `writer.set_permissions(from's mode)`, and .NET has no
-// Unix permission model so `File::set_permissions` is `Unsupported` — that made `fs::copy` fail at
-// the very end after the bytes were already written. A dedicated `copy` below copies the bytes and
-// skips the permission propagation (correct for managed files). `exists` is also NOT taken from
-// `common` (its `metadata`-then-NotFound path would route through the io-error `Uncategorized` trap).
+// `common`: `common::copy` streams bytes and then asks `File::set_permissions` to reproduce the
+// source mode. The dotnet PAL can preserve the mode more faithfully by using the BCL's native
+// `File.Copy`, which also keeps executable apphosts launchable on Unix. `exists` is also NOT taken
+// from `common` (its `metadata`-then-NotFound path would route through the io-error
+// `Uncategorized` trap).
 pub use crate::sys::fs::common::{remove_dir_all, Dir};
 
-/// `std::fs::copy` for the .NET arm: copy the file's bytes, but DON'T propagate the source's Unix
-/// mode (managed files have no such model — `File::set_permissions` is `Unsupported`). Mirrors
-/// `sys::fs::common::copy` minus the final `set_permissions`.
+/// `std::fs::copy` for the .NET arm, backed by `System.IO.File.Copy`.
+///
+/// Unlike a Rust-side stream copy, the BCL primitive preserves the source's Unix
+/// mode on Unix hosts. That matters for copied apphosts: `Process.Start` must
+/// see the destination's execute bit rather than an ordinary `0644` data file.
 pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
-    use crate::fs;
-    let mut reader = fs::File::open(from)?;
-    if !reader.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the source path is not an existing regular file",
-        ));
+    reject_nul(from)?;
+    reject_nul(to)?;
+    let from_bytes = path_bytes(from);
+    let to_bytes = path_bytes(to);
+    // SAFETY: both `(ptr, len)` pairs describe readable UTF-8 regions. The BCL
+    // hook catches managed failures, maps them to `errno`, and returns -1.
+    let size = unsafe {
+        rcl_dotnet_fs_copy(
+            from_bytes.as_ptr(),
+            from_bytes.len(),
+            to_bytes.as_ptr(),
+            to_bytes.len(),
+        )
+    };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
     }
-    let mut writer = fs::File::create(to)?;
-    io::copy(&mut reader, &mut writer)
+    Ok(size as u64)
 }
 
 // ===========================================================================
@@ -123,10 +135,13 @@ pub fn copy(from: &Path, to: &Path) -> io::Result<u64> {
 /// `(ptr,len)` decoded BCL-side), so this is the verbatim copy of the upstream
 /// free fallback body (`sys/fs/mod.rs:55-58`).
 ///
-/// **LEAKY (L6):** interior-NUL paths are not rejected at the std boundary; they
-/// surface as a `System.IO` exception rather than `ErrorKind::InvalidInput`.
+/// Interior-NUL paths are rejected before they reach the BCL. Rust's `std::fs`
+/// contract reports these as `ErrorKind::InvalidInput`; letting a NUL-bearing
+/// UTF-8 buffer reach `System.IO` would instead be lossy (some BCL probes return
+/// false, others throw `ArgumentException`).
 #[inline]
 pub fn with_native_path<T>(path: &Path, f: &dyn Fn(&Path) -> io::Result<T>) -> io::Result<T> {
+    reject_nul(path)?;
     f(path)
 }
 
@@ -182,6 +197,12 @@ unsafe extern "C" {
     fn rcl_dotnet_fs_flush(handle: *mut u8);
     fn rcl_dotnet_fs_close(handle: *mut u8);
     fn rcl_dotnet_fs_len(handle: *mut u8) -> i64;
+    fn rcl_dotnet_fs_copy(
+        from_ptr: *const u8,
+        from_len: usize,
+        to_ptr: *const u8,
+        to_len: usize,
+    ) -> i64;
     fn rcl_dotnet_fs_set_len(handle: *mut u8, len: i64) -> i32;
     fn rcl_dotnet_fs_stat(
         path_ptr: *const u8,
@@ -272,6 +293,22 @@ fn rc(code: i32) -> io::Result<()> {
 #[inline]
 fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_encoded_bytes()
+}
+
+/// Enforce Rust's path contract at the dotnet PAL boundary.
+///
+/// Unlike Unix's `CString` conversion, the dotnet arm passes `(ptr, len)` UTF-8
+/// buffers to managed APIs. A NUL therefore remains representable unless we
+/// reject it explicitly. Keeping this check in the PAL (and on every two-path
+/// operation) also covers BCL methods such as `Exists` that silently translate
+/// invalid paths into a false result instead of throwing.
+#[inline]
+fn reject_nul(path: &Path) -> io::Result<()> {
+    if path_bytes(path).contains(&0) {
+        Err(io::Error::from(io::ErrorKind::InvalidInput))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -537,6 +574,7 @@ unsafe impl Sync for File {}
 
 impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
+        reject_nul(path)?;
         let (mode, access) = opts.to_mode_access()?;
         let bytes = path_bytes(path);
         // SAFETY: `(ptr, len)` describes a readable UTF-8 region for the call;
@@ -780,6 +818,7 @@ impl DirBuilder {
     }
 
     pub fn mkdir(&self, p: &Path) -> io::Result<()> {
+        reject_nul(p)?;
         let bytes = path_bytes(p);
         // SAFETY: `(ptr, len)` describes a readable UTF-8 region for the call.
         // NOTE: Directory.CreateDirectory is recursive + idempotent (see the
@@ -891,6 +930,7 @@ impl DirEntry {
 }
 
 pub fn readdir(p: &Path) -> io::Result<ReadDir> {
+    reject_nul(p)?;
     let bytes = path_bytes(p);
     // SAFETY: `(ptr, len)` describes a readable UTF-8 region for the call;
     // returns an opaque non-null handle, or a managed exception unwinds.
@@ -904,12 +944,15 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
 }
 
 pub fn unlink(p: &Path) -> io::Result<()> {
+    reject_nul(p)?;
     let bytes = path_bytes(p);
     // SAFETY: `(ptr, len)` describes a readable UTF-8 region for the call.
     rc(unsafe { rcl_dotnet_fs_unlink(bytes.as_ptr(), bytes.len()) })
 }
 
 pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
+    reject_nul(old)?;
+    reject_nul(new)?;
     let ob = path_bytes(old);
     let nb = path_bytes(new);
     // SAFETY: both `(ptr, len)` pairs describe readable UTF-8 regions.
@@ -917,12 +960,21 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
 }
 
 pub fn set_perm(p: &Path, perm: FilePermissions) -> io::Result<()> {
+    reject_nul(p)?;
     // .NET has no Unix mode; a FilePermissions on this arm carries only the read-only bit, which
     // maps to FileAttributes.ReadOnly. (Other mode bits have no managed equivalent and are ignored.)
     let bytes = path_bytes(p);
     let readonly = if perm.readonly() { 1 } else { 0 };
     // SAFETY: `(ptr, len)` is a readable UTF-8 region the hook reads.
     rc(unsafe { rcl_dotnet_fs_set_readonly(bytes.as_ptr(), bytes.len(), readonly) })
+}
+
+/// The managed BCL has no portable "change permissions without following the final symlink"
+/// operation.  Keep the new std API honest rather than silently following the link as `set_perm`
+/// would; callers receive the same explicit unsupported-platform error as other missing PAL
+/// operations.
+pub fn set_perm_nofollow(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
+    unsupported()
 }
 
 pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> {
@@ -934,12 +986,14 @@ pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
 }
 
 pub fn rmdir(p: &Path) -> io::Result<()> {
+    reject_nul(p)?;
     let bytes = path_bytes(p);
     // SAFETY: `(ptr, len)` describes a readable UTF-8 region for the call.
     rc(unsafe { rcl_dotnet_fs_rmdir(bytes.as_ptr(), bytes.len()) })
 }
 
 pub fn exists(path: &Path) -> io::Result<bool> {
+    reject_nul(path)?;
     let bytes = path_bytes(path);
     // SAFETY: `(ptr, len)` describes a readable UTF-8 region for the call.
     // The hook is bool-valued (1/0), never errno-based, so this cannot surface
@@ -949,6 +1003,7 @@ pub fn exists(path: &Path) -> io::Result<bool> {
 }
 
 pub fn readlink(p: &Path) -> io::Result<PathBuf> {
+    reject_nul(p)?;
     // B2 Piece 4: REAL — File.ResolveLinkTarget(path, returnFinalTarget=false).
     // The hook returns a freshly-allocated NUL-terminated UTF-8 C string (the
     // resolved target's full path), or NULL when `p` is not a symlink / missing.
@@ -968,6 +1023,8 @@ pub fn readlink(p: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
+    reject_nul(original)?;
+    reject_nul(link)?;
     // B2 Piece 4: REAL — File.CreateSymbolicLink(link, original). `original` is
     // the target the link points at; `link` is the new symlink location.
     let target = path_bytes(original);
@@ -982,7 +1039,9 @@ pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
+pub fn link(src: &Path, dst: &Path) -> io::Result<()> {
+    reject_nul(src)?;
+    reject_nul(dst)?;
     // STAYS STUBBED (honest): .NET has NO managed `File.CreateHardLink` in the
     // BCL — only Win32 P/Invoke or libc `link(2)`, neither portable here. Hard
     // links have no clean managed path, so this remains Unsupported (I3).
@@ -990,6 +1049,7 @@ pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> {
 }
 
 pub fn stat(p: &Path) -> io::Result<FileAttr> {
+    reject_nul(p)?;
     let bytes = path_bytes(p);
     let mut size: u64 = 0;
     let mut is_dir: i32 = 0;
@@ -1040,6 +1100,7 @@ pub fn lstat(p: &Path) -> io::Result<FileAttr> {
 }
 
 pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
+    reject_nul(p)?;
     // Path.GetFullPath (absolute + `.`/`..`-normalized) of an existing path. The hook returns NULL
     // when the path does not exist (canonicalize requires existence), else an owned NUL-terminated
     // UTF-8 C string (freed below). Same decode/free pattern as `readlink`.

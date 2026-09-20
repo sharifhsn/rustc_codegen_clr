@@ -135,9 +135,15 @@ pub fn encode_type(
                 let cref = ClassRef::half(asm);
                 encode_class(cref, true, asm, resolver, out);
             }
-            // il_exporter renders `valuetype f128` (a synthetic module-local struct); wiring that
-            // TypeDef up is deferred with the rest of f128 (a .NET-mode wall — C-mode only).
-            Float::F128 => todo!("f128 in a PE signature"),
+            // Rust's f128 is represented by the linker's synthetic 16-byte `f128` valuetype. The
+            // CLR has no native quadruple scalar, but encoding the value as that local struct
+            // keeps signatures and constants structurally valid; arithmetic/casts remain guarded
+            // by the backend's existing soft-float capability checks.
+            Float::F128 => {
+                let name = asm.alloc_string("f128");
+                let cref = asm.alloc_class_ref(ClassRef::new(name, None, true, [].into()));
+                encode_class(cref, true, asm, resolver, out);
+            }
         },
         Type::Ptr(inner) => {
             out.push(ET_PTR);
@@ -457,6 +463,42 @@ mod tests {
             [ET_VALUETYPE, 5],
             "i128 must encode as VALUETYPE System.Int128 via the resolver"
         );
+    }
+
+    #[test]
+    fn f128_lowers_to_the_synthetic_local_valuetype() {
+        let mut asm = Assembly::default();
+        struct RecordingResolver {
+            class_ref: Option<Interned<ClassRef>>,
+        }
+        impl TypeDefOrRefResolver for RecordingResolver {
+            fn type_def_or_ref(&mut self, class_ref: Interned<ClassRef>, _: &mut Assembly) -> u32 {
+                self.class_ref = Some(class_ref);
+                5
+            }
+        }
+
+        let mut resolver = RecordingResolver { class_ref: None };
+        let mut encoded = Vec::new();
+        encode_type(
+            Type::Float(Float::F128),
+            &mut asm,
+            &mut resolver,
+            &mut encoded,
+        );
+        assert_eq!(
+            encoded,
+            [ET_VALUETYPE, 5],
+            "f128 must encode as a valuetype, not as a native CLR float scalar"
+        );
+        let class_ref = resolver
+            .class_ref
+            .expect("f128 encoding must resolve a class reference");
+        let class_ref = asm.class_ref(class_ref);
+        assert_eq!(&asm[class_ref.name()], "f128");
+        assert_eq!(class_ref.asm(), None, "f128 must be module-local");
+        assert!(class_ref.is_valuetype());
+        assert!(class_ref.generics().is_empty());
     }
 
     #[test]

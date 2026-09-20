@@ -62,30 +62,8 @@ pub const DATA_PTR: &str = "d";
 pub const ENUM_TAG: &str = "v";
 #[macro_export]
 macro_rules! config {
-    ($name:ident,bool,$default:expr) => {
-        pub static $name: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::vars()
-                .find_map(|(key, value)| {
-                    if key == stringify!($name) {
-                        Some(value)
-                    } else {
-                        None
-                    }
-                })
-                .map(|value| match value.as_ref() {
-                    "0" | "false" | "False" | "FALSE" => false,
-                    "1" | "true" | "True" | "TRUE" => true,
-                    _ => panic!(
-                        "Boolean enviroment variable {} has invalid value {}",
-                        stringify!($name),
-                        value
-                    ),
-                })
-                .unwrap_or($default)
-        });
-    };
-    ($name:ident,bool,$default:expr,$comment:literal) => {
-        #[doc = $comment]
+    ($name:ident, bool, $default:expr $(, $comment:literal)?) => {
+        $(#[doc = $comment])?
         pub static $name: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::vars()
                 .find_map(|(key, value)| {

@@ -31,7 +31,7 @@ use crate::r#type::utilis::{
     INTEROP_STRUCT_TPE_NAME, INTEROP_TYPE_GENERIC_TPE_NAME, is_zst, resolve_const_size,
 };
 use crate::r#type::utilis::{adt_name, stable_adt_name};
-use crate::r#type::utilis::{garg_to_string, garg_to_usize, ptr_is_fat, tuple_name};
+use crate::r#type::utilis::{garg_to_string, garg_to_usize, ptr_is_fat};
 use cilly::IString;
 use cilly::bimap::Interned;
 use cilly::class::{ClassDefIdx, FixedArrayLayout};
@@ -149,6 +149,24 @@ pub fn tuple_garg_types<'tcx>(
         _ => panic!("expected a tuple of generic arguments, got {ty:?}"),
     }
 }
+
+fn managed_class_ref<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    subst: &[rustc_middle::ty::GenericArg<'tcx>],
+    is_valuetype: bool,
+    generics: Vec<Type>,
+) -> Type {
+    let assembly = garg_to_string(subst[0], ctx.tcx());
+    let assembly = (!assembly.is_empty()).then(|| ctx.alloc_string(assembly));
+    let name = garg_to_string(subst[1], ctx.tcx());
+    let name = ctx.alloc_string(name);
+    Type::ClassRef(ctx.alloc_class_ref(ClassRef::new(
+        name,
+        assembly,
+        is_valuetype,
+        generics.into(),
+    )))
+}
 /// Converts a Rust MIR type to an optimized .NET type representation.
 pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Type {
     let ty = ctx.monomorphize(ty);
@@ -249,24 +267,38 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                 ctx.nptr(inner)
             }
         }
-        // Slice type is almost never refered to directly, and should pop up here ONLY in the case of
-        // a DST.
-        TyKind::Str => Type::Int(Int::U8),
+        // An unsized value receiver (`self: [T]`/`self: str`) appears directly in rustc's FnAbi,
+        // rather than as an explicit `&[T]`/`&str` reference.  It is still passed as the usual
+        // `(data, metadata)` pair, so preserve that pair here.  Returning only the element type
+        // loses the metadata word and makes later slice projections manufacture fields for a
+        // different `FatPtr…` class (the verifier catches this as a field-owner mismatch in
+        // alloc's `SpecExtendStr`).  The pointer/reference arm above handles the corresponding
+        // sized source type and intentionally shares this `fat_ptr_to` representation.
+        TyKind::Str => Type::ClassRef(fat_ptr_to(Ty::new_uint(ctx.tcx(), UintTy::U8), ctx)),
         TyKind::Slice(inner) => {
             let inner = ctx.monomorphize(*inner);
-            get_type(inner, ctx)
+            Type::ClassRef(fat_ptr_to(inner, ctx))
         }
         TyKind::Tuple(types) => {
             let types: Vec<_> = types.iter().map(|ty| get_type(ty, ctx)).collect();
             if types.is_empty() {
                 Type::Void
             } else {
-                let name = tuple_name(&types, ctx);
+                let layout = ctx.layout_of(ty);
+                let field_offsets = (0..types.len())
+                    .map(|index| layout.layout.fields.offset(index).bytes())
+                    .collect::<Vec<_>>();
+                let name = utilis::rust_tuple_name(
+                    &types,
+                    ctx,
+                    layout.layout.size().bytes(),
+                    layout.layout.align().abi.bytes(),
+                    &field_offsets,
+                );
                 let name = ctx.alloc_string(name);
                 let cref = ClassRef::new(name, None, true, [].into());
                 // This only checks if a refernce to this class has already been allocated. In theory, allocating a class reference beforhand could break this, and make it not add the type definition
                 if !ctx.contains_ref(&cref) {
-                    let layout = ctx.layout_of(ty);
                     let _ = tuple_typedef(&types, layout.layout, ctx, name);
                 }
                 Type::ClassRef(ctx.alloc_class_ref(cref))
@@ -295,9 +327,19 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                 // intrinsic builtins detect this array fallback via `simd_lane_info` and lower ops
                 // over it element-wise (the per-lane spill-and-index path already works on it).
                 let layout = ctx.layout_of(ty);
-                let vec_bits = layout.layout.size().bytes().saturating_mul(8);
                 let elem_simd: Result<cilly::tpe::simd::SIMDElem, _> = elem.try_into();
-                if elem_simd.is_err() || !matches!(vec_bits, 64 | 128 | 256 | 512) {
+                // Use the *semantic* lane width here, not the ABI-padded layout size. Rust may
+                // round e.g. `Simd<u32, 11>` up to a 64-byte allocation for alignment while its
+                // actual value is 352 bits; feeding the physical 512-bit width to
+                // `SIMDVector::new` would then panic on the 352-bit lane product.  The CLR vector
+                // class must match the Rust value width, so padded non-power-of-two values take
+                // the fixed-array path below.
+                let semantic_bits = match elem {
+                    Type::Int(int) => u64::from(int.bits().unwrap_or(64)) * count,
+                    Type::Float(float) => u64::from(float.bits()) * count,
+                    _ => 0,
+                };
+                if elem_simd.is_err() || !matches!(semantic_bits, 64 | 128 | 256 | 512) {
                     let arr_size = layout.layout.size().bytes();
                     let arr_align = layout.layout.align().abi.bytes();
                     // I3 totality: a SIMD vector lowered to a fixed array can't exceed 2^32 bytes on
@@ -349,18 +391,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         subst.len() == 2,
                         "Managed object reference must have exactly 2 generic arguments!"
                     );
-                    let assembly = garg_to_string(subst[0], ctx.tcx());
-                    let assembly = Some(assembly)
-                        .filter(|assembly| !assembly.is_empty())
-                        .map(|asm| ctx.alloc_string(asm));
-                    let name = garg_to_string(subst[1], ctx.tcx());
-                    let name = ctx.alloc_string(name);
-                    Type::ClassRef(ctx.alloc_class_ref(ClassRef::new(
-                        name,
-                        assembly,
-                        false,
-                        [].into(),
-                    )))
+                    managed_class_ref(ctx, subst, false, vec![])
                 } else if item_name == INTEROP_STRUCT_TPE_NAME {
                     // A managed value type carries 3 generics: <ASSEMBLY, CLASS_PATH, SIZE>.
                     // (The size hint is only used Rust-side for layout; the CLR knows the real size.)
@@ -368,18 +399,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         subst.len() == 3,
                         "Managed struct reference must have exactly 3 generic arguments (assembly, class, size)!"
                     );
-                    let assembly = garg_to_string(subst[0], ctx.tcx());
-                    let assembly = Some(assembly)
-                        .filter(|assembly| !assembly.is_empty())
-                        .map(|asm| ctx.alloc_string(asm));
-                    let name = garg_to_string(subst[1], ctx.tcx());
-                    let name = ctx.alloc_string(name);
-                    Type::ClassRef(ctx.alloc_class_ref(ClassRef::new(
-                        name,
-                        assembly,
-                        true,
-                        [].into(),
-                    )))
+                    managed_class_ref(ctx, subst, true, vec![])
                 } else if item_name == INTEROP_ARR_TPE_NAME {
                     assert!(
                         subst.len() == 2,
@@ -403,19 +423,8 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         subst.len() == 3,
                         "RustcCLRInteropManagedGeneric must have exactly 3 generic arguments (assembly, class, class-generics-tuple)!"
                     );
-                    let assembly = garg_to_string(subst[0], ctx.tcx());
-                    let assembly = Some(assembly)
-                        .filter(|assembly| !assembly.is_empty())
-                        .map(|asm| ctx.alloc_string(asm));
-                    let name = garg_to_string(subst[1], ctx.tcx());
-                    let name = ctx.alloc_string(name);
                     let class_generics: Vec<Type> = tuple_garg_types(subst[2], ctx);
-                    Type::ClassRef(ctx.alloc_class_ref(ClassRef::new(
-                        name,
-                        assembly,
-                        false,
-                        class_generics.into(),
-                    )))
+                    managed_class_ref(ctx, subst, false, class_generics)
                 } else if item_name == INTEROP_GENERIC_STRUCT_TPE_NAME {
                     // `RustcCLRInteropManagedGenericStruct<ASSEMBLY, CLASS_PATH, SIZE, ClassGenerics>`
                     // — a *value type* of a generic instantiation (e.g. `Nullable<JsonNodeOptions>`).
@@ -427,34 +436,21 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
                         subst.len() == 4,
                         "RustcCLRInteropManagedGenericStruct must have exactly 4 generic arguments (assembly, class, size, class-generics-tuple)!"
                     );
-                    let assembly = garg_to_string(subst[0], ctx.tcx());
-                    let assembly = Some(assembly)
-                        .filter(|assembly| !assembly.is_empty())
-                        .map(|asm| ctx.alloc_string(asm));
-                    let name = garg_to_string(subst[1], ctx.tcx());
-                    let name = ctx.alloc_string(name);
                     let class_generics: Vec<Type> = tuple_garg_types(subst[3], ctx);
-                    Type::ClassRef(ctx.alloc_class_ref(ClassRef::new(
-                        name,
-                        assembly,
-                        true,
-                        class_generics.into(),
-                    )))
-                } else if item_name == INTEROP_TYPE_GENERIC_TPE_NAME {
-                    // Lowers to the .NET *class* generic parameter `!N` (a method-definition-shape
-                    // marker used when calling a method on a generic instantiation).
+                    managed_class_ref(ctx, subst, true, class_generics)
+                } else if matches!(
+                    item_name,
+                    INTEROP_TYPE_GENERIC_TPE_NAME | INTEROP_METHOD_GENERIC_TPE_NAME
+                ) {
+                    // Lowers to a .NET generic parameter: `!N` for a class marker or `!!N` for a
+                    // method marker.
                     let n = garg_to_usize(subst[0], ctx.tcx());
-                    Type::PlatformGeneric(
-                        u32::try_from(n).expect("class generic index over 2^32"),
-                        GenericKind::TypeGeneric,
-                    )
-                } else if item_name == INTEROP_METHOD_GENERIC_TPE_NAME {
-                    // Lowers to the .NET *method* generic parameter `!!N`.
-                    let n = garg_to_usize(subst[0], ctx.tcx());
-                    Type::PlatformGeneric(
-                        u32::try_from(n).expect("method generic index over 2^32"),
-                        GenericKind::CallGeneric,
-                    )
+                    let kind = if item_name == INTEROP_TYPE_GENERIC_TPE_NAME {
+                        GenericKind::TypeGeneric
+                    } else {
+                        GenericKind::CallGeneric
+                    };
+                    Type::PlatformGeneric(u32::try_from(n).expect("generic index over 2^32"), kind)
                 } else if item_name == INTEROP_BYREF_TPE_NAME {
                     // Lowers to a managed byref `Inner&` (`Type::Ref`) — the return shape of a
                     // byref-returning member, e.g. `Span<T>.get_Item(int) -> ref T` written as
@@ -514,7 +510,7 @@ pub fn get_type<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Typ
             let cref = fixed_array(ctx, element, length as u64, n_arr_size, arr_size, arr_align);
             Type::ClassRef(cref)
         }
-        TyKind::Alias(_) => panic!("Attempted to get the .NET type of an unmorphized type"),
+        TyKind::Alias(..) => panic!("Attempted to get the .NET type of an unmorphized type"),
         TyKind::Coroutine(_defid, coroutine_args) => {
             let coroutine_args = coroutine_args.as_coroutine();
 

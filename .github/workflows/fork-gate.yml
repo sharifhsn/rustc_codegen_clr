@@ -457,3 +457,42 @@ jobs:
             ${{ runner.temp }}/private-registry-acceptance/logs
             ${{ runner.temp }}/private-registry-acceptance/registry.events
             ${{ runner.temp }}/api-documentation
+  stdlib_suite:
+    name: ${{ matrix.profile }} ${{ matrix.suite }}
+    # Keep the upstream Rust corpus separate from the product fixture job so a complete
+    # denominator is visible in its own artifact and does not get reduced to a smoke subset.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: coretests
+            profile: debug
+          - suite: coretests
+            profile: release
+          - suite: alloctests
+            profile: debug
+          - suite: alloctests
+            profile: release
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          cache-targets: "true"
+      - name: Run complete pinned ${{ matrix.profile }} ${{ matrix.suite }} suite
+        env:
+          RCL_STDLIB_BUILD_TIMEOUT: "1800"
+          RCL_STDLIB_OUT: ${{ runner.temp }}/stdlib-suites
+        run: bash feasibility/stdlib_ci.sh "${{ matrix.suite }}" "${{ matrix.profile }}" "$RCL_STDLIB_OUT"
+      - name: Upload ${{ matrix.profile }} ${{ matrix.suite }} receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stdlib-${{ matrix.suite }}-${{ matrix.profile }}-${{ github.sha }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/stdlib-suites

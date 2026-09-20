@@ -123,9 +123,8 @@ fn collect(crate_dir: &Path) -> Result<Vec<PathBuf>> {
         .resolve
         .as_ref()
         .context("cargo metadata inputs: resolved dependency graph is missing")?;
-    let root_id = metadata
-        .root_package()
-        .context("cargo metadata inputs: selected manifest has no root package")?
+    let root_id = context::package_for_manifest(&metadata, &manifest)
+        .context("cargo metadata inputs: selected manifest package is missing")?
         .id
         .clone();
     let mut reachable = HashSet::from([root_id]);

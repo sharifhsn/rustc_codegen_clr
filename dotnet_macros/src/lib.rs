@@ -23,10 +23,10 @@ use syn::{
 /// Split a `"[Assembly]Namespace.Type"` spec into `(assembly, type_name)`. An empty/`[]`-less spec
 /// yields `("", spec)`.
 fn split_dotnet_ref(spec: &str) -> (String, String) {
-    if let Some(rest) = spec.strip_prefix('[') {
-        if let Some((asm, name)) = rest.split_once(']') {
-            return (asm.to_string(), name.to_string());
-        }
+    if let Some(rest) = spec.strip_prefix('[')
+        && let Some((asm, name)) = rest.split_once(']')
+    {
+        return (asm.to_string(), name.to_string());
     }
     (String::new(), spec.to_string())
 }
@@ -39,13 +39,13 @@ fn split_dotnet_ref(spec: &str) -> (String, String) {
 /// Returns `(spec, None)` unchanged if there's no such suffix. Only a single generic argument is
 /// supported (multi-argument interfaces like `IDictionary<K,V>` aren't expressible this way today).
 fn split_generic_suffix(spec: &str) -> (String, Option<String>) {
-    if let Some(open) = spec.find('<') {
-        if let Some(inner) = spec.strip_suffix('>') {
-            return (
-                spec[..open].to_string(),
-                Some(inner[open + 1..].to_string()),
-            );
-        }
+    if let Some(open) = spec.find('<')
+        && let Some(inner) = spec.strip_suffix('>')
+    {
+        return (
+            spec[..open].to_string(),
+            Some(inner[open + 1..].to_string()),
+        );
     }
     (spec.to_string(), None)
 }
@@ -2058,10 +2058,11 @@ impl syn::visit_mut::VisitMut for DimRewriter<'_> {
         syn::visit_mut::visit_expr_mut(self, expr);
         // Any remaining bare `self` (e.g. passed as an argument) becomes the handle — sound
         // because the handle IS the receiver and is `Copy`.
-        if let syn::Expr::Path(p) = expr {
-            if p.qself.is_none() && p.path.is_ident("self") {
-                *expr = syn::parse_quote!(this);
-            }
+        if let syn::Expr::Path(p) = expr
+            && p.qself.is_none()
+            && p.path.is_ident("self")
+        {
+            *expr = syn::parse_quote!(this);
         }
     }
 }
@@ -2288,9 +2289,10 @@ fn first_generic_param_mention(
 /// used anywhere except a bare parameter/return position. Also rejected: generic parameters on
 /// a `#[dotnet_event]` member, on a method with a default body (the lifted DIM body would need
 /// a generic IL body), and on a static (receiver-less) member (generic `static abstract` isn't
-/// emitted yet). Like a `static abstract`, a generic member is declaration-only surface from
-/// the Rust side: Rust code cannot *call* it through the handle yet (the trait is a declaration
-/// vehicle); the C# consumer implements and dispatches it.
+/// emitted yet). Like a `static abstract`, a generic METHOD is declaration-only surface from
+/// the Rust side: Rust code cannot *call* it through the handle yet; the C# consumer implements
+/// and dispatches it. Ordinary non-generic instance methods on a generic interface are callable
+/// through the generated `<Name>ManagedDispatch<T, ...>` extension trait.
 ///
 /// **`ref`/`out` parameters**: a `&mut T` (thin, sized `T`) parameter maps to a managed byref —
 /// C# sees `ref T` — and marking it `#[dotnet_out]` additionally stamps `ParamAttributes.Out`
@@ -2315,11 +2317,18 @@ fn first_generic_param_mention(
 /// interfaces from C# for now (see `docs/MYCORRHIZA_ERGONOMICS_BACKLOG.md`).
 ///
 /// The macro also emits an `<Name>Handle` managed-handle alias (a Rust-side reference to the
-/// interface type). The trait itself is re-emitted unchanged — it is a declaration vehicle only
-/// (nothing needs to `impl` it in Rust; managed types satisfy the interface by name+signature).
+/// interface type) and a `<Name>ManagedDispatch` extension trait for directly representable
+/// instance members (by-value parameters, at most two, no method-level generics or managed
+/// byrefs). The extension methods issue a real managed `callvirt`; they do not synthesize a native
+/// Rust `dyn Trait`, and the source trait remains a declaration vehicle (managed types satisfy the
+/// interface by name+signature).
 #[proc_macro_attribute]
 pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(item as ItemTrait);
+    // Keep the source signatures before marker attributes are stripped and carrier-only generic
+    // substitutions are applied below.  They are used to synthesize the narrow Rust -> managed
+    // dispatch surface after the interface metadata has been validated.
+    let dispatch_source = input.clone();
     let trait_name = input.ident.clone();
     let span = trait_name.span();
     let handle_ident = format_ident!("{}Handle", trait_name);
@@ -3202,12 +3211,11 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .into();
                         }
                     }
-                    if !has_default {
-                        if let Some((name, inner)) = single_generic_arg(&carrier_pt.ty) {
-                            if name == "ManagedOption" {
-                                carrier_pt.ty = Box::new(inner.clone());
-                            }
-                        }
+                    if !has_default
+                        && let Some((name, inner)) = single_generic_arg(&carrier_pt.ty)
+                        && name == "ManagedOption"
+                    {
+                        carrier_pt.ty = Box::new(inner.clone());
                     }
                     carrier_inputs.push(FnArg::Typed(carrier_pt));
                 }
@@ -3223,16 +3231,16 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         // Byref returns (`fn f(&self) -> &mut i32`) have no supported mapping (C# `ref` returns
         // are a different metadata shape than we emit) — reject loudly rather than emit `T*`.
-        if let ReturnType::Type(_, ty) = &m.sig.output {
-            if matches!(&**ty, syn::Type::Reference(_)) {
-                return syn::Error::new(
-                    ty.span(),
-                    "#[dotnet_interface]: reference returns (`-> &T` / `-> &mut T`) are not \
+        if let ReturnType::Type(_, ty) = &m.sig.output
+            && matches!(&**ty, syn::Type::Reference(_))
+        {
+            return syn::Error::new(
+                ty.span(),
+                "#[dotnet_interface]: reference returns (`-> &T` / `-> &mut T`) are not \
                      supported on interface methods",
-                )
-                .to_compile_error()
-                .into();
-            }
+            )
+            .to_compile_error()
+            .into();
         }
         let output = &m.sig.output;
         // The CARRIER's return type: a bare `-> T` naming a METHOD generic parameter becomes
@@ -3347,18 +3355,18 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // (it becomes a C# `ref`/`out` parameter on an ordinary method) — but no C#
                 // property setter can be `ref`/`out`-valued, so reject it here explicitly rather
                 // than silently emitting an unimplementable property.
-                if let Some(FnArg::Typed(pt)) = m.sig.inputs.iter().nth(1) {
-                    if matches!(&*pt.ty, syn::Type::Reference(_)) {
-                        return syn::Error::new(
-                            pt.ty.span(),
-                            format!(
-                                "#[dotnet_interface]: property setter `{fn_ident}`'s value \
+                if let Some(FnArg::Typed(pt)) = m.sig.inputs.iter().nth(1)
+                    && matches!(&*pt.ty, syn::Type::Reference(_))
+                {
+                    return syn::Error::new(
+                        pt.ty.span(),
+                        format!(
+                            "#[dotnet_interface]: property setter `{fn_ident}`'s value \
                                  parameter must be passed by value, not by reference"
-                            ),
-                        )
-                        .to_compile_error()
-                        .into();
-                    }
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
                 }
             }
             let slot_idx = property_members
@@ -3709,11 +3717,160 @@ pub fn dotnet_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // A managed interface handle is a real CLR reference in a GC-tracked argument/local slot, not
+    // a native Rust trait object.  Give Rust code a typed, name-checked way to invoke the simple
+    // instance members that can already be represented faithfully by the managed-call intrinsics.
+    //
+    // This deliberately does NOT synthesize `impl Trait for Handle`: the source trait's `&self`
+    // receiver suggests an ordinary borrowable Rust value, while a managed reference may only be
+    // used transiently in managed stack slots.  A separate by-value extension trait makes the
+    // boundary explicit and avoids creating a fake `dyn Trait`/fat-pointer representation.
+    let dispatch_trait_ident = format_ident!("{}ManagedDispatch", trait_name);
+    let mut dispatch_declarations = Vec::new();
+    let mut dispatch_implementations = Vec::new();
+    for item in &dispatch_source.items {
+        let TraitItem::Fn(method) = item else {
+            continue;
+        };
+        let is_event = method
+            .attrs
+            .iter()
+            .any(|attr| attr.path().is_ident("dotnet_event"));
+        let Some(FnArg::Receiver(receiver)) = method.sig.inputs.first() else {
+            continue;
+        };
+        // Typed receivers (`self: Box<Self>`, `self: Pin<&mut Self>`, etc.) have distinct Rust
+        // ownership/layout semantics. Only the ordinary self/&self/&mut self forms map directly
+        // to the single managed object reference consumed by callvirt.
+        if is_event || receiver.colon_token.is_some() || !method.sig.generics.params.is_empty() {
+            continue;
+        }
+
+        let mut arg_defs = Vec::new();
+        let mut arg_names = Vec::new();
+        let mut arg_tys = Vec::new();
+        let mut sig_arg_tys = Vec::new();
+        let mut unsupported = false;
+        for arg in method.sig.inputs.iter().skip(1) {
+            let FnArg::Typed(arg) = arg else {
+                unsupported = true;
+                break;
+            };
+            if matches!(&*arg.ty, Type::Reference(_)) {
+                unsupported = true;
+                break;
+            }
+            // `ManagedOption<T>` is represented as `T` in managed metadata, but its Rust value
+            // must be constructed from the incoming managed reference. Until dispatch has an
+            // explicit argument conversion, omitting this member is safer than passing the
+            // wrapper bits as though they were the managed object.
+            if single_generic_arg(&arg.ty).is_some_and(|(name, _)| name == "ManagedOption") {
+                unsupported = true;
+                break;
+            }
+            let syn::Pat::Ident(pat) = &*arg.pat else {
+                unsupported = true;
+                break;
+            };
+            let name = &pat.ident;
+            let ty = &arg.ty;
+            arg_defs.push(quote!(#name: #ty));
+            arg_names.push(quote!(#name));
+            arg_tys.push(quote!(#ty));
+            if let Some(idx) = bare_generic_param(ty, &param_index) {
+                let idx = proc_macro2::Literal::usize_unsuffixed(idx);
+                sig_arg_tys.push(quote!(
+                    ::mycorrhiza::intrinsics::RustcCLRInteropTypeGeneric<#idx>
+                ));
+            } else {
+                sig_arg_tys.push(quote!(#ty));
+            }
+        }
+        // The public virtual-call ladders currently support receiver + at most two value args.
+        // Reference/byref parameters and generic methods require distinct signature machinery and
+        // remain declaration-only rather than being exposed with a subtly wrong call signature.
+        if unsupported || arg_tys.len() > 2 {
+            continue;
+        }
+
+        let (return_decl, runtime_ret, sig_ret) = match &method.sig.output {
+            ReturnType::Default => (quote!(), quote!(()), quote!(())),
+            ReturnType::Type(arrow, ty) => {
+                // `ManagedOption<T>` is rewritten to a naked managed reference in metadata; the
+                // wrapper requires a dedicated conversion and is intentionally not auto-dispatched.
+                if single_generic_arg(ty).is_some_and(|(name, _)| name == "ManagedOption") {
+                    continue;
+                }
+                let sig_ty = if let Some(idx) = bare_generic_param(ty, &param_index) {
+                    let idx = proc_macro2::Literal::usize_unsuffixed(idx);
+                    quote!(::mycorrhiza::intrinsics::RustcCLRInteropTypeGeneric<#idx>)
+                } else {
+                    quote!(#ty)
+                };
+                (quote!(#arrow #ty), quote!(#ty), sig_ty)
+            }
+        };
+        let method_ident = &method.sig.ident;
+        let managed_method_name = to_pascal_case(&method_ident.to_string());
+        let method_lit = LitStr::new(&managed_method_name, method_ident.span());
+        let unsafety = &method.sig.unsafety;
+        dispatch_declarations.push(quote! {
+            #unsafety fn #method_ident(self, #(#arg_defs),*) #return_decl;
+        });
+
+        let body = if type_params.is_empty() {
+            let virt = format_ident!("virt{}", arg_tys.len());
+            quote! {
+                self.#virt::<#method_lit, #(#arg_tys,)* #runtime_ret>(#(#arg_names),*)
+            }
+        } else {
+            let call = format_ident!("rustc_clr_interop_generic_call{}", arg_tys.len() + 1);
+            quote! {
+                ::mycorrhiza::intrinsics::#call::<
+                    "", #name_lit, false, #method_lit, 2,
+                    (#(#type_params,)*),
+                    (#sig_ret, #(#sig_arg_tys,)*),
+                    #runtime_ret,
+                    Self,
+                    #(#arg_tys,)*
+                >(self, #(#arg_names),*)
+            }
+        };
+        dispatch_implementations.push(quote! {
+            #unsafety fn #method_ident(self, #(#arg_defs),*) #return_decl {
+                #body
+            }
+        });
+    }
+    let dispatch_surface = if dispatch_declarations.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            /// Typed Rust-to-managed virtual dispatch for the directly representable instance
+            /// members of this interface. The receiver is consumed by value because it is a
+            /// transient CLR reference in a GC-tracked managed stack slot, not native Rust data.
+            /// This is not, and does not create, a Rust `dyn Trait` object.
+            #[allow(non_snake_case, dead_code)]
+            pub trait #dispatch_trait_ident<#(#type_params),*> {
+                #(#dispatch_declarations)*
+            }
+
+            #[allow(non_snake_case, dead_code)]
+            impl<#(#type_params),*> #dispatch_trait_ident<#(#type_params),*>
+                for #handle_ident<#(#type_params),*>
+            {
+                #(#dispatch_implementations)*
+            }
+        }
+    };
+
     let expanded = quote! {
         // The trait, unchanged — a declaration vehicle only.
         #input
 
         #handle_alias
+
+        #dispatch_surface
 
         #[allow(non_snake_case, dead_code, unused_variables, internal_features, clippy::diverging_sub_expression)]
         mod #entry_mod {
@@ -5134,12 +5291,13 @@ fn is_passthrough_primitive(path: &str) -> bool {
 /// The single-segment path name of a plain type path (e.g. `String`, `i32`), or `None` for anything
 /// more complex (generics, qualified paths, …).
 fn simple_path_ident(ty: &Type) -> Option<String> {
-    if let Type::Path(tp) = ty {
-        if tp.qself.is_none() && tp.path.segments.len() == 1 {
-            let seg = &tp.path.segments[0];
-            if seg.arguments.is_empty() {
-                return Some(seg.ident.to_string());
-            }
+    if let Type::Path(tp) = ty
+        && tp.qself.is_none()
+        && tp.path.segments.len() == 1
+    {
+        let seg = &tp.path.segments[0];
+        if seg.arguments.is_empty() {
+            return Some(seg.ident.to_string());
         }
     }
     None
@@ -5168,10 +5326,10 @@ fn single_generic_arg(ty: &Type) -> Option<(String, &Type)> {
 }
 
 fn managed_data_field_seam_type(ty: &Type) -> Type {
-    if let Some((name, inner)) = single_generic_arg(ty) {
-        if name == "ManagedOption" {
-            return inner.clone();
-        }
+    if let Some((name, inner)) = single_generic_arg(ty)
+        && name == "ManagedOption"
+    {
+        return inner.clone();
     }
     if simple_path_ident(ty).as_deref() == Some("String") {
         return syn::parse_quote!(::mycorrhiza::system::MString);
@@ -5180,10 +5338,10 @@ fn managed_data_field_seam_type(ty: &Type) -> Type {
 }
 
 fn managed_data_field_into_seam(name: &syn::Ident, ty: &Type) -> proc_macro2::TokenStream {
-    if let Some((wrapper, _)) = single_generic_arg(ty) {
-        if wrapper == "ManagedOption" {
-            return quote! { #name.into_raw() };
-        }
+    if let Some((wrapper, _)) = single_generic_arg(ty)
+        && wrapper == "ManagedOption"
+    {
+        return quote! { #name.into_raw() };
     }
     if simple_path_ident(ty).as_deref() == Some("String") {
         return quote! { ::mycorrhiza::system::MString::from(#name.as_str()) };
@@ -5268,10 +5426,10 @@ fn nullable_inner(ty: &Type) -> Option<&Type> {
 /// all; `Err` (via the caller) if it names 2+ dimensions, so that case fails loudly with a clear
 /// message rather than silently mismarshalling.
 fn managed_array_elem(ty: &Type) -> Option<Result<&Type, String>> {
-    if let Some((name, elem)) = single_generic_arg(ty) {
-        if name == "ManagedArray" {
-            return Some(Ok(elem));
-        }
+    if let Some((name, elem)) = single_generic_arg(ty)
+        && name == "ManagedArray"
+    {
+        return Some(Ok(elem));
     }
     let Type::Path(tp) = ty else { return None };
     if tp.qself.is_some() {
@@ -5476,22 +5634,22 @@ fn imported_delegate_param(ty: &Type) -> Option<Result<Marshal, String>> {
 fn marshal_param(ty: &Type) -> Result<Marshal, String> {
     // `&str` (shared ref to a `str`) → managed `System.String` inbound.
     if let Type::Reference(r) = ty {
-        if r.mutability.is_none() {
-            if let Type::Path(tp) = &*r.elem {
-                if tp.qself.is_none() && tp.path.is_ident("str") {
-                    return Ok(Marshal {
-                        seam_ty: quote! { ::mycorrhiza::system::MString },
-                        to_rust: Some(Box::new(|id| {
-                            quote! {
-                                let #id: ::std::string::String =
-                                    ::mycorrhiza::system::DotNetString::from_handle(#id).to_rust_string();
-                            }
-                        })),
-                        from_rust: None,
-                        returns_managed_handle: false,
-                    });
-                }
-            }
+        if r.mutability.is_none()
+            && let Type::Path(tp) = &*r.elem
+            && tp.qself.is_none()
+            && tp.path.is_ident("str")
+        {
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::system::MString },
+                to_rust: Some(Box::new(|id| {
+                    quote! {
+                        let #id: ::std::string::String =
+                            ::mycorrhiza::system::DotNetString::from_handle(#id).to_rust_string();
+                    }
+                })),
+                from_rust: None,
+                returns_managed_handle: false,
+            });
         }
         if let Type::Slice(slice) = &*r.elem {
             let Some(element_name) = simple_path_ident(&slice.elem) else {
@@ -5545,24 +5703,25 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
         return delegate;
     }
 
-    if let Some((name, args)) = generic_type_args(ty) {
-        if name == "MutableDictionary" && args.len() == 2 {
-            let key = args[0].clone();
-            let value = args[1].clone();
-            return Ok(Marshal {
-                seam_ty: quote! {
-                    ::mycorrhiza::collections::MutableDictionaryHandle<#key, #value>
-                },
-                to_rust: Some(Box::new(move |id| {
-                    quote! {
-                        let #id = ::mycorrhiza::collections::MutableDictionary::<#key, #value>
-                            ::from_raw(#id);
-                    }
-                })),
-                from_rust: None,
-                returns_managed_handle: false,
-            });
-        }
+    if let Some((name, args)) = generic_type_args(ty)
+        && name == "MutableDictionary"
+        && args.len() == 2
+    {
+        let key = args[0].clone();
+        let value = args[1].clone();
+        return Ok(Marshal {
+            seam_ty: quote! {
+                ::mycorrhiza::collections::MutableDictionaryHandle<#key, #value>
+            },
+            to_rust: Some(Box::new(move |id| {
+                quote! {
+                    let #id = ::mycorrhiza::collections::MutableDictionary::<#key, #value>
+                        ::from_raw(#id);
+                }
+            })),
+            from_rust: None,
+            returns_managed_handle: false,
+        });
     }
 
     if let Some(name) = simple_path_ident(ty) {
@@ -5826,35 +5985,35 @@ fn marshal_param(ty: &Type) -> Result<Marshal, String> {
             ));
         }
         if name == "RustOwnedVec" {
-            if let Some(elem_name) = simple_path_ident(inner) {
-                if is_passthrough_primitive(&elem_name) {
-                    let elem_ty = inner.clone();
-                    return Ok(Marshal {
-                        seam_ty: quote! { ::core::primitive::usize },
-                        to_rust: Some(Box::new(move |id| {
-                            quote! {
-                                let #id: ::mycorrhiza::containers::RustOwnedVec<#elem_ty> = {
-                                    let __len = unsafe { crate::rcl_vec_len(#id) };
-                                    let mut __out = ::std::vec::Vec::with_capacity(__len);
-                                    for __i in 0..__len {
-                                        let mut __elem: #elem_ty = ::core::default::Default::default();
-                                        unsafe {
-                                            crate::rcl_vec_get(
-                                                #id,
-                                                __i,
-                                                (&mut __elem as *mut #elem_ty) as *mut u8,
-                                            );
-                                        }
-                                        __out.push(__elem);
+            if let Some(elem_name) = simple_path_ident(inner)
+                && is_passthrough_primitive(&elem_name)
+            {
+                let elem_ty = inner.clone();
+                return Ok(Marshal {
+                    seam_ty: quote! { ::core::primitive::usize },
+                    to_rust: Some(Box::new(move |id| {
+                        quote! {
+                            let #id: ::mycorrhiza::containers::RustOwnedVec<#elem_ty> = {
+                                let __len = unsafe { crate::rcl_vec_len(#id) };
+                                let mut __out = ::std::vec::Vec::with_capacity(__len);
+                                for __i in 0..__len {
+                                    let mut __elem: #elem_ty = ::core::default::Default::default();
+                                    unsafe {
+                                        crate::rcl_vec_get(
+                                            #id,
+                                            __i,
+                                            (&mut __elem as *mut #elem_ty) as *mut u8,
+                                        );
                                     }
-                                    ::mycorrhiza::containers::RustOwnedVec::from(__out)
-                                };
-                            }
-                        })),
-                        from_rust: None,
-                        returns_managed_handle: false,
-                    });
-                }
+                                    __out.push(__elem);
+                                }
+                                ::mycorrhiza::containers::RustOwnedVec::from(__out)
+                            };
+                        }
+                    })),
+                    from_rust: None,
+                    returns_managed_handle: false,
+                });
             }
             return Err(format!(
                 "#[dotnet_export]: `RustOwnedVec<{}>` supports passthrough primitive elements only",
@@ -5916,19 +6075,19 @@ fn parameter_seam_needs_root(ty: &Type, registered_enum: bool) -> bool {
 fn marshal_return(ty: &Type) -> Result<Marshal, String> {
     // `&str` return (typically a `&'static str`) → managed string outbound.
     if let Type::Reference(r) = ty {
-        if r.mutability.is_none() {
-            if let Type::Path(tp) = &*r.elem {
-                if tp.qself.is_none() && tp.path.is_ident("str") {
-                    return Ok(Marshal {
-                        seam_ty: quote! { ::mycorrhiza::system::MString },
-                        to_rust: None,
-                        from_rust: Some(Box::new(|id| {
-                            quote! { ::mycorrhiza::system::DotNetString::from(#id).handle() }
-                        })),
-                        returns_managed_handle: false,
-                    });
-                }
-            }
+        if r.mutability.is_none()
+            && let Type::Path(tp) = &*r.elem
+            && tp.qself.is_none()
+            && tp.path.is_ident("str")
+        {
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::system::MString },
+                to_rust: None,
+                from_rust: Some(Box::new(|id| {
+                    quote! { ::mycorrhiza::system::DotNetString::from(#id).handle() }
+                })),
+                returns_managed_handle: false,
+            });
         }
         return Err(format!(
             "#[dotnet_export]: unsupported reference return type `{}`; only `&str` is marshalled \
@@ -5937,19 +6096,20 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
         ));
     }
 
-    if let Some((name, args)) = generic_type_args(ty) {
-        if name == "MutableDictionary" && args.len() == 2 {
-            let key = args[0].clone();
-            let value = args[1].clone();
-            return Ok(Marshal {
-                seam_ty: quote! {
-                    ::mycorrhiza::collections::MutableDictionaryHandle<#key, #value>
-                },
-                to_rust: None,
-                from_rust: Some(Box::new(|id| quote! { #id.into_raw() })),
-                returns_managed_handle: true,
-            });
-        }
+    if let Some((name, args)) = generic_type_args(ty)
+        && name == "MutableDictionary"
+        && args.len() == 2
+    {
+        let key = args[0].clone();
+        let value = args[1].clone();
+        return Ok(Marshal {
+            seam_ty: quote! {
+                ::mycorrhiza::collections::MutableDictionaryHandle<#key, #value>
+            },
+            to_rust: None,
+            from_rust: Some(Box::new(|id| quote! { #id.into_raw() })),
+            returns_managed_handle: true,
+        });
     }
 
     // `mycorrhiza::task::Task` — the idiomatic non-generic managed `Task` wrapper. NOTE: unlike
@@ -6052,29 +6212,28 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
     // directly instead of manually building a `Nullable<T>` and `.into()`-ing it yourself (the arm
     // above is kept as-is for that explicit spelling, and for the day a non-primitive `T` is
     // supported). Converts via the same `Nullable<T>: From<Option<T>>` impl that arm's doc documents.
-    if let Some((name, inner)) = single_generic_arg(ty) {
-        if name == "Option" {
-            if let Some(inner_name) = simple_path_ident(inner) {
-                if is_passthrough_primitive(&inner_name) {
-                    let inner = inner.clone();
-                    return Ok(Marshal {
-                        seam_ty: quote! { ::mycorrhiza::nullable::Nullable<#inner> },
-                        to_rust: None,
-                        from_rust: Some(Box::new(move |id| {
-                            quote! {
-                                ::core::convert::Into::<::mycorrhiza::nullable::Nullable<#inner>>::into(#id)
-                            }
-                        })),
-                        returns_managed_handle: false,
-                    });
-                }
-                return Err(format!(
-                    "#[dotnet_export]: unsupported `Option<{inner_name}>` return element type. Only \
+    if let Some((name, inner)) = single_generic_arg(ty)
+        && name == "Option"
+        && let Some(inner_name) = simple_path_ident(inner)
+    {
+        if is_passthrough_primitive(&inner_name) {
+            let inner = inner.clone();
+            return Ok(Marshal {
+                seam_ty: quote! { ::mycorrhiza::nullable::Nullable<#inner> },
+                to_rust: None,
+                from_rust: Some(Box::new(move |id| {
+                    quote! {
+                        ::core::convert::Into::<::mycorrhiza::nullable::Nullable<#inner>>::into(#id)
+                    }
+                })),
+                returns_managed_handle: false,
+            });
+        }
+        return Err(format!(
+            "#[dotnet_export]: unsupported `Option<{inner_name}>` return element type. Only \
                      the integer/float primitives and `bool` are supported as `Option<T>` returns \
                      today."
-                ));
-            }
-        }
+        ));
     }
 
     // `mycorrhiza::intrinsics::RustcCLRInteropManagedArray<T, 1>` — a real managed 1-D array handle
@@ -6192,32 +6351,32 @@ fn marshal_return(ty: &Type) -> Result<Marshal, String> {
             ));
         }
         if name == "RustOwnedVec" {
-            if let Some(elem_name) = simple_path_ident(elem_ty) {
-                if is_passthrough_primitive(&elem_name) {
-                    let elem_ty = elem_ty.clone();
-                    return Ok(Marshal {
-                        seam_ty: quote! { ::core::primitive::usize },
-                        to_rust: None,
-                        from_rust: Some(Box::new(move |id| {
-                            quote! {
-                                {
-                                    let __elems = #id.into_inner();
-                                    let __handle = crate::rcl_vec_new(::core::mem::size_of::<#elem_ty>());
-                                    for __elem in __elems.iter() {
-                                        unsafe {
-                                            crate::rcl_vec_push(
-                                                __handle,
-                                                (__elem as *const #elem_ty) as *const u8,
-                                            );
-                                        }
+            if let Some(elem_name) = simple_path_ident(elem_ty)
+                && is_passthrough_primitive(&elem_name)
+            {
+                let elem_ty = elem_ty.clone();
+                return Ok(Marshal {
+                    seam_ty: quote! { ::core::primitive::usize },
+                    to_rust: None,
+                    from_rust: Some(Box::new(move |id| {
+                        quote! {
+                            {
+                                let __elems = #id.into_inner();
+                                let __handle = crate::rcl_vec_new(::core::mem::size_of::<#elem_ty>());
+                                for __elem in __elems.iter() {
+                                    unsafe {
+                                        crate::rcl_vec_push(
+                                            __handle,
+                                            (__elem as *const #elem_ty) as *const u8,
+                                        );
                                     }
-                                    __handle
                                 }
+                                __handle
                             }
-                        })),
-                        returns_managed_handle: false,
-                    });
-                }
+                        }
+                    })),
+                    returns_managed_handle: false,
+                });
             }
             return Err(format!(
                 "#[dotnet_export]: `RustOwnedVec<{}>` supports passthrough primitive elements only",
@@ -6577,12 +6736,12 @@ fn render_rustdoc_xml(
 /// name, not its C#/Rust keyword (`System.Int32`, not `int`/`i32`).
 fn clr_member_id_type_name(ty: &Type) -> Option<String> {
     if let Type::Reference(r) = ty {
-        if r.mutability.is_none() {
-            if let Type::Path(tp) = &*r.elem {
-                if tp.qself.is_none() && tp.path.is_ident("str") {
-                    return Some("System.String".to_string());
-                }
-            }
+        if r.mutability.is_none()
+            && let Type::Path(tp) = &*r.elem
+            && tp.qself.is_none()
+            && tp.path.is_ident("str")
+        {
+            return Some("System.String".to_string());
         }
         if let Type::Slice(slice) = &*r.elem {
             let element = clr_member_id_type_name(&slice.elem)?;
@@ -6662,10 +6821,10 @@ fn clr_member_id_type_name(ty: &Type) -> Option<String> {
         }
     }
     let name = simple_path_ident(ty)?;
-    if let Some(class_name) = name.strip_suffix("Handle") {
-        if !class_name.is_empty() {
-            return Some(class_name.to_string());
-        }
+    if let Some(class_name) = name.strip_suffix("Handle")
+        && !class_name.is_empty()
+    {
+        return Some(class_name.to_string());
     }
     Some(
         match name.as_str() {
@@ -6710,13 +6869,13 @@ fn interface_member_id_type_name(
     if let Some(index) = bare_generic_param(ty, type_parameters) {
         return Some(format!("`{index}"));
     }
-    if let Type::Reference(reference) = ty {
-        if reference.mutability.is_some() {
-            return Some(format!(
-                "{}@",
-                interface_member_id_type_name(&reference.elem, type_parameters, method_parameters,)?
-            ));
-        }
+    if let Type::Reference(reference) = ty
+        && reference.mutability.is_some()
+    {
+        return Some(format!(
+            "{}@",
+            interface_member_id_type_name(&reference.elem, type_parameters, method_parameters,)?
+        ));
     }
     clr_member_id_type_name(ty)
 }
@@ -7107,18 +7266,18 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
     if sig.asyncness.is_some() {
         for input in &sig.inputs {
-            if let FnArg::Typed(argument) = input {
-                if matches!(
+            if let FnArg::Typed(argument) = input
+                && matches!(
                     &*argument.ty,
                     Type::Reference(reference) if matches!(&*reference.elem, Type::Slice(_))
-                ) {
-                    return syn::Error::new(
+                )
+            {
+                return syn::Error::new(
                         argument.ty.span(),
                         "#[dotnet_export]: Span<T>/ReadOnlySpan<T> parameters are synchronous-only and cannot be retained by an async export; use Memory<T>/ReadOnlyMemory<T>",
                     )
                     .to_compile_error()
                     .into();
-                }
             }
         }
         if export_args.error_exception || export_args.error_managed {
@@ -7299,7 +7458,7 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = sig.ident.clone();
     let (managed_name, export_attribute) = match export_args.name.as_ref() {
         Some(managed_name) => {
-            let name_literal = LitStr::new(&managed_name, fn_name.span());
+            let name_literal = LitStr::new(managed_name, fn_name.span());
             (
                 managed_name.clone(),
                 quote! { #[unsafe(export_name = #name_literal)] },
@@ -7507,26 +7666,24 @@ pub fn dotnet_export(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Scrape Rustdoc into a standard IntelliSense member entry after the complete managed shape is
     // known. Best-effort: documentation generation must never turn a valid build into a failure.
-    if doc_param_types_complete {
-        if let Some(doc) = scrape_doc_comment(&func.attrs) {
-            let exceptions = if export_args.error_exception || export_args.error_managed {
-                vec![XmlDocException {
-                    cref: "T:System.Exception",
-                    fallback: "Thrown when the Rust operation returns an error.",
-                }]
-            } else {
-                Vec::new()
-            };
-            emit_xmldoc_entry(
-                &managed_name,
-                &doc_param_types,
-                &doc,
-                &doc_param_names,
-                documented_return_has_value(&sig.output),
-                &[],
-                &exceptions,
-            );
-        }
+    if doc_param_types_complete && let Some(doc) = scrape_doc_comment(&func.attrs) {
+        let exceptions = if export_args.error_exception || export_args.error_managed {
+            vec![XmlDocException {
+                cref: "T:System.Exception",
+                fallback: "Thrown when the Rust operation returns an error.",
+            }]
+        } else {
+            Vec::new()
+        };
+        emit_xmldoc_entry(
+            &managed_name,
+            &doc_param_types,
+            &doc,
+            &doc_param_names,
+            documented_return_has_value(&sig.output),
+            &[],
+            &exceptions,
+        );
     }
 
     let raw_call = quote! {{

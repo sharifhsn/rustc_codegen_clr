@@ -141,43 +141,8 @@ impl Default for Guid {
     }
 }
 
-impl core::fmt::Display for Guid {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // `Guid.ToString()` yields the canonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form; print
-        // its UTF-16 content through the idiomatic string wrapper, which decodes to Rust text.
-        let s =
-            crate::system::DotNetString::from_handle((*self).vt_instance0::<"ToString", MString>());
-        core::fmt::Display::fmt(&s, f)
-    }
-}
-
-impl core::fmt::Debug for Guid {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Display::fmt(self, f)
-    }
-}
-
-impl PartialEq for Guid {
-    #[inline(always)]
-    fn eq(&self, other: &Self) -> bool {
-        self.equals(*other)
-    }
-}
-impl Eq for Guid {}
-
-impl PartialOrd for Guid {
-    #[inline(always)]
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for Guid {
-    #[inline(always)]
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        // `CompareTo` already returns the total-order sign, so map it straight onto `Ordering`.
-        self.compare_to(*other).cmp(&0)
-    }
-}
+impl_managed_display_value!(Guid);
+impl_managed_ordering!(Guid, equals);
 
 impl core::hash::Hash for Guid {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {

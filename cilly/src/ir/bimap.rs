@@ -461,8 +461,8 @@ impl<T> Interned<T> {
 impl<T: ?Sized> Clone for Interned<T> {
     fn clone(&self) -> Self {
         Self {
-            pd: self.pd.clone(),
-            idx: self.idx.clone(),
+            pd: self.pd,
+            idx: self.idx,
         }
     }
 }

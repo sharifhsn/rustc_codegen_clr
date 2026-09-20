@@ -56,5 +56,8 @@ examples/**/target/
 *.runtimeconfig.json
 # macOS debug-symbol bundles from running compiled test binaries
 *.dSYM/
+# Python harness bytecode is local execution output, not producer source material.
+__pycache__/
+*.py[cod]
 # bench_rs_vs_cs benchmark artifacts (rebuildable, not source)
 cargo_tests/bench_rs_vs_cs/binaries/

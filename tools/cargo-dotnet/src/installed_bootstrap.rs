@@ -22,10 +22,7 @@ const BUILD_ID_RECEIPT_SUFFIX: &[u8] = b":CARGO_DOTNET_BUILD_ID_RECEIPT_V1_END";
 
 pub(crate) fn binary_build_id(bytes: &[u8]) -> Result<String> {
     let mut identities = std::collections::BTreeSet::new();
-    for start in 0..bytes.len().saturating_sub(BUILD_ID_RECEIPT_PREFIX.len()) {
-        if !bytes[start..].starts_with(BUILD_ID_RECEIPT_PREFIX) {
-            continue;
-        }
+    for start in memchr::memmem::find_iter(bytes, BUILD_ID_RECEIPT_PREFIX) {
         let value_start = start + BUILD_ID_RECEIPT_PREFIX.len();
         let limit = bytes
             .len()
@@ -68,57 +65,43 @@ pub(crate) fn enter() -> Result<Entry> {
         crate::mode::Mode::Installed { home } => home,
     };
     let current = std::env::current_exe().context("locating running cargo-dotnet")?;
-    let mut recovered = false;
-    loop {
-        let coordination = LaunchCoordinationLease::acquire(&home)?;
-        pre_main_test_barrier()?;
-        if crate::install_transaction::has_pending(&home)? {
-            drop(coordination);
-            if recovered {
-                bail!("installed SDK activation journal remained after recovery");
-            }
-            crate::install_transaction::recover(&home)?;
-            recovered = true;
-            continue;
-        }
-
-        let inside_home = executable_is_inside_home(&current, &home)?;
-        let mutating = raw_command_mutates_home(std::env::args_os());
-        if !inside_home {
-            if mutating {
-                // Setup and bundle-install are the writers themselves. They must not retain the
-                // shared side while acquiring activation's exclusive side.
-                drop(coordination);
-                return Ok(Entry::Continue(None));
-            }
-            let driver = home_driver(&home);
-            if !driver.is_file() {
-                bail!("{}", crate::context::missing_install_home_message(&home));
-            }
-            // Coordination remains alive across pathname resolution, process creation, and the
-            // complete child lifetime. The child also validates its embedded identity.
-            let mut child = Command::new(&driver);
-            child.args(std::env::args_os().skip(1));
-            child.env_remove("CARGO_DOTNET_TEST_PRE_MAIN_READY");
-            child.env_remove("CARGO_DOTNET_TEST_PRE_MAIN_RELEASE");
-            let status = child
-                .status()
-                .with_context(|| format!("starting installed SDK driver {}", driver.display()))?;
-            drop(coordination);
-            return Ok(Entry::Exit(status.code().unwrap_or(1)));
-        }
-
-        crate::bundle::validate_loaded_driver_identity(&home, EMBEDDED_DRIVER_BUILD_ID)?;
+    let coordination = LaunchCoordinationLease::acquire(&home)?;
+    pre_main_test_barrier()?;
+    let inside_home = executable_is_inside_home(&current, &home)?;
+    let mutating = raw_command_mutates_home(std::env::args_os());
+    if !inside_home {
         if mutating {
+            // Setup and bundle-install are the writers themselves. They must not retain the
+            // shared side while acquiring activation's exclusive side.
             drop(coordination);
             return Ok(Entry::Continue(None));
         }
-        // Lock ordering matches activation: fixed coordination first, then the hashed home lock.
-        // Once the lifetime lease is held, coordination can be released without a deletion gap.
-        let lease = InstalledHomeLease::acquire(&home)?;
+        let driver = home_driver(&home);
+        if !driver.is_file() {
+            bail!("{}", crate::context::missing_install_home_message(&home));
+        }
+        // Coordination remains alive across pathname resolution, process creation, and the
+        // complete child lifetime. The child also validates its embedded identity.
+        let mut child = Command::new(&driver);
+        child.args(std::env::args_os().skip(1));
+        child.env_remove("CARGO_DOTNET_TEST_PRE_MAIN_READY");
+        child.env_remove("CARGO_DOTNET_TEST_PRE_MAIN_RELEASE");
+        let status = child
+            .status()
+            .with_context(|| format!("starting installed SDK driver {}", driver.display()))?;
         drop(coordination);
-        return Ok(Entry::Continue(Some(lease)));
+        return Ok(Entry::Exit(status.code().unwrap_or(1)));
     }
+
+    crate::bundle::validate_loaded_driver_identity(&home, EMBEDDED_DRIVER_BUILD_ID)?;
+    if mutating {
+        drop(coordination);
+        return Ok(Entry::Continue(None));
+    }
+    // Once the lifetime lease is held, coordination can be released without a deletion gap.
+    let lease = InstalledHomeLease::acquire(&home)?;
+    drop(coordination);
+    Ok(Entry::Continue(Some(lease)))
 }
 
 fn executable_is_inside_home(executable: &Path, home: &Path) -> Result<bool> {
@@ -176,6 +159,28 @@ fn pre_main_test_barrier() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_build_id_requires_one_valid_receipt() {
+        let identity = format!("source-sha256:{}", "a".repeat(64));
+        let receipt = [
+            BUILD_ID_RECEIPT_PREFIX,
+            identity.as_bytes(),
+            BUILD_ID_RECEIPT_SUFFIX,
+        ]
+        .concat();
+        let mut image = b"unrelated executable prefix".to_vec();
+        image.extend_from_slice(&receipt);
+        image.extend_from_slice(b"unrelated executable suffix");
+        assert_eq!(binary_build_id(&image).unwrap(), identity);
+
+        let conflicting_identity = format!("source-sha256:{}", "b".repeat(64));
+        image.extend_from_slice(BUILD_ID_RECEIPT_PREFIX);
+        image.extend_from_slice(conflicting_identity.as_bytes());
+        image.extend_from_slice(BUILD_ID_RECEIPT_SUFFIX);
+        assert!(binary_build_id(&image).is_err());
+        assert!(binary_build_id(b"no receipt").is_err());
+    }
 
     #[test]
     fn raw_writer_detection_handles_cargo_and_direct_forms() {

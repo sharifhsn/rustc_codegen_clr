@@ -145,46 +145,29 @@ impl<T> IntoAsmIndex<T> for T {
         self
     }
 }
-impl IntoAsmIndex<Interned<IString>> for &str {
-    fn into_idx(self, asm: &mut Assembly) -> Interned<IString> {
-        asm.alloc_string(self)
-    }
+
+macro_rules! impl_into_asm_index {
+    ($source:ty => $target:ty, $allocator:ident) => {
+        impl IntoAsmIndex<$target> for $source {
+            fn into_idx(self, asm: &mut Assembly) -> $target {
+                asm.$allocator(self)
+            }
+        }
+    };
 }
-impl IntoAsmIndex<Interned<IString>> for IString {
-    fn into_idx(self, asm: &mut Assembly) -> Interned<IString> {
-        asm.alloc_string(self)
-    }
-}
-impl IntoAsmIndex<Interned<IString>> for String {
-    fn into_idx(self, asm: &mut Assembly) -> Interned<IString> {
-        asm.alloc_string(self)
-    }
-}
-impl IntoAsmIndex<Interned<Type>> for Type {
-    fn into_idx(self, asm: &mut Assembly) -> Interned<Type> {
-        asm.alloc_type(self)
-    }
-}
-impl IntoAsmIndex<Interned<Type>> for Int {
-    fn into_idx(self, asm: &mut Assembly) -> Interned<Type> {
-        asm.alloc_type(self)
-    }
-}
+
+impl_into_asm_index!(&str => Interned<IString>, alloc_string);
+impl_into_asm_index!(IString => Interned<IString>, alloc_string);
+impl_into_asm_index!(String => Interned<IString>, alloc_string);
+impl_into_asm_index!(Type => Interned<Type>, alloc_type);
+impl_into_asm_index!(Int => Interned<Type>, alloc_type);
 impl IntoAsmIndex<Interned<Type>> for Interned<ClassRef> {
     fn into_idx(self, asm: &mut Assembly) -> Interned<Type> {
         asm.alloc_type(Type::ClassRef(self))
     }
 }
-impl IntoAsmIndex<Interned<CILNode>> for CILNode {
-    fn into_idx(self, asm: &mut Assembly) -> Interned<CILNode> {
-        asm.alloc_node(self)
-    }
-}
-impl IntoAsmIndex<Interned<CILNode>> for Const {
-    fn into_idx(self, asm: &mut Assembly) -> Interned<CILNode> {
-        asm.alloc_node(self)
-    }
-}
+impl_into_asm_index!(CILNode => Interned<CILNode>, alloc_node);
+impl_into_asm_index!(Const => Interned<CILNode>, alloc_node);
 pub trait IntoIntType {
     fn int_type() -> Int;
 }

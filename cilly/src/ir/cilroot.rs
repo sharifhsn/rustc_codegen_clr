@@ -224,7 +224,6 @@ impl CILRoot {
     /// Returns a mutable reference to all the arguments of this CIL root, in the order they are evaluated.
     pub fn nodes_mut(&mut self) -> Box<[&mut Interned<CILNode>]> {
         match self {
-            CILRoot::Unreachable(_) => [].into(),
             CILRoot::StLoc(_, tree)
             | CILRoot::StArg(_, tree)
             | CILRoot::Ret(tree)
@@ -239,7 +238,8 @@ impl CILRoot {
             | CILRoot::Nop
             | CILRoot::InitFragmentBoundary
             | CILRoot::TerminateRegion { .. }
-            | CILRoot::ReThrow => [].into(),
+            | CILRoot::ReThrow
+            | CILRoot::Unreachable(_) => [].into(),
             CILRoot::Branch(info) => {
                 let (_, _, cond) = info.as_mut();
                 let Some(cond) = cond else { return [].into() };
@@ -296,7 +296,6 @@ impl CILRoot {
         node_map: &mut dyn FnMut(CILNode, &mut Assembly) -> CILNode,
     ) -> Self {
         match self {
-            CILRoot::Unreachable(_) => root_map(self, asm),
             CILRoot::StLoc(loc, val) => {
                 let val: CILNode = asm.get_node(val).clone().map(asm, node_map);
                 let root = CILRoot::StLoc(loc, asm.alloc_node(val));
@@ -333,7 +332,8 @@ impl CILRoot {
             | CILRoot::Nop
             | CILRoot::InitFragmentBoundary
             | CILRoot::ExitSpecialRegion { .. }
-            | CILRoot::ReThrow => root_map(self, asm),
+            | CILRoot::ReThrow
+            | CILRoot::Unreachable(_) => root_map(self, asm),
             CILRoot::TerminateRegion { protected, reason } => {
                 // Recurse into the single protected child root so optimizer/realloc passes that go
                 // through `map` see and rewrite it, then re-wrap.

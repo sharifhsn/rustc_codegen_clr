@@ -173,6 +173,7 @@ dependencies = [
  "clap",
  "clap-cargo",
  "fs2",
+ "memchr",
  "object",
  "pathdiff",
  "rust-dotnet-assets",
@@ -237,6 +238,7 @@ dependencies = [
  "rust-dotnet-sdk-core",
  "rustc-demangle",
  "serde",
+ "sha2",
 ]
 
 [[package]]

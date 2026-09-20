@@ -55,12 +55,13 @@
 //! REAL (BCL-backed): `TcpStream::{connect, read, write, peer_addr, socket_addr,
 //! shutdown, set_nodelay, nodelay, set_nonblocking}`; `TcpListener::{bind, accept,
 //! socket_addr, set_nonblocking}`; `UdpSocket::{bind, send_to, recv_from, recv,
-//! send, peer_addr, socket_addr, connect, set_nonblocking}`. The `*_vectored` /
-//! `read_buf` methods delegate to the `crate::io::default_*` adapters.
+//! send, peer_addr, socket_addr, connect, set_nonblocking}`; and deterministic
+//! `localhost`/`localhost.` resolution without an external DNS dependency. The
+//! `*_vectored` / `read_buf` methods delegate to the `crate::io::default_*` adapters.
 //!
 //! STUBBED to `Err(Unsupported)` / sensible default (os=dotnet-only): timeouts,
 //! `peek`/`peek_from`, `duplicate`, linger/keepalive/ttl/only_v6/broadcast/
-//! multicast, `take_error`, `lookup_host`.
+//! multicast, `take_error`, and non-localhost DNS resolution.
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use crate::fmt;
@@ -172,6 +173,32 @@ const TCP_BACKLOG: i32 = 128;
 const SHUT_READ: i32 = 0;
 const SHUT_WRITE: i32 = 1;
 const SHUT_BOTH: i32 = 2;
+
+macro_rules! unsupported_method {
+    ($name:ident() -> $ret:ty) => {
+        pub fn $name(&self) -> io::Result<$ret> {
+            unsupported()
+        }
+    };
+    ($name:ident($($arg:tt)+) -> $ret:ty) => {
+        pub fn $name(&self, $($arg)+) -> io::Result<$ret> {
+            unsupported()
+        }
+    };
+}
+
+macro_rules! default_method {
+    ($name:ident() -> $ret:ty = $value:expr) => {
+        pub fn $name(&self) -> io::Result<$ret> {
+            Ok($value)
+        }
+    };
+    ($name:ident($($arg:tt)+) -> $ret:ty = $value:expr) => {
+        pub fn $name(&self, $($arg)+) -> io::Result<$ret> {
+            Ok($value)
+        }
+    };
+}
 
 // ===========================================================================
 // The unified fd-backed Socket
@@ -290,28 +317,11 @@ impl Socket {
         Ok(unsafe { Socket::from_raw_fd(fd) })
     }
 
-    pub fn duplicate(&self) -> io::Result<Socket> {
-        // No clean BCL path to clone a Socket handle into an independent fd. STUB.
-        unsupported()
-    }
-
-    /// `set_timeout(dur, kind)` where `kind` is `SO_RCVTIMEO`/`SO_SNDTIMEO`. STUB.
-    pub fn set_timeout(&self, _dur: Option<Duration>, _kind: i32) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn timeout(&self, _kind: i32) -> io::Result<Option<Duration>> {
-        Ok(None)
-    }
-
-    /// SO_MARK (Linux-only socket option). STUB (no managed equivalent).
-    pub fn set_mark(&self, _mark: u32) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        Ok(None)
-    }
+    unsupported_method!(duplicate() -> Socket);
+    unsupported_method!(set_timeout(_dur: Option<Duration>, _kind: i32) -> ());
+    default_method!(timeout(_kind: i32) -> Option<Duration> = None);
+    unsupported_method!(set_mark(_mark: u32) -> ());
+    default_method!(take_error() -> Option<io::Error> = None);
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         // B2 Piece 1: REAL — rcl_dotnet_net_shutdown over the fd-table handle.
@@ -330,7 +340,6 @@ impl Socket {
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         // B2 Piece 1: REAL — rcl_dotnet_net_set_nonblocking (Socket.Blocking).
-        // SAFETY: live handle.
         let rc = unsafe { rcl_dotnet_net_set_nonblocking(self.handle(), nonblocking as i32) };
         if rc != 0 {
             return Err(io::const_error!(io::ErrorKind::Other, "set_nonblocking failed"));
@@ -341,50 +350,6 @@ impl Socket {
     pub fn peek(&self, _buf: &mut [u8]) -> io::Result<usize> {
         // MSG_PEEK-style peek has no clean fd-table-handle path here. STUB.
         unsupported()
-    }
-
-    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        // B2 Piece 1: REAL — rcl_dotnet_net_recv (same data-plane as TcpStream).
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // SAFETY: writable region; handle resolved fresh from the fd-table.
-        let n = unsafe { rcl_dotnet_net_recv(self.handle(), buf.as_mut_ptr(), buf.len()) };
-        let n = cvt(n)?;
-        Ok(n as usize)
-    }
-
-    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
-        crate::io::default_read_buf(|buf| self.read(buf), cursor)
-    }
-
-    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        crate::io::default_read_vectored(|b| self.read(b), bufs)
-    }
-
-    pub fn is_read_vectored(&self) -> bool {
-        false
-    }
-
-    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        // B2 Piece 1: REAL — rcl_dotnet_net_send.
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // SAFETY: readable region; live handle.
-        let n = unsafe { rcl_dotnet_net_send(self.handle(), buf.as_ptr(), buf.len()) };
-        if n < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "send failed"));
-        }
-        Ok(n as usize)
-    }
-
-    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        crate::io::default_write_vectored(|b| self.write(b), bufs)
-    }
-
-    pub fn is_write_vectored(&self) -> bool {
-        false
     }
 
     /// `send_with_flags(buf, MSG_NOSIGNAL)` from os::unix::net::UnixStream::write
@@ -516,6 +481,28 @@ fn rc(code: i32) -> io::Result<()> {
     }
 }
 
+fn recv(handle: *mut u8, buf: &mut [u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    cvt(unsafe { rcl_dotnet_net_recv(handle, buf.as_mut_ptr(), buf.len()) }).map(|n| n as usize)
+}
+
+fn send(handle: *mut u8, buf: &[u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let n = unsafe { rcl_dotnet_net_send(handle, buf.as_ptr(), buf.len()) };
+    if n < 0 {
+        return Err(io::const_error!(io::ErrorKind::Other, "send failed"));
+    }
+    Ok(n as usize)
+}
+
+fn set_nonblocking(handle: *mut u8, nonblocking: bool) -> io::Result<()> {
+    rc(unsafe { rcl_dotnet_net_set_nonblocking(handle, nonblocking as i32) })
+}
+
 // ===========================================================================
 // TcpStream
 // ===========================================================================
@@ -524,27 +511,160 @@ pub struct TcpStream {
     inner: Socket,
 }
 
+macro_rules! impl_socket_wrapper {
+    ($ty:ident) => {
+        impl AsInner<Socket> for $ty {
+            #[inline]
+            fn as_inner(&self) -> &Socket {
+                &self.inner
+            }
+        }
+
+        impl FromInner<Socket> for $ty {
+            #[inline]
+            fn from_inner(inner: Socket) -> $ty {
+                $ty { inner }
+            }
+        }
+
+        impl IntoInner<Socket> for $ty {
+            #[inline]
+            fn into_inner(self) -> Socket {
+                self.inner
+            }
+        }
+
+        impl fmt::Debug for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($ty))
+                    .field("fd", &self.inner.as_raw_fd())
+                    .finish()
+            }
+        }
+
+        impl $ty {
+            #[inline]
+            pub fn socket(&self) -> &Socket {
+                &self.inner
+            }
+
+            #[inline]
+            pub fn into_socket(self) -> Socket {
+                self.inner
+            }
+
+            pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+                set_nonblocking(self.inner.handle(), nonblocking)
+            }
+
+            /// The managed handle used by the dotnet `mio` readiness adapter.
+            pub fn dotnet_raw_handle(&self) -> *mut u8 {
+                self.inner.handle()
+            }
+
+            pub fn duplicate(&self) -> io::Result<$ty> {
+                unsupported()
+            }
+
+            pub fn set_ttl(&self, _: u32) -> io::Result<()> {
+                unsupported()
+            }
+
+            pub fn ttl(&self) -> io::Result<u32> {
+                unsupported()
+            }
+
+            pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+                Ok(None)
+            }
+        }
+    };
+}
+
+macro_rules! impl_socket_io {
+    ($ty:ident, $self:ident, $handle:expr) => {
+        impl $ty {
+            pub fn read(&$self, buf: &mut [u8]) -> io::Result<usize> {
+                recv($handle, buf)
+            }
+
+            pub fn read_buf(&$self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
+                crate::io::default_read_buf(|buf| $self.read(buf), cursor)
+            }
+
+            pub fn read_vectored(&$self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+                crate::io::default_read_vectored(|b| $self.read(b), bufs)
+            }
+
+            pub fn is_read_vectored(&$self) -> bool {
+                false
+            }
+
+            pub fn write(&$self, buf: &[u8]) -> io::Result<usize> {
+                send($handle, buf)
+            }
+
+            pub fn write_vectored(&$self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+                crate::io::default_write_vectored(|b| $self.write(b), bufs)
+            }
+
+            pub fn is_write_vectored(&$self) -> bool {
+                false
+            }
+        }
+    };
+}
+
+macro_rules! impl_socket_timeouts {
+    ($ty:ident) => {
+        impl $ty {
+            pub fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+                unsupported()
+            }
+
+            pub fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+                unsupported()
+            }
+
+            pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
+                Ok(None)
+            }
+
+            pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
+                Ok(None)
+            }
+        }
+    };
+}
+
+macro_rules! impl_connected_socket_addrs {
+    ($ty:ident) => {
+        impl $ty {
+            pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+                read_out_addr(|f, ip, p| unsafe {
+                    rcl_dotnet_net_peer_addr(self.inner.handle(), f, ip, p)
+                })
+            }
+
+            pub fn socket_addr(&self) -> io::Result<SocketAddr> {
+                read_out_addr(|f, ip, p| unsafe {
+                    rcl_dotnet_net_local_addr(self.inner.handle(), f, ip, p)
+                })
+            }
+        }
+    };
+}
+
+impl_socket_io!(Socket, self, self.handle());
+
 impl TcpStream {
-    /// The unified `Socket` backing this stream (for `os/fd/net.rs`).
-    #[inline]
-    pub fn socket(&self) -> &Socket {
-        &self.inner
-    }
-
-    /// Consume into the backing `Socket` (for `os/fd/net.rs` `into_raw_fd`).
-    #[inline]
-    pub fn into_socket(self) -> Socket {
-        self.inner
-    }
-
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
         let addr = first_addr(addr)?;
         let (family, ip, ip_len, port) = addr_parts(&addr);
         // SAFETY: `(ip.as_ptr(), ip_len)` is a readable octet buffer; the hook
         // returns an opaque handle (or null on failure).
         let handle = unsafe { rcl_dotnet_net_tcp_connect(family, ip.as_ptr(), ip_len, port) };
-        let inner = Socket::from_handle(handle)
-            .ok_or_else(|| io::const_error!(io::ErrorKind::Other, "tcp connect failed"))?;
+        let inner = Socket::from_handle(handle).ok_or_else(io::Error::last_os_error)?;
         Ok(TcpStream { inner })
     }
 
@@ -552,82 +672,7 @@ impl TcpStream {
         unsupported()
     }
 
-    pub fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
-        Ok(None)
-    }
-
-    pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
-        Ok(None)
-    }
-
-    pub fn peek(&self, _: &mut [u8]) -> io::Result<usize> {
-        unsupported()
-    }
-
-    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // SAFETY: writable region; the handle is resolved fresh from the fd-table.
-        let n = unsafe { rcl_dotnet_net_recv(self.inner.handle(), buf.as_mut_ptr(), buf.len()) };
-        // WouldBlock fix: the shim now returns -1/errno on a non-blocking recv
-        // race (errno=EAGAIN → ErrorKind::WouldBlock), so surface the real errno
-        // rather than a flat ErrorKind::Other — mio re-polls on WouldBlock.
-        let n = cvt(n)?;
-        Ok(n as usize)
-    }
-
-    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
-        crate::io::default_read_buf(|buf| self.read(buf), cursor)
-    }
-
-    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        crate::io::default_read_vectored(|b| self.read(b), bufs)
-    }
-
-    pub fn is_read_vectored(&self) -> bool {
-        false
-    }
-
-    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // SAFETY: readable region the hook only reads.
-        let n = unsafe { rcl_dotnet_net_send(self.inner.handle(), buf.as_ptr(), buf.len()) };
-        if n < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "send failed"));
-        }
-        Ok(n as usize)
-    }
-
-    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        crate::io::default_write_vectored(|b| self.write(b), bufs)
-    }
-
-    pub fn is_write_vectored(&self) -> bool {
-        false
-    }
-
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        read_out_addr(|f, ip, p|
-            // SAFETY: live handle; valid out-pointers.
-            unsafe { rcl_dotnet_net_peer_addr(self.inner.handle(), f, ip, p) })
-    }
-
-    pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        read_out_addr(|f, ip, p|
-            // SAFETY: see `peer_addr`.
-            unsafe { rcl_dotnet_net_local_addr(self.inner.handle(), f, ip, p) })
-    }
+    unsupported_method!(peek(_: &mut [u8]) -> usize);
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         let how = match how {
@@ -639,25 +684,10 @@ impl TcpStream {
         rc(unsafe { rcl_dotnet_net_shutdown(self.inner.handle(), how) })
     }
 
-    pub fn duplicate(&self) -> io::Result<TcpStream> {
-        unsupported()
-    }
-
-    pub fn set_linger(&self, _: Option<Duration>) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn linger(&self) -> io::Result<Option<Duration>> {
-        Ok(None)
-    }
-
-    pub fn set_keepalive(&self, _: bool) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn keepalive(&self) -> io::Result<bool> {
-        Ok(false)
-    }
+    unsupported_method!(set_linger(_: Option<Duration>) -> ());
+    default_method!(linger() -> Option<Duration> = None);
+    unsupported_method!(set_keepalive(_: bool) -> ());
+    default_method!(keepalive() -> bool = false);
 
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         // SAFETY: live handle.
@@ -673,58 +703,12 @@ impl TcpStream {
         Ok(r != 0)
     }
 
-    pub fn set_ttl(&self, _: u32) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn ttl(&self) -> io::Result<u32> {
-        unsupported()
-    }
-
-    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        Ok(None)
-    }
-
-    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        // SAFETY: live handle.
-        rc(unsafe { rcl_dotnet_net_set_nonblocking(self.inner.handle(), nonblocking as i32) })
-    }
-
-    /// The opaque managed `GCHandle` `IntPtr` backing this socket, resolved fresh
-    /// through the fd-table. Bespoke accessor for the dotnet `mio` PAL arm (the
-    /// readiness Selector keys sockets by this handle, passing it to
-    /// `rcl_dotnet_socket_poll`).
-    pub fn dotnet_raw_handle(&self) -> *mut u8 {
-        self.inner.handle()
-    }
 }
 
-impl AsInner<Socket> for TcpStream {
-    #[inline]
-    fn as_inner(&self) -> &Socket {
-        &self.inner
-    }
-}
-
-impl FromInner<Socket> for TcpStream {
-    #[inline]
-    fn from_inner(inner: Socket) -> TcpStream {
-        TcpStream { inner }
-    }
-}
-
-impl IntoInner<Socket> for TcpStream {
-    #[inline]
-    fn into_inner(self) -> Socket {
-        self.inner
-    }
-}
-
-impl fmt::Debug for TcpStream {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TcpStream").field("fd", &self.inner.as_raw_fd()).finish()
-    }
-}
+impl_connected_socket_addrs!(TcpStream);
+impl_socket_timeouts!(TcpStream);
+impl_socket_io!(TcpStream, self, self.inner.handle());
+impl_socket_wrapper!(TcpStream);
 
 // ===========================================================================
 // TcpListener
@@ -735,16 +719,6 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    #[inline]
-    pub fn socket(&self) -> &Socket {
-        &self.inner
-    }
-
-    #[inline]
-    pub fn into_socket(self) -> Socket {
-        self.inner
-    }
-
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
         let addr = first_addr(addr)?;
         let (family, ip, ip_len, port) = addr_parts(&addr);
@@ -783,67 +757,12 @@ impl TcpListener {
         Ok((TcpStream { inner }, peer))
     }
 
-    pub fn duplicate(&self) -> io::Result<TcpListener> {
-        unsupported()
-    }
+    unsupported_method!(set_only_v6(_: bool) -> ());
+    unsupported_method!(only_v6() -> bool);
 
-    pub fn set_ttl(&self, _: u32) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn ttl(&self) -> io::Result<u32> {
-        unsupported()
-    }
-
-    pub fn set_only_v6(&self, _: bool) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn only_v6(&self) -> io::Result<bool> {
-        unsupported()
-    }
-
-    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        Ok(None)
-    }
-
-    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        // SAFETY: live handle.
-        rc(unsafe { rcl_dotnet_net_set_nonblocking(self.inner.handle(), nonblocking as i32) })
-    }
-
-    /// See `TcpStream::dotnet_raw_handle` — used by the dotnet `mio` PAL arm.
-    pub fn dotnet_raw_handle(&self) -> *mut u8 {
-        self.inner.handle()
-    }
 }
 
-impl AsInner<Socket> for TcpListener {
-    #[inline]
-    fn as_inner(&self) -> &Socket {
-        &self.inner
-    }
-}
-
-impl FromInner<Socket> for TcpListener {
-    #[inline]
-    fn from_inner(inner: Socket) -> TcpListener {
-        TcpListener { inner }
-    }
-}
-
-impl IntoInner<Socket> for TcpListener {
-    #[inline]
-    fn into_inner(self) -> Socket {
-        self.inner
-    }
-}
-
-impl fmt::Debug for TcpListener {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TcpListener").field("fd", &self.inner.as_raw_fd()).finish()
-    }
-}
+impl_socket_wrapper!(TcpListener);
 
 // ===========================================================================
 // UdpSocket
@@ -854,16 +773,6 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
-    #[inline]
-    pub fn socket(&self) -> &Socket {
-        &self.inner
-    }
-
-    #[inline]
-    pub fn into_socket(self) -> Socket {
-        self.inner
-    }
-
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
         let addr = first_addr(addr)?;
         let (family, ip, ip_len, port) = addr_parts(&addr);
@@ -874,18 +783,6 @@ impl UdpSocket {
         let inner = Socket::from_handle(handle)
             .ok_or_else(|| io::const_error!(io::ErrorKind::Other, "udp bind failed"))?;
         Ok(UdpSocket { inner })
-    }
-
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        read_out_addr(|f, ip, p|
-            // SAFETY: live handle; valid out-pointers.
-            unsafe { rcl_dotnet_net_peer_addr(self.inner.handle(), f, ip, p) })
-    }
-
-    pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        read_out_addr(|f, ip, p|
-            // SAFETY: live handle; valid out-pointers.
-            unsafe { rcl_dotnet_net_local_addr(self.inner.handle(), f, ip, p) })
     }
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -913,9 +810,7 @@ impl UdpSocket {
         Ok((n as usize, from))
     }
 
-    pub fn peek_from(&self, _: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        unsupported()
-    }
+    unsupported_method!(peek_from(_: &mut [u8]) -> (usize, SocketAddr));
 
     pub fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
         let (family, ip, ip_len, port) = addr_parts(addr);
@@ -938,123 +833,27 @@ impl UdpSocket {
         Ok(n as usize)
     }
 
-    pub fn duplicate(&self) -> io::Result<UdpSocket> {
-        unsupported()
-    }
-
-    pub fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
-        Ok(None)
-    }
-
-    pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
-        Ok(None)
-    }
-
-    pub fn set_broadcast(&self, _: bool) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn broadcast(&self) -> io::Result<bool> {
-        Ok(false)
-    }
-
-    pub fn set_multicast_loop_v4(&self, _: bool) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn multicast_loop_v4(&self) -> io::Result<bool> {
-        Ok(false)
-    }
-
-    pub fn set_multicast_ttl_v4(&self, _: u32) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn multicast_ttl_v4(&self) -> io::Result<u32> {
-        unsupported()
-    }
-
-    pub fn set_multicast_loop_v6(&self, _: bool) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn multicast_loop_v6(&self) -> io::Result<bool> {
-        Ok(false)
-    }
-
-    pub fn join_multicast_v4(&self, _: &Ipv4Addr, _: &Ipv4Addr) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn join_multicast_v6(&self, _: &Ipv6Addr, _: u32) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn leave_multicast_v4(&self, _: &Ipv4Addr, _: &Ipv4Addr) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn leave_multicast_v6(&self, _: &Ipv6Addr, _: u32) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn set_ttl(&self, _: u32) -> io::Result<()> {
-        unsupported()
-    }
-
-    pub fn ttl(&self) -> io::Result<u32> {
-        unsupported()
-    }
-
-    pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        Ok(None)
-    }
-
-    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        // SAFETY: live handle.
-        rc(unsafe { rcl_dotnet_net_set_nonblocking(self.inner.handle(), nonblocking as i32) })
-    }
-
-    /// See `TcpStream::dotnet_raw_handle` — used by the dotnet `mio` PAL arm (the
-    /// loopback waker socket is a `UdpSocket` registered for readiness).
-    pub fn dotnet_raw_handle(&self) -> *mut u8 {
-        self.inner.handle()
-    }
+    unsupported_method!(set_broadcast(_: bool) -> ());
+    default_method!(broadcast() -> bool = false);
+    unsupported_method!(set_multicast_loop_v4(_: bool) -> ());
+    default_method!(multicast_loop_v4() -> bool = false);
+    unsupported_method!(set_multicast_ttl_v4(_: u32) -> ());
+    unsupported_method!(multicast_ttl_v4() -> u32);
+    unsupported_method!(set_multicast_loop_v6(_: bool) -> ());
+    default_method!(multicast_loop_v6() -> bool = false);
+    unsupported_method!(join_multicast_v4(_: &Ipv4Addr, _: &Ipv4Addr) -> ());
+    unsupported_method!(join_multicast_v6(_: &Ipv6Addr, _: u32) -> ());
+    unsupported_method!(leave_multicast_v4(_: &Ipv4Addr, _: &Ipv4Addr) -> ());
+    unsupported_method!(leave_multicast_v6(_: &Ipv6Addr, _: u32) -> ());
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // SAFETY: writable region.
-        let n = unsafe { rcl_dotnet_net_recv(self.inner.handle(), buf.as_mut_ptr(), buf.len()) };
-        // WouldBlock fix: surface the real errno (EAGAIN → WouldBlock) on a
-        // non-blocking recv race instead of a flat ErrorKind::Other.
-        let n = cvt(n)?;
-        Ok(n as usize)
+        recv(self.inner.handle(), buf)
     }
 
-    pub fn peek(&self, _: &mut [u8]) -> io::Result<usize> {
-        unsupported()
-    }
+    unsupported_method!(peek(_: &mut [u8]) -> usize);
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        // SAFETY: readable region. Requires a prior `connect`.
-        let n = unsafe { rcl_dotnet_net_send(self.inner.handle(), buf.as_ptr(), buf.len()) };
-        if n < 0 {
-            return Err(io::const_error!(io::ErrorKind::Other, "send failed"));
-        }
-        Ok(n as usize)
+        send(self.inner.handle(), buf)
     }
 
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
@@ -1065,46 +864,42 @@ impl UdpSocket {
     }
 }
 
-impl AsInner<Socket> for UdpSocket {
-    #[inline]
-    fn as_inner(&self) -> &Socket {
-        &self.inner
-    }
-}
-
-impl FromInner<Socket> for UdpSocket {
-    #[inline]
-    fn from_inner(inner: Socket) -> UdpSocket {
-        UdpSocket { inner }
-    }
-}
-
-impl IntoInner<Socket> for UdpSocket {
-    #[inline]
-    fn into_inner(self) -> Socket {
-        self.inner
-    }
-}
-
-impl fmt::Debug for UdpSocket {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UdpSocket").field("fd", &self.inner.as_raw_fd()).finish()
-    }
-}
+impl_connected_socket_addrs!(UdpSocket);
+impl_socket_timeouts!(UdpSocket);
+impl_socket_wrapper!(UdpSocket);
 
 // ===========================================================================
-// DNS (stubbed — numeric/loopback addrs are parsed std-side and never reach here)
+// Deterministic localhost resolution. Numeric addresses are parsed std-side and never reach here;
+// arbitrary DNS remains explicitly unsupported until the PAL owns a complete BCL-backed resolver
+// with portable error translation and ordering semantics.
 // ===========================================================================
 
-pub struct LookupHost(());
+pub struct LookupHost {
+    addrs: [SocketAddr; 2],
+    next: usize,
+}
 
 impl Iterator for LookupHost {
     type Item = SocketAddr;
     fn next(&mut self) -> Option<SocketAddr> {
-        None
+        let addr = self.addrs.get(self.next).copied();
+        if addr.is_some() {
+            self.next += 1;
+        }
+        addr
     }
 }
 
-pub fn lookup_host(_host: &str, _port: u16) -> io::Result<LookupHost> {
-    unsupported()
+pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if !host.eq_ignore_ascii_case("localhost") {
+        return unsupported();
+    }
+    Ok(LookupHost {
+        addrs: [
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0)),
+        ],
+        next: 0,
+    })
 }

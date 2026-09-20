@@ -205,8 +205,6 @@ fn add_mandatory_statics(asm: &mut cilly::Assembly) {
         false,
     );
 }
-static FORCE_FAIL: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("FORCE_FAIL").is_ok());
 static LIBC: std::sync::LazyLock<String> = std::sync::LazyLock::new(get_libc_);
 static LIBM: std::sync::LazyLock<String> = std::sync::LazyLock::new(get_libm_);
 static BACKUP_STD: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
@@ -220,49 +218,6 @@ static BACKUP_STD: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::n
         })
         .next()
 });
-#[cfg(target_os = "linux")]
-/// Candidate directories to search for shared libraries, multiarch-aware.
-/// Auto-discovers `*-linux-gnu` subdirs (e.g. `aarch64-linux-gnu`) so library
-/// lookup works on non-x86_64 hosts, where `/lib64` does not exist and libc
-/// lives under `/usr/lib/<triple>/` instead.
-fn linux_lib_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs: Vec<std::path::PathBuf> = ["/lib", "/usr/lib", "/lib64", "/usr/lib64"]
-        .iter()
-        .map(std::path::PathBuf::from)
-        .collect();
-    for base in ["/lib", "/usr/lib"] {
-        let Ok(rd) = std::fs::read_dir(base) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            if entry.file_name().to_string_lossy().ends_with("-linux-gnu")
-                && entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-            {
-                dirs.push(entry.path());
-            }
-        }
-    }
-    dirs
-}
-#[cfg(target_os = "linux")]
-/// Find a shared library whose file name contains `needle` (e.g. `"libc.so."`),
-/// falling back to the bare soname for the dynamic loader to resolve. Missing
-/// directories are skipped rather than panicked on.
-fn find_linux_lib(needle: &str, fallback: &str) -> String {
-    for dir in linux_lib_dirs() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            if entry.metadata().map(|m| m.is_file()).unwrap_or(false)
-                && entry.file_name().to_string_lossy().contains(needle)
-            {
-                return entry.path().to_string_lossy().into_owned();
-            }
-        }
-    }
-    fallback.to_owned()
-}
 #[cfg(target_os = "linux")]
 fn get_libc_() -> String {
     // Let CoreCLR apply its platform DllImport resolution. Embedding the build host's absolute
@@ -391,22 +346,6 @@ fn main() {
     let no_unwind = effective_abi_config.no_unwind();
     let pool_alloc = linker_config.pool_alloc;
     let panic_managed_backtrace = linker_config.panic_managed_backtrace;
-    /*
-       {
-           let msg = final_assembly.alloc_string("Starting constant initialization");
-           let msg = final_assembly.alloc_node(Const::PlatformString(msg));
-           let console = ClassRef::console(&mut final_assembly);
-           let fn_name = final_assembly.alloc_string("WriteLine");
-           let mref = final_assembly.class_ref(console).clone().static_mref(
-               &[Type::PlatformString],
-               Type::Void,
-               fn_name,
-               &mut final_assembly,
-           );
-           let stat = final_assembly.alloc_root(CILRoot::call(((mref, [msg].into()))));
-           final_assembly.add_cctor(&[stat]);
-       }
-    */
     let path: std::path::PathBuf = out_path.into();
 
     let is_lib = out_path.contains(".dll") || out_path.contains(".so") || out_path.contains(".o");
@@ -498,6 +437,9 @@ fn main() {
     // `std_detect` may retain LLVM's native XCR0 reader in debug builds. Managed code cannot
     // execute `xgetbv`; report no extended state so feature detection remains conservative.
     cilly::builtins::x86::xgetbv_unavailable(&mut final_assembly, &mut overrides);
+    // The matching AVX transition instruction only affects native register state; CIL has no
+    // exposed upper-vector state, so preserve the intrinsic's Rust-visible no-op semantics.
+    cilly::builtins::x86::vzeroupper_noop(&mut final_assembly, &mut overrides);
 
     overrides.insert(
         final_assembly.alloc_string("_Unwind_DeleteException"),
@@ -557,6 +499,7 @@ fn main() {
     cilly::builtins::int128::generate_int128_ops(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::i128_mul_ovf_check(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::u128_mul_ovf_check(&mut final_assembly, &mut overrides);
+    cilly::builtins::int_to_float::insert_int_to_float(&mut final_assembly, &mut overrides);
     cilly::builtins::int128::generate_x86_wide_carry(&mut final_assembly, &mut overrides);
     cilly::builtins::f16::generate_f16_ops(&mut final_assembly, &mut overrides);
     cilly::builtins::atomics::generate_all_atomics(
@@ -679,9 +622,6 @@ fn main() {
     final_assembly
         .save_tmp(&mut std::fs::File::create(path.with_extension("cilly2")).unwrap())
         .unwrap();
-    if *FORCE_FAIL {
-        panic!("FORCE_FAIL");
-    }
     {
         // Hand-rolled ECMA-335 PE writer (`cilly::pe_exporter`) — bypasses `ilasm` entirely.
         //

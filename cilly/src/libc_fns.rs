@@ -815,14 +815,3 @@ pub fn f128_support_lib() -> Option<PathBuf> {
 pub fn f128_support_lib() -> Option<PathBuf> {
     None
 }
-/*
-"pthread_atfork",
-"pthread_attr_destroy",
-"pthread_attr_init",
-"pthread_attr_setstacksize",
-"pthread_create",
-"pthread_detach",
-"pthread_join",
-"pthread_self",
-"pthread_setname_np",
-*/

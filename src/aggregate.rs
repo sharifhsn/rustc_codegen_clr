@@ -4,11 +4,11 @@ use crate::r#type::{
     GetTypeExt,
     adt::{enum_tag_info, field_descrptor},
     escape_field_name, get_type,
-    utilis::{is_zst, ptr_is_fat, simple_tuple},
+    utilis::{instance_try_resolve, is_zst, ptr_is_fat, rust_tuple_name},
 };
 use crate::{
     assembly::MethodCompileCtx,
-    utilis::{adt::set_discr, field_name, instance_try_resolve, variant_name},
+    utilis::{adt::set_discr, field_name, variant_name},
 };
 use cilly::{
     Const, FieldDesc, FnSig, Int, Interned, MethodRef, Type,
@@ -23,6 +23,27 @@ use rustc_middle::{
 
 type Node = Interned<cilly::ir::CILNode>;
 type Root = Interned<cilly::ir::CILRoot>;
+
+fn set_aggregate_fields<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    value_index: &IndexVec<FieldIdx, Operand<'tcx>>,
+    owner: Interned<cilly::ClassRef>,
+    address: Node,
+) -> Vec<Root> {
+    let mut sub_trees = vec![];
+    for (index, value) in value_index.iter_enumerated() {
+        let field_ty = ctx.monomorphize(value.ty(ctx.body(), ctx.tcx()));
+        let field_type = get_type(field_ty, ctx);
+        if field_type == cilly::Type::Void {
+            continue;
+        }
+        let field_name = ctx.alloc_string(format!("f_{}", index.as_u32()));
+        let value = handle_operand(value, ctx);
+        let desc = ctx.alloc_field(FieldDesc::new(owner, field_name, field_type));
+        sub_trees.push(ctx.set_field(desc, address, value));
+    }
+    sub_trees
+}
 
 /// Returns the CIL ops to create the aggreagate value specifed by `aggregate_kind` at `dst_place`. Uses indivlidual values specifed by `value_index`
 pub fn handle_aggregate<'tcx>(
@@ -102,6 +123,7 @@ pub fn handle_aggregate<'tcx>(
         }
         AggregateKind::Tuple => {
             let tuple_getter = place_address(dst_place, ctx);
+            let destination_ty = ctx.monomorphize(dst_place.ty(ctx.body(), ctx.tcx()).ty);
             let types: Vec<_> = value_index
                 .iter()
                 .map(|operand| {
@@ -109,7 +131,20 @@ pub fn handle_aggregate<'tcx>(
                     get_type(operand_ty, ctx)
                 })
                 .collect();
-            let dotnet_tpe = simple_tuple(&types, ctx);
+            let destination_layout = ctx.layout_of(destination_ty).layout;
+            let field_offsets = (0..types.len())
+                .map(|index| destination_layout.fields.offset(index).bytes())
+                .collect::<Vec<_>>();
+            let tuple_name = rust_tuple_name(
+                &types,
+                ctx,
+                destination_layout.size().bytes(),
+                destination_layout.align().abi.bytes(),
+                &field_offsets,
+            );
+            let tuple_name = ctx.alloc_string(tuple_name);
+            let dotnet_tpe =
+                ctx.alloc_class_ref(cilly::ClassRef::new(tuple_name, None, true, [].into()));
             let mut sub_trees = Vec::new();
             for field in &values {
                 // Assigining to a Void field is a NOP and must be skipped(since it can have wierd side-effects).
@@ -134,19 +169,7 @@ pub fn handle_aggregate<'tcx>(
             let closure_type = get_type(closure_ty, ctx);
             let closure_dotnet = closure_type.as_class_ref().expect("Invalid closure type!");
             let closure_getter = place_address(dst_place, ctx);
-            let mut sub_trees = vec![];
-            for (index, value) in value_index.iter_enumerated() {
-                let field_ty = ctx.monomorphize(value.ty(ctx.body(), ctx.tcx()));
-                let field_type = get_type(field_ty, ctx);
-                if field_type == cilly::Type::Void {
-                    continue;
-                }
-                let field_name = ctx.alloc_string(format!("f_{}", index.as_u32()));
-                let value = handle_operand(value, ctx);
-                let desc = ctx.alloc_field(FieldDesc::new(closure_dotnet, field_name, field_type));
-                let root = ctx.set_field(desc, closure_getter, value);
-                sub_trees.push(root);
-            }
+            let sub_trees = set_aggregate_fields(ctx, value_index, closure_dotnet, closure_getter);
 
             (sub_trees, (place_get(dst_place, ctx)))
         }
@@ -157,19 +180,8 @@ pub fn handle_aggregate<'tcx>(
                 .as_class_ref()
                 .expect("Invalid closure type!");
             let closure_getter = place_address(dst_place, ctx);
-            let mut sub_trees = vec![];
-            for (index, value) in value_index.iter_enumerated() {
-                let field_ty = ctx.monomorphize(value.ty(ctx.body(), ctx.tcx()));
-                let field_type = get_type(field_ty, ctx);
-                if field_type == cilly::Type::Void {
-                    continue;
-                }
-                let field_name = ctx.alloc_string(format!("f_{}", index.as_u32()));
-                let value = handle_operand(value, ctx);
-                let desc = ctx.alloc_field(FieldDesc::new(closure_dotnet, field_name, field_type));
-                let root = ctx.set_field(desc, closure_getter, value);
-                sub_trees.push(root);
-            }
+            let mut sub_trees =
+                set_aggregate_fields(ctx, value_index, closure_dotnet, closure_getter);
             let layout = ctx.layout_of(coroutine_ty);
             let (disrc_type, _) = enum_tag_info(layout.layout, ctx);
             if disrc_type != Type::Void {

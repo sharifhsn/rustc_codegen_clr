@@ -8,7 +8,7 @@ use cilly::cilnode::ExtendKind;
 use cilly::{BinOp, Const, IntoAsmIndex, Type};
 use cilly::{FieldDesc, Int, Interned};
 use rustc_abi::{BackendRepr, FieldIdx};
-use rustc_hir::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::{
     mir::{Operand, Place},
     traits::{self, ImplSource},
@@ -271,7 +271,7 @@ fn pointer_leaf<'tcx>(layout: TyAndLayout<'tcx>) -> (Ty<'tcx>, bool) {
     };
     let is_fat = match layout.layout.0.0.backend_repr {
         BackendRepr::Scalar(_) => false,
-        BackendRepr::ScalarPair(_, _) => true,
+        BackendRepr::ScalarPair { .. } => true,
         ref other => panic!("pointer leaf {:?} had non-pointer ABI {other:?}", layout.ty),
     };
     (pointee, is_fat)

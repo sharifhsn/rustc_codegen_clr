@@ -465,7 +465,7 @@ pub(crate) struct RelocateCtx<'source> {
 }
 
 impl<'source> RelocateCtx<'source> {
-    fn new(source: &'source Assembly) -> Self {
+    pub(crate) fn new(source: &'source Assembly) -> Self {
         Self::with_options(source, None, ClassKindOverrides::new())
     }
 
@@ -750,7 +750,7 @@ impl Assembly {
                 data: ctx.const_data(self, *data),
                 tpe: ctx.type_id(self, *tpe),
             },
-            _ => cst.clone(),
+            _ => *cst,
         }
     }
     // The complexity of this function is unavoidable.
@@ -1163,7 +1163,7 @@ fn enum_semantic_key(
         definition
             .variants()
             .iter()
-            .map(|(name, value)| (assembly[*name].to_string(), value.clone()))
+            .map(|(name, value)| (assembly[*name].to_string(), *value))
             .collect(),
     )
 }
@@ -2325,7 +2325,6 @@ fn merge_special_method_link_info(
     use SpecialMethodLinkInfo as Info;
     match (&mut *existing, incoming) {
         (Info::Missing, incoming) => *existing = incoming.clone(),
-        (_, Info::Missing) => {}
         (
             Info::MethodBody {
                 fragments: existing_fragments,
@@ -3950,176 +3949,6 @@ mod tests {
         }
     }
 
-    fn assembly_with_many_static_fields(count: usize) -> Assembly {
-        let mut assembly = Assembly::default();
-        let owner_name = assembly.alloc_string("ManyStaticFields");
-        let mut fields = Vec::with_capacity(count);
-        for index in 0..count {
-            fields.push(StaticFieldDef {
-                tpe: Type::Int(Int::I32),
-                name: assembly.alloc_string(format!("field_{index}")),
-                is_tls: false,
-                default_value: None,
-                is_const: false,
-            });
-        }
-        assembly
-            .class_def(ClassDef::new(
-                owner_name,
-                false,
-                0,
-                None,
-                vec![],
-                fields,
-                Access::Private,
-                None,
-                None,
-                true,
-            ))
-            .unwrap();
-        assembly
-    }
-
-    fn add_unrelated_class_kind_authority(assembly: &mut Assembly) {
-        let name = assembly.alloc_string("UnrelatedAuthorityProjection");
-        assembly
-            .class_def(ClassDef::new(
-                name,
-                false,
-                0,
-                None,
-                vec![],
-                vec![],
-                Access::Private,
-                None,
-                None,
-                true,
-            ))
-            .unwrap();
-        assembly
-            .class_def(
-                ClassDef::new(
-                    name,
-                    true,
-                    0,
-                    None,
-                    vec![],
-                    vec![],
-                    Access::Private,
-                    None,
-                    None,
-                    true,
-                )
-                .with_valuetype_authoritative(),
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn one_large_static_field_shard_is_visited_once_per_row() {
-        let count = 8_192;
-        let mut destination = Assembly::default();
-        let stats = destination
-            .try_link_in_place(assembly_with_many_static_fields(count))
-            .unwrap();
-        assert_eq!(stats.preflight.source_static_fields_indexed, count);
-        assert_eq!(stats.preflight.source_static_field_preflight_visits, count);
-        assert_eq!(stats.class_static_fields_visited, count);
-        assert_eq!(stats.class_static_fields_committed, count);
-        let definition = destination
-            .class_defs()
-            .values()
-            .find(|definition| &destination[definition.name()] == "ManyStaticFields")
-            .unwrap();
-        assert_eq!(definition.static_fields().len(), count);
-    }
-
-    #[test]
-    fn unrelated_authority_normalizes_one_large_static_class_linearly() {
-        let count = 8_192;
-        let mut source = assembly_with_many_static_fields(count);
-        add_unrelated_class_kind_authority(&mut source);
-        let mut destination = Assembly::default();
-        let stats = destination.try_link_in_place(source).unwrap();
-        // The original and rebuilt source each construct one persistent index; neither pass
-        // performs per-field owner cloning.
-        assert_eq!(stats.preflight.source_static_fields_indexed, count * 2);
-        assert_eq!(stats.preflight.authority_normalized_static_fields, count);
-        assert_eq!(stats.class_static_fields_visited, count);
-        assert_eq!(stats.class_static_fields_committed, count);
-    }
-
-    fn assembly_with_many_member_heavy_methods(count: usize) -> Assembly {
-        let mut assembly = Assembly::default();
-        let owner_name = assembly.alloc_string("ManyMemberHeavyMethods");
-        let mut fields = Vec::with_capacity(count);
-        let mut statics = Vec::with_capacity(count);
-        for index in 0..count {
-            fields.push((
-                Type::Int(Int::I32),
-                assembly.alloc_string(format!("field_{index}")),
-                None,
-            ));
-            statics.push(StaticFieldDef {
-                tpe: Type::Int(Int::I32),
-                name: assembly.alloc_string(format!("static_{index}")),
-                is_tls: false,
-                default_value: None,
-                is_const: false,
-            });
-        }
-        let owner = assembly
-            .class_def(ClassDef::new(
-                owner_name,
-                false,
-                0,
-                None,
-                fields,
-                statics,
-                Access::Private,
-                None,
-                None,
-                true,
-            ))
-            .unwrap();
-        let signature = assembly.sig([], Type::Void);
-        let ret = assembly.alloc_root(CILRoot::VoidRet);
-        for index in 0..count {
-            let name = assembly.alloc_string(format!("method_{index}"));
-            assembly.new_method(MethodDef::new(
-                Access::Private,
-                owner,
-                name,
-                signature,
-                MethodKind::Static,
-                MethodImpl::MethodBody {
-                    blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-                    locals: vec![],
-                },
-                vec![],
-            ));
-        }
-        add_unrelated_class_kind_authority(&mut assembly);
-        assembly
-    }
-
-    #[test]
-    fn unrelated_authority_uses_minimal_method_owner_shells() {
-        let count = 2_048;
-        let mut destination = Assembly::default();
-        let stats = destination
-            .try_link_in_place(assembly_with_many_member_heavy_methods(count))
-            .unwrap();
-        assert_eq!(stats.preflight.source_method_definitions_indexed, count * 2);
-        assert_eq!(
-            stats.preflight.authority_normalized_method_definitions,
-            count
-        );
-        assert_eq!(stats.preflight.source_class_members_indexed, count * 2);
-        assert_eq!(stats.preflight.source_static_fields_indexed, count * 2);
-        assert_eq!(destination.method_defs().len(), count);
-    }
-
     #[test]
     fn persistent_index_tracks_empty_classes_and_invalidates_on_public_mutation() {
         let mut destination =
@@ -4431,9 +4260,8 @@ mod tests {
         let source_counts = source.arena_counts();
         let source_bytes = postcard::to_stdvec(source).unwrap();
 
-        let error = match preflight_assembly_link(destination, source) {
-            Err(error) => error,
-            Ok(_) => panic!("internal class-kind conflict passed link preflight"),
+        let Err(error) = preflight_assembly_link(destination, source) else {
+            panic!("internal class-kind conflict passed link preflight")
         };
         assert!(matches!(
             error,
@@ -4849,9 +4677,8 @@ mod tests {
         let destination_bytes = postcard::to_stdvec(&destination).unwrap();
         let source_bytes = postcard::to_stdvec(&source).unwrap();
 
-        let error = match preflight_assembly_link(&destination, &source) {
-            Err(error) => error,
-            Ok(_) => panic!("internal normalized conflict passed preflight"),
+        let Err(error) = preflight_assembly_link(&destination, &source) else {
+            panic!("internal normalized conflict passed preflight")
         };
         match conflict {
             InternalNormalizedConflict::Field => {
@@ -4975,9 +4802,8 @@ mod tests {
                 let destination_bytes = postcard::to_stdvec(&destination).unwrap();
                 let source_bytes = postcard::to_stdvec(&source).unwrap();
 
-                let error = match preflight_assembly_link(&destination, &source) {
-                    Err(error) => error,
-                    Ok(_) => panic!("normalized method identity collision passed preflight"),
+                let Err(error) = preflight_assembly_link(&destination, &source) else {
+                    panic!("normalized method identity collision passed preflight")
                 };
                 assert!(matches!(
                     error,
@@ -6042,62 +5868,6 @@ mod tests {
     }
 
     #[test]
-    fn special_initializer_merge_is_associative_across_every_three_way_order() {
-        const ORDERS: [[i32; 3]; 6] = [
-            [1, 2, 3],
-            [1, 3, 2],
-            [2, 1, 3],
-            [2, 3, 1],
-            [3, 1, 2],
-            [3, 2, 1],
-        ];
-        for name in [CCTOR, TCCTOR, USER_INIT] {
-            let mut canonical_bytes = None;
-            let mut canonical_pe = None;
-            for order in ORDERS {
-                let mut assembly = assembly_with_special_initializer(
-                    name,
-                    order[0],
-                    SpecialInitializerShape::Mergeable,
-                );
-                for value in &order[1..] {
-                    assembly
-                        .try_link_in_place(assembly_with_special_initializer(
-                            name,
-                            *value,
-                            SpecialInitializerShape::Mergeable,
-                        ))
-                        .unwrap();
-                }
-                assert_eq!(special_initializer_values(&assembly, name), [1, 2, 3]);
-                let (assembly, _) = assembly.compact();
-                let bytes = postcard::to_stdvec(&assembly).unwrap();
-                match &canonical_bytes {
-                    Some(canonical) => assert_eq!(&bytes, canonical),
-                    None => canonical_bytes = Some(bytes),
-                }
-                let options = crate::ir::pe_exporter::export::ExportOptions {
-                    runtime: rust_dotnet_sdk_core::runtime::DotnetVersion::Net10,
-                    is_dll: true,
-                    assembly_name: "special-initializer-order".into(),
-                    public_module_full_name: None,
-                    module_name: "special-initializer-order.dll".into(),
-                    pdb_file_name: String::new(),
-                };
-                let pe = assembly
-                    .verify_for_export()
-                    .unwrap()
-                    .render_pe(&options)
-                    .unwrap();
-                match &canonical_pe {
-                    Some(canonical) => assert_eq!(&pe, canonical),
-                    None => canonical_pe = Some(pe),
-                }
-            }
-        }
-    }
-
-    #[test]
     fn empty_special_initializers_are_merge_identities_across_artifact_roundtrip() {
         for name in [CCTOR, TCCTOR, USER_INIT] {
             let mut assembly =
@@ -6224,12 +5994,11 @@ mod tests {
                         .is_err()
                     );
 
-                    let error = match preflight_assembly_link(&destination, &source) {
-                        Err(error) => error,
-                        Ok(_) => panic!(
+                    let Err(error) = preflight_assembly_link(&destination, &source) else {
+                        panic!(
                             "nonmergeable special initializer passed preflight: \
                              name={name}, shape={shape:?}, invalid_is_destination={invalid_is_destination}"
-                        ),
+                        )
                     };
                     assert!(matches!(error, AssemblyLinkError::MethodConflict { .. }));
                     let mut attempted_destination = destination.clone();

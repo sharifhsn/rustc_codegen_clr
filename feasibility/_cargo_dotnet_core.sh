@@ -16,7 +16,7 @@
 #   /work        = the repo         (backend dylib in rcc-target volume, overlays, spec)
 #   CD_REL=1|0   release (default 1) | debug
 #   CD_RUN=1|0   build only (0) | build + run the produced apphost (1)
-#   CD_CLEAN=1|0 `cargo clean` first (rebuilds std; bulletproof)
+#   CD_CLEAN=1|0 `cargo clean` first (rebuilds std)
 #   CD_VERBOSE=1|0  unfiltered build log (default 0 = filtered like dev.sh)
 #   "$@"         = program args, forwarded to the .NET exe on `run`
 #
@@ -621,7 +621,7 @@ if [ -n "${CD_EXTRA_CARGO_FLAGS:-}" ]; then
   CARGOFLAGS+=($CD_EXTRA_CARGO_FLAGS)
 fi
 echo "==> cargo dotnet: building $(pwd) (profile=$PROFILE)"
-if [ "${CD_CLEAN:-0}" = 1 ]; then echo "==> cargo clean (full, bulletproof)"; cargo clean; fi
+if [ "${CD_CLEAN:-0}" = 1 ]; then echo "==> cargo clean"; cargo clean; fi
 # getrandom needs NO RUSTFLAGS: the dotnet_overlays/getrandom-{0.2,0.3,0.4} overlays
 # supply a self-contained `target_os="dotnet"` backend arm that calls the PAL CSPRNG
 # (rcl_dotnet_random_fill), so rand/ahash/uuid build with zero wiring. The old

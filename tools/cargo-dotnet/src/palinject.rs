@@ -19,9 +19,9 @@
 //!
 //! ANCHORS over ORDINALS: the bash keyed ~22 cfg_select! arms by "which 1-based
 //! cfg_select! block", which drifts every time upstream inserts a block (the
-//! thread_local `destructors`-shift saga that left `guard::enable` undefined). Here
-//! ONE injection ([`exit.rs` nth=2]) is the documented [`Anchor::Ordinal`] exception;
-//! everything else is [`Anchor::After`].
+//! thread_local `destructors`-shift saga that left `guard::enable` undefined). The
+//! production manifest uses [`Anchor::After`] throughout; [`Anchor::Ordinal`] remains
+//! available only for the engine's regression fixture.
 //!
 //! Rust string ops are platform-agnostic, so the BSD/GNU `sed -i` shim and the
 //! `perl -0`/`tr`/`paste`/`mktemp` text-processing all vanish — a real win for the
@@ -32,15 +32,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-/// Where a `CfgArm` is inserted. Anchors are STRONGLY preferred; the single
-/// `Ordinal` use is documented at its call site (exit.rs).
+/// Where a `CfgArm` is inserted. Anchors are STRONGLY preferred; ordinals remain available for
+/// historical fixture coverage but are not used by the production manifest.
 #[derive(Debug, Clone)]
 pub enum Anchor {
     /// Insert into the FIRST `cfg_select! {` that appears at or after a line
     /// containing this fixed string. Robust to block-count drift across nightlies.
     After(String),
-    /// Insert into the Nth (1-based) `cfg_select! {` in the file. The documented
-    /// exception: exit.rs's two cfg_select!s have no distinguishing nearby string.
+    /// Insert into the Nth (1-based) `cfg_select! {` in the file. Kept for historical fixture
+    /// coverage; production injections use the drift-resistant `After` anchor.
+    #[allow(dead_code)]
     Ordinal(usize),
 }
 
@@ -346,19 +347,46 @@ fn arm_blk1(body: &str) -> Injection {
 fn sys_targets() -> Vec<Target> {
     vec![
         // pal/mod.rs: declare + re-export the dotnet pal module.
-        Target { rel: "pal/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use self::dotnet::*;")] },
+        Target {
+            rel: "pal/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use self::dotnet::*;")],
+        },
         // alloc: the dotnet allocator (managed heap).
-        Target { rel: "alloc/mod.rs", injections: vec![arm_blk1("mod dotnet;")] },
-        Target { rel: "stdio/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")] },
-        Target { rel: "args/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")] },
-        Target { rel: "env/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")] },
-        Target { rel: "random/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")] },
-        Target { rel: "io/error/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")] },
+        Target {
+            rel: "alloc/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; use dotnet as imp;")],
+        },
+        Target {
+            rel: "stdio/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")],
+        },
+        Target {
+            rel: "args/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")],
+        },
+        Target {
+            rel: "env/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")],
+        },
+        Target {
+            rel: "random/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")],
+        },
+        Target {
+            rel: "io/error/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")],
+        },
         // time/mod.rs uses the `mod X; use X as imp;` cascade shape (re-exports
         // imp::{Instant,SystemTime,UNIX_EPOCH}); dotnet backs them with Stopwatch/DateTime.
-        Target { rel: "time/mod.rs", injections: vec![arm_blk1("mod dotnet; use dotnet as imp;")] },
+        Target {
+            rel: "time/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; use dotnet as imp;")],
+        },
         // thread/mod.rs: plain `pub use dotnet::*` cascade; System.Threading.Thread.
-        Target { rel: "thread/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")] },
+        Target {
+            rel: "thread/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")],
+        },
         // fs/mod.rs: `mod X; use X as imp;` shape. The arm body is WIDENED for the
         // target-family=unix flip: it imports the dotnet with_native_path (shadowing
         // the dropped free fn) and re-exports the unix cascade's chown family etc.
@@ -366,52 +394,73 @@ fn sys_targets() -> Vec<Target> {
         // load-bearing under the flip.
         Target {
             rel: "fs/mod.rs",
-            injections: vec![
-                arm_blk1(
-                    "mod dotnet; use dotnet as imp; #[cfg(target_family = \"unix\")] use dotnet::with_native_path; #[cfg(target_family = \"unix\")] pub use dotnet::{chown, fchown, lchown, mkfifo, chroot}; #[cfg(target_family = \"unix\")] pub(crate) use dotnet::debug_assert_fd_is_open;",
-                ),
-                // set_permissions_nofollow: route dotnet to the unimplemented! arm. The
-                // real-impl gate excludes dotnet; the stub gate includes it. (raw O_NOFOLLOW
-                // can't be expressed by the FileStream model — I4.)
-                Injection::Replace {
-                    find: "#[cfg(all(unix, not(target_os = \"vxworks\")))]".to_string(),
-                    with: "#[cfg(all(unix, not(target_os = \"vxworks\"), not(target_os = \"dotnet\")))]".to_string(),
-                    marker: "not(target_os = \"vxworks\"), not(target_os = \"dotnet\")".to_string(),
-                },
-                Injection::Replace {
-                    find: "#[cfg(any(not(unix), target_os = \"vxworks\"))]".to_string(),
-                    with: "#[cfg(any(not(unix), target_os = \"vxworks\", target_os = \"dotnet\"))]".to_string(),
-                    marker: "target_os = \"vxworks\", target_os = \"dotnet\"".to_string(),
-                },
-            ],
+            injections: vec![arm_blk1(
+                "mod dotnet; use dotnet as imp; #[cfg(target_family = \"unix\")] use dotnet::with_native_path; #[cfg(target_family = \"unix\")] pub use dotnet::{chown, fchown, lchown, mkfifo, chroot}; #[cfg(target_family = \"unix\")] pub(crate) use dotnet::debug_assert_fd_is_open;",
+            )],
         },
         // net/connection/mod.rs: the net IMPL cascade (TcpStream/TcpListener/UdpSocket
         // over System.Net.Sockets). net/mod.rs just re-exports connection::*.
-        Target { rel: "net/connection/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")] },
+        Target {
+            rel: "net/connection/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")],
+        },
         // paths/mod.rs: `mod X; use X as imp;`; REAL getcwd/current_exe/chdir/temp_dir.
-        Target { rel: "paths/mod.rs", injections: vec![arm_blk1("mod dotnet; use dotnet as imp;")] },
+        Target {
+            rel: "paths/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; use dotnet as imp;")],
+        },
         // CAP-1 libc-shim foundation arms (load-bearing under the families flip).
         // sys::fd — FileDesc(OwnedFd); the net Socket onion needs it. Load-bearing now.
-        Target { rel: "fd/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")] },
+        Target {
+            rel: "fd/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")],
+        },
         // sys::process — mirror unsupported + REAL getpid (Environment.ProcessId).
-        Target { rel: "process/mod.rs", injections: vec![arm_blk1("mod dotnet; use dotnet as imp;")] },
+        Target {
+            rel: "process/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; use dotnet as imp;")],
+        },
         // sys::pipe — PRESENT-but-Unsupported.
-        Target { rel: "pipe/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::{Pipe, pipe};")] },
+        Target {
+            rel: "pipe/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::{Pipe, pipe};")],
+        },
         // sys::sync::* + thread_parking — REAL multi-thread sync (Class-D keystone).
         // mutex = SemaphoreSlim; thread_parking = a counting-SemaphoreSlim-backed
         // Parker; once/rwlock then ride std's GENERIC queue impls (pure Parker +
         // atomics); condvar = a SemaphoreSlim wakeup-counter. See
         // docs/THREADING_PAL_RESEARCH.md + dotnet_pal/sys/sync/*/dotnet.rs.
-        Target { rel: "sync/mutex/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::Mutex;")] },
-        Target { rel: "sync/rwlock/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::RwLock;")] },
-        Target { rel: "sync/condvar/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::Condvar;")] },
-        Target { rel: "sync/once/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::{Once, OnceState};")] },
-        Target { rel: "sync/thread_parking/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::Parker;")] },
+        Target {
+            rel: "sync/mutex/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::Mutex;")],
+        },
+        Target {
+            rel: "sync/rwlock/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::RwLock;")],
+        },
+        Target {
+            rel: "sync/condvar/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::Condvar;")],
+        },
+        Target {
+            rel: "sync/once/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::{Once, OnceState};")],
+        },
+        Target {
+            rel: "sync/thread_parking/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::Parker;")],
+        },
         // sys::net::hostname — REAL (Environment.MachineName).
-        Target { rel: "net/hostname/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::hostname;")] },
+        Target {
+            rel: "net/hostname/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::hostname;")],
+        },
         // sys::io is_terminal — the only cfg_select! in io/mod.rs (nested in `mod
         // is_terminal {`); generic is_terminal<T>(_)->false form.
-        Target { rel: "io/mod.rs", injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")] },
+        Target {
+            rel: "io/mod.rs",
+            injections: vec![arm_blk1("mod dotnet; pub use dotnet::*;")],
+        },
         // thread_local/mod.rs: THREE arms, two ANCHOR-keyed (the destructors-shift
         // saga is precisely why ordinals are banned here).
         Target {
@@ -428,6 +477,19 @@ fn sys_targets() -> Vec<Target> {
                     "pub use dotnet::{Storage, thread_local_inner, value_align};",
                     Anchor::After("cfg_select! {".to_string()),
                 ),
+                // The thread PAL needs a crate-visible exit hook, but the
+                // storage arm above intentionally keeps its re-export surface
+                // identical to upstream's `os` arm. Insert this separate,
+                // target-gated root re-export so both pristine and previously
+                // injected sysroots migrate idempotently.
+                Injection::LineInsert {
+                    before: "/// The native TLS implementation needs".to_string(),
+                    lines: vec![
+                        "#[cfg(target_os = \"dotnet\")]".to_string(),
+                        "pub(crate) use dotnet::run_dtors;".to_string(),
+                    ],
+                    marker: "pub(crate) use dotnet::run_dtors;".to_string(),
+                },
                 // Guard arm: anchored on `pub(crate) mod guard {` (super::dotnet::enable).
                 arm(
                     "pub(crate) use super::dotnet::enable;",
@@ -445,10 +507,11 @@ fn sys_targets() -> Vec<Target> {
                 ),
             ],
         },
-        // exit.rs: the ONLY Ordinal in the whole manifest. block 1 is the file-level
-        // `unique_thread_exit` cascade; block 2 is the in-fn one inside `pub fn exit`.
-        // Its two cfg_select!s have no distinguishing nearby string, so Ordinal(2) is
-        // the documented exception. Declares + calls `rcl_dotnet_exit(code)`, which the
+        // exit.rs: the managed arm belongs to the cfg_select! inside `pub fn exit`. Anchor on
+        // that function rather than an ordinal: current rust-src has an additional file-level
+        // cfg_select! for runtime-symbol declarations, so the old ordinal silently landed in
+        // item context and produced an invalid `unsafe { ... }` arm. Declares + calls
+        // `rcl_dotnet_exit(code)`, which the
         // cilly linker maps to `System.Environment.Exit((int)code)` — a CLEAN managed
         // process-exit WITH the code (matching native rustc). We canNOT call `libc::exit`
         // here: std's in-tree libc shim does not declare `exit` (E0425). Previously this
@@ -459,7 +522,7 @@ fn sys_targets() -> Vec<Target> {
             injections: vec![arm(
                 "unsafe { unsafe extern \"C\" { fn rcl_dotnet_exit(code: i32) -> !; } rcl_dotnet_exit(code) }",
                 "unsafe { unsafe extern \"C\" { fn rcl_dotnet_exit(code: i32) -> !; } rcl_dotnet_exit(code) }",
-                Anchor::Ordinal(2),
+                Anchor::After("pub fn exit(code: i32) -> ! {".to_string()),
             )],
         },
         // personality/mod.rs: the eh_personality lang item (aborting stub; .NET's
@@ -606,10 +669,22 @@ fn dotnet_managed_thread_init<F: FnOnce() + Send>(handle: Thread, rust_start: F)
 }"#.to_string(),
                     marker: "rust_start_handle: *mut u8".to_string(),
                 },
-                Injection::Replace {
-                    find: "    pub fn init(self: Box<Self>) -> Box<dyn FnOnce() + Send> {".to_string(),
-                    with: "    #[cfg(not(target_os = \"dotnet\"))]\n    pub fn init(self: Box<Self>) -> Box<dyn FnOnce() + Send> {".to_string(),
-                    marker: "#[cfg(not(target_os = \"dotnet\"))]\n    pub fn init".to_string(),
+                Injection::ReplaceOneOf {
+                    alternatives: vec![
+                        (
+                            "    pub(crate) fn init(self: Box<Self>) -> Box<dyn FnOnce() + Send> {"
+                                .to_string(),
+                            "    #[cfg(not(target_os = \"dotnet\"))]\n    pub(crate) fn init(self: Box<Self>) -> Box<dyn FnOnce() + Send> {"
+                                .to_string(),
+                        ),
+                        (
+                            "    pub fn init(self: Box<Self>) -> Box<dyn FnOnce() + Send> {"
+                                .to_string(),
+                            "    #[cfg(not(target_os = \"dotnet\"))]\n    pub(crate) fn init(self: Box<Self>) -> Box<dyn FnOnce() + Send> {"
+                                .to_string(),
+                        ),
+                    ],
+                    marker: "#[cfg(not(target_os = \"dotnet\"))]\n    pub(crate) fn init(self".to_string(),
                 },
                 Injection::Replace {
                     find: "        self.rust_start\n    }\n}".to_string(),
@@ -892,6 +967,28 @@ pub fn patch_libc(libc_dir: &Path) -> Result<bool> {
         )?;
     }
     widen_dotnet_as_linux_in_tree(&libc_dir.join("new"))?;
+
+    // libc 0.2.189 moved the Linux ioctl literal helper behind a root-level cfg instead of the
+    // `unix/linux_like` tree.  The selected generic Linux module still references it for the
+    // dotnet target, so widen both the definition and its macro prelude export along with the
+    // platform tree above.  Keep these replacements exact and idempotent: they must not broaden
+    // unrelated Linux-only APIs in the public libc surface.
+    let types = libc_dir.join("types.rs");
+    if types.is_file() {
+        replace_in_file(
+            &types,
+            "#[cfg(any(target_os = \"linux\", target_os = \"android\", target_os = \"l4re\"))]\npub(crate) const fn u32_cast_ioctl",
+            "#[cfg(any(target_os = \"linux\", target_os = \"dotnet\", target_os = \"android\", target_os = \"l4re\"))]\npub(crate) const fn u32_cast_ioctl",
+        )?;
+    }
+    let macros = libc_dir.join("macros.rs");
+    if macros.is_file() {
+        replace_in_file(
+            &macros,
+            "            #[cfg(any(target_os = \"linux\", target_os = \"android\", target_os = \"l4re\"))]\n            pub(crate) use crate::types::u32_cast_ioctl;",
+            "            #[cfg(any(target_os = \"linux\", target_os = \"dotnet\", target_os = \"android\", target_os = \"l4re\"))]\n            pub(crate) use crate::types::u32_cast_ioctl;",
+        )?;
+    }
 
     // The old facade was always appended at EOF. Remove it before selecting the upstream tree, or
     // its glob export would collide with the canonical Unix definitions.

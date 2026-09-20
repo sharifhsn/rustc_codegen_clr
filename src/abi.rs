@@ -50,7 +50,7 @@ impl AbiPlan {
         let fn_abi = match fn_abi {
             Ok(abi) => abi,
             Err(error) => {
-                rustc_middle::bug!("`fn_abi_of_instance` failed for {function:?}: {error:?}")
+                rustc_span::bug!("`fn_abi_of_instance` failed for {function:?}: {error:?}")
             }
         };
         let fn_ty = function.ty(
@@ -61,7 +61,7 @@ impl AbiPlan {
             TyKind::FnDef(_, _) => fn_ty.fn_sig(ctx.tcx()).abi(),
             TyKind::Closure(_, args) => args.as_closure().sig().abi(),
             TyKind::Coroutine(_, _) => TargetAbi::Rust,
-            _ => rustc_middle::bug!(
+            _ => rustc_span::bug!(
                 "cannot derive ABI plan for instance type {fn_ty} ({:?})",
                 fn_ty.kind()
             ),
@@ -73,7 +73,9 @@ impl AbiPlan {
         let closure_instance = ctx.tcx().is_closure_like(function.def_id())
             || matches!(
                 function.def,
-                rustc_middle::ty::InstanceKind::ClosureOnceShim { .. }
+                rustc_middle::ty::InstanceKind::Shim(
+                    rustc_middle::ty::ShimKind::ClosureOnce { .. },
+                )
             );
         let first_arg_is_closure = fn_abi
             .args
@@ -146,7 +148,7 @@ impl AbiPlan {
     pub fn from_fn_ptr_ty<'tcx>(ty: Ty<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> Self {
         let ty = ctx.monomorphize(ty);
         let TyKind::FnPtr(signature, header) = ty.kind() else {
-            rustc_middle::bug!("expected fn-pointer type, got {ty:?}")
+            rustc_span::bug!("expected fn-pointer type, got {ty:?}")
         };
         Self::from_fn_ptr(signature.with(*header), ctx)
     }

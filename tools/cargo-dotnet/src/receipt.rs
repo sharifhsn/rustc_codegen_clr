@@ -44,6 +44,8 @@ struct BuildReceipt {
     private_sysroot_receipt: FileIdentity,
     cargo_home: String,
     cargo_arguments: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_target: Option<TestTargetReceipt>,
     backend: FileIdentity,
     linker: FileIdentity,
     target_spec: FileIdentity,
@@ -54,6 +56,17 @@ struct BuildReceipt {
     xml_docs: Option<FileIdentity>,
     managed_identity: Option<ManagedIdentityReceipt>,
     local_input_closure: Option<InputClosureIdentity>,
+}
+
+#[derive(Debug, Serialize)]
+struct TestTargetReceipt {
+    selector: String,
+    package_id: String,
+    artifact_name: String,
+    artifact_kind: Vec<String>,
+    target_dir: Option<String>,
+    locked: bool,
+    cargo_lock_sha256: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -79,15 +92,56 @@ pub fn write(
     artifact: &Artifact,
     sysroot: &PrivateSysroot,
 ) -> Result<Option<PathBuf>> {
+    write_receipt(ctx, artifact, sysroot, None)
+}
+
+pub fn write_with_test_target(
+    ctx: &Context,
+    artifact: &Artifact,
+    sysroot: &PrivateSysroot,
+    actual_target: crate::artifact::TestTargetIdentity,
+) -> Result<Option<PathBuf>> {
+    write_receipt(ctx, artifact, sysroot, Some(actual_target))
+}
+
+/// Remove any earlier receipt before a new invocation materializes runtime sidecars.
+/// A failed sidecar copy must never leave a successful-looking receipt from an older run.
+pub fn invalidate_for_artifact(artifact_path: &Path) -> Result<()> {
+    let path = PathBuf::from(format!(
+        "{}.rustdotnet.receipt.json",
+        artifact_path.display()
+    ));
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("invalidate prior artifact receipt {}", path.display())),
+    }
+}
+
+fn write_receipt(
+    ctx: &Context,
+    artifact: &Artifact,
+    sysroot: &PrivateSysroot,
+    actual_test_target: Option<crate::artifact::TestTargetIdentity>,
+) -> Result<Option<PathBuf>> {
     let artifact_path = match artifact {
         Artifact::Executable(path) => path,
         Artifact::Library { dll, .. } => dll,
         Artifact::None => return Ok(None),
     };
+    let cargo_lock_sha256 = workspace_cargo_lock_sha256(ctx)?;
+    let test_target = receipt_test_target(
+        &ctx.flags.extra_cargo,
+        actual_test_target,
+        cargo_lock_sha256.clone(),
+    )?;
     let receipt = BuildReceipt {
-        schema: 1,
+        // Schema 2 adds `test_target`; keep ordinary build receipts on schema 1 so
+        // existing consumers do not need to understand a test-only field.
+        schema: receipt_schema(test_target.is_some()),
         host_os: ctx.host.os,
-        source: source_identity(&ctx.crate_dir)?,
+        source: source_identity(&ctx.crate_dir, cargo_lock_sha256)?,
         profile: ctx.profile.dir(),
         target: ctx.paths.target_spec.to_string_lossy().into_owned(),
         dotnet: ctx.dotnet.as_env(),
@@ -96,6 +150,7 @@ pub fn write(
         private_sysroot_receipt: file_identity(&sysroot.root.join("receipt.json"))?,
         cargo_home: ctx.paths.cargo_home.to_string_lossy().into_owned(),
         cargo_arguments: ctx.flags.extra_cargo.clone(),
+        test_target,
         backend: producer_identity(&ctx.paths.backend_dylib)?,
         linker: producer_identity(&ctx.paths.linker)?,
         target_spec: file_identity(&ctx.paths.target_spec)?,
@@ -117,6 +172,95 @@ pub fn write(
     fs::rename(&temp, &path)
         .with_context(|| format!("publish artifact receipt {}", path.display()))?;
     Ok(Some(path))
+}
+
+const fn receipt_schema(has_test_target: bool) -> u32 {
+    if has_test_target { 2 } else { 1 }
+}
+
+fn test_target_receipt(
+    flags: &[String],
+    actual_target: crate::artifact::TestTargetIdentity,
+    cargo_lock_sha256: Option<String>,
+) -> Result<TestTargetReceipt> {
+    let selector = if flags.iter().any(|flag| flag == "--lib") {
+        Some("--lib".to_owned())
+    } else if let Some(name) = last_cargo_option_value(flags, "--test")? {
+        Some(format!("--test={name}"))
+    } else {
+        Some("selectorless".to_owned())
+    };
+    let selector = selector.context("test receipt selector is missing")?;
+    let target_dir = last_cargo_option_value(flags, "--target-dir")?;
+    let locked = flags
+        .iter()
+        .any(|flag| flag == "--locked" || flag == "--frozen");
+    if locked && cargo_lock_sha256.is_none() {
+        anyhow::bail!(
+            "locked test receipt requires Cargo's workspace-root Cargo.lock to be present and hashed"
+        );
+    }
+    Ok(TestTargetReceipt {
+        selector,
+        package_id: actual_target.package_id,
+        artifact_name: actual_target.name,
+        artifact_kind: actual_target.kind,
+        target_dir,
+        locked,
+        cargo_lock_sha256,
+    })
+}
+
+/// Return Cargo's effective value for a repeated long option. Cargo accepts both
+/// `--flag value` and `--flag=value`; later occurrences override earlier ones.
+/// Reject a malformed option here as well, rather than recording a value borrowed
+/// from an unrelated following flag.
+pub(crate) fn last_cargo_option_value(flags: &[String], option: &str) -> Result<Option<String>> {
+    let equals = format!("{option}=");
+    let mut selected = None;
+    let mut index = 0;
+    while let Some(flag) = flags.get(index) {
+        if flag == option {
+            let value = flags
+                .get(index + 1)
+                .with_context(|| format!("{option} requires an argument"))?;
+            if value.is_empty() {
+                anyhow::bail!("{option} requires a non-empty argument");
+            }
+            selected = Some(value.clone());
+            index += 2;
+            continue;
+        } else if let Some(value) = flag.strip_prefix(&equals) {
+            if value.is_empty() {
+                anyhow::bail!("{option} requires a non-empty argument");
+            }
+            selected = Some(value.to_owned());
+        }
+        index += 1;
+    }
+    Ok(selected)
+}
+
+fn receipt_test_target(
+    flags: &[String],
+    actual_target: Option<crate::artifact::TestTargetIdentity>,
+    cargo_lock_sha256: Option<String>,
+) -> Result<Option<TestTargetReceipt>> {
+    actual_target
+        .map(|target| test_target_receipt(flags, target, cargo_lock_sha256))
+        .transpose()
+}
+
+fn workspace_cargo_lock_sha256(ctx: &Context) -> Result<Option<String>> {
+    workspace_cargo_lock_sha256_at(&ctx.workspace_root)
+}
+
+/// The context constructor already resolved Cargo metadata's workspace root.
+/// Re-running `cargo locate-project` here could select a different topology from
+/// the build, so the receipt binds the lock directly to that resolved root.
+fn workspace_cargo_lock_sha256_at(workspace_root: &Path) -> Result<Option<String>> {
+    let lock = workspace_root.join("Cargo.lock");
+    lock.is_file().then(|| hash_file(&lock)).transpose()
 }
 
 fn input_closure_identity(ctx: &Context) -> Result<Option<InputClosureIdentity>> {
@@ -167,7 +311,7 @@ fn identity_receipt(project: &ManagedProjectConfig) -> ManagedIdentityReceipt {
     }
 }
 
-fn source_identity(crate_dir: &Path) -> Result<SourceIdentity> {
+fn source_identity(crate_dir: &Path, cargo_lock_sha256: Option<String>) -> Result<SourceIdentity> {
     let revision = git_output(crate_dir, &["rev-parse", "HEAD"]);
     // A checkout path is machine-specific and would make otherwise identical packages differ.
     // Record only the stable source remote; repositories without one remain explicitly unknown.
@@ -184,12 +328,11 @@ fn source_identity(crate_dir: &Path) -> Result<SourceIdentity> {
     } else {
         None
     };
-    let lock = crate_dir.join("Cargo.lock");
     Ok(SourceIdentity {
         repository,
         revision,
         dirty,
-        cargo_lock_sha256: lock.is_file().then(|| hash_file(&lock)).transpose()?,
+        cargo_lock_sha256,
     })
 }
 
@@ -290,5 +433,131 @@ mod tests {
         fs::write(root.join("nested/a"), b"changed").unwrap();
         assert_ne!(first, tree_hash(&root).unwrap());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalidating_a_prior_artifact_receipt_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("suite");
+        fs::write(&artifact, b"apphost").unwrap();
+        let receipt = PathBuf::from(format!("{}.rustdotnet.receipt.json", artifact.display()));
+        fs::write(&receipt, b"stale").unwrap();
+        invalidate_for_artifact(&artifact).unwrap();
+        assert!(!receipt.exists());
+        invalidate_for_artifact(&artifact).unwrap();
+    }
+
+    #[test]
+    fn ordinary_build_selectors_do_not_create_test_target_receipts() {
+        assert!(
+            receipt_test_target(&["--lib".into()], None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            receipt_test_target(&["--test".into(), "integration".into()], None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn selectorless_unique_test_receipt_records_cargo_identity() {
+        let receipt = receipt_test_target(
+            &[],
+            Some(crate::artifact::TestTargetIdentity {
+                package_id: "path+file:///tmp/crate#0.0.0".into(),
+                name: "crate_name".into(),
+                kind: vec!["lib".into()],
+            }),
+            Some("lock-hash".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(receipt.selector, "selectorless");
+        assert_eq!(receipt.package_id, "path+file:///tmp/crate#0.0.0");
+        assert_eq!(receipt.artifact_name, "crate_name");
+        assert_eq!(receipt.artifact_kind, ["lib"]);
+        assert_eq!(receipt.cargo_lock_sha256.as_deref(), Some("lock-hash"));
+    }
+
+    #[test]
+    fn locked_test_receipt_requires_a_workspace_lock_hash() {
+        let error = receipt_test_target(
+            &["--lib".into(), "--locked".into()],
+            Some(crate::artifact::TestTargetIdentity {
+                package_id: "path+file:///tmp/crate#0.0.0".into(),
+                name: "crate_name".into(),
+                kind: vec!["lib".into()],
+            }),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("workspace-root Cargo.lock"));
+    }
+
+    #[test]
+    fn repeated_target_dir_uses_cargos_final_value_across_both_forms() {
+        assert_eq!(
+            last_cargo_option_value(
+                &[
+                    "--target-dir".into(),
+                    "first".into(),
+                    "--target-dir=second".into(),
+                    "--target-dir".into(),
+                    "final".into(),
+                ],
+                "--target-dir",
+            )
+            .unwrap(),
+            Some("final".into())
+        );
+    }
+
+    #[test]
+    fn repeated_test_selector_uses_cargos_final_value_across_both_forms() {
+        assert_eq!(
+            last_cargo_option_value(
+                &["--test=first".into(), "--test".into(), "final".into(),],
+                "--test",
+            )
+            .unwrap(),
+            Some("final".into())
+        );
+    }
+
+    #[test]
+    fn ordinary_and_test_receipts_use_the_compatible_schemas() {
+        assert_eq!(receipt_schema(false), 1);
+        assert_eq!(receipt_schema(true), 2);
+    }
+
+    #[test]
+    fn workspace_member_receipt_hashes_the_context_workspace_root_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let member = root.path().join("member");
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(member.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+        fs::write(root.path().join("Cargo.lock"), "workspace lock\n").unwrap();
+        fs::write(member.join("Cargo.lock"), "member decoy\n").unwrap();
+
+        assert_eq!(
+            workspace_cargo_lock_sha256_at(root.path()).unwrap(),
+            Some(hash_file(&root.path().join("Cargo.lock")).unwrap())
+        );
+        assert_ne!(
+            workspace_cargo_lock_sha256_at(root.path()).unwrap(),
+            Some(hash_file(&member.join("Cargo.lock")).unwrap())
+        );
     }
 }

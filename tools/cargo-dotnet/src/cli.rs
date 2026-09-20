@@ -55,7 +55,8 @@ pub enum Cmd {
     Attach(AttachArgs),
     /// Diagnose the toolchain, or translate a .NET runtime failure into an actionable fix.
     Doctor(DoctorArgs),
-    /// Diagnose the local Unity Editor integration prerequisites.
+    /// Archived internal Unity integration (not part of the public release surface).
+    #[command(hide = true)]
     Unity(UnityArgs),
     /// Build a crate's #[test]s with the backend and run them on .NET.
     Test(BuildArgs),
@@ -196,7 +197,7 @@ pub struct BuildArgs {
     /// Debug profile (opt out of the release default).
     #[arg(long)]
     pub debug: bool,
-    /// `cargo clean` first (rebuilds std; bulletproof but slow).
+    /// `cargo clean` first (rebuilds std).
     #[arg(long)]
     pub clean: bool,
     /// Unfiltered build log.
@@ -228,6 +229,23 @@ pub struct BuildArgs {
     pub manifest: clap_cargo::Manifest,
     #[command(flatten)]
     pub workspace: clap_cargo::Workspace,
+
+    /// Build and run one named integration-test harness. Unlike `--tests`, this does not
+    /// broaden selection to every integration target.
+    #[arg(long = "test", value_name = "NAME", conflicts_with = "lib")]
+    pub test_target: Option<String>,
+
+    /// Build and run the package library's unit-test harness only.
+    #[arg(long, conflicts_with = "test_target")]
+    pub lib: bool,
+
+    /// Directory for Cargo build artifacts, forwarded to the inner build unchanged.
+    #[arg(long, value_name = "DIR")]
+    pub target_dir: Option<PathBuf>,
+
+    /// Require the copied suite's pinned Cargo.lock during the inner Cargo invocation.
+    #[arg(long)]
+    pub locked: bool,
 
     /// Unknown cargo flags forwarded verbatim to the inner cargo (e.g. --locked,
     /// --offline, --frozen, --target-dir, --message-format). Hyphen values are allowed
@@ -293,7 +311,7 @@ impl Template {
 }
 
 const NEW_TEMPLATE_FLAGS: &[&str] = &[
-    "app", "lib", "plugin", "excel", "maui", "winui", "webapi", "worker", "unity",
+    "app", "lib", "plugin", "excel", "maui", "winui", "webapi", "worker",
 ];
 
 #[derive(clap::Args)]
@@ -325,8 +343,8 @@ pub struct NewArgs {
     /// A .NET worker service with Rust business logic compiled to managed .NET.
     #[arg(long, conflicts_with_all = ["app", "lib", "plugin", "excel", "maui", "winui", "webapi"])]
     pub worker: bool,
-    /// A Unity 6.3 project with managed Rust and an optional native Rust kernel.
-    #[arg(long, conflicts_with_all = ["app", "lib", "plugin", "excel", "maui", "winui", "webapi", "worker"])]
+    /// Archived internal Unity template; not part of the public release surface.
+    #[arg(long, hide = true, conflicts_with_all = ["app", "lib", "plugin", "excel", "maui", "winui", "webapi", "worker"])]
     pub unity: bool,
 
     /// Override the crate name (default: the final path component).
@@ -752,6 +770,21 @@ pub struct PublishArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_and_lib_harness_selectors_conflict() {
+        let error = match DotnetCli::try_parse_from([
+            "cargo-dotnet",
+            "test",
+            "--test",
+            "coretests",
+            "--lib",
+        ]) {
+            Ok(_) => panic!("--test and --lib unexpectedly selected multiple harnesses"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn new_excel_selects_the_excel_dna_template() {

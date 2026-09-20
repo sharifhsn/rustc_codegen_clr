@@ -3,6 +3,10 @@
 //! Warm builds compare a per-file identity/stat index against the ambient toolchain, hashing only
 //! changed file contents. The expensive whole-tree byte proof is created once and remains
 //! available explicitly through `cargo dotnet doctor --full-integrity`.
+//! The root `share/` tree is deliberately outside that payload: rustup uses it for HTML/manual
+//! documentation and shell completions, while rustc/build-std resolve executable inputs from
+//! `bin/`, `lib/`, and `libexec/`. Copying almost a gigabyte of docs into every content-addressed
+//! PAL snapshot adds no compiler authority and turns each backend revision into minutes of I/O.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,12 +21,13 @@ use sha2::{Digest, Sha256};
 
 use crate::context::Context;
 
-const SYSROOT_CACHE_SCHEMA: u32 = 5;
-const INPUT_INDEX_SCHEMA: u32 = 2;
+const SYSROOT_CACHE_SCHEMA: u32 = 6;
+const INPUT_INDEX_SCHEMA: u32 = 3;
 const SYSROOT_CACHE_LIMIT: usize = 4;
 const INPUT_INDEX_LIMIT: usize = 8;
-const READY_BYTES: &[u8] = b"cargo-dotnet-private-sysroot-v5\n";
+const READY_BYTES: &[u8] = b"cargo-dotnet-private-sysroot-v6\n";
 const LIBRARY_PATH: &str = "lib/rustlib/src/rust/library";
+const AMBIENT_EXCLUDED_ROOT_ENTRIES: &[&str] = &["share"];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct SysrootReceipt {
@@ -120,7 +125,11 @@ pub fn prepare(ctx: &Context) -> Result<PrivateSysroot> {
         |root| validate_snapshot_fast(root, &key),
         |tmp| {
             let expected_ambient = ambient_index.load()?;
-            let cloned_ambient = clone_tree_indexed(&ambient, tmp)?;
+            let cloned_ambient = clone_tree_indexed_excluding(
+                &ambient,
+                tmp,
+                AMBIENT_EXCLUDED_ROOT_ENTRIES,
+            )?;
             if cloned_ambient.payload_sha256 != expected_ambient.payload_sha256 {
                 bail!(
                     "ambient rustc sysroot changed while it was cloned; retry so cargo-dotnet can build a fresh content key"
@@ -172,11 +181,11 @@ pub fn prepare(ctx: &Context) -> Result<PrivateSysroot> {
 }
 
 fn store_root() -> Result<PathBuf> {
-    Ok(crate::context::cargo_dotnet_cache_home()?.join("sysroots/v5"))
+    Ok(crate::context::cargo_dotnet_cache_home()?.join("sysroots/v6"))
 }
 
 fn input_index_store_root() -> Result<PathBuf> {
-    Ok(crate::context::cargo_dotnet_cache_home()?.join("sysroots/input-index/v2"))
+    Ok(crate::context::cargo_dotnet_cache_home()?.join("sysroots/input-index/v3"))
 }
 
 fn materialize_ambient_index(ctx: &Context, ambient: &Path) -> Result<AmbientIndex> {
@@ -195,11 +204,9 @@ fn materialize_ambient_index_at(
         &key,
         |root| validate_input_index_current(root, &key, ambient, &refreshed),
         |tmp| {
-            let index = refreshed
-                .borrow_mut()
-                .take()
-                .map(Ok)
-                .unwrap_or_else(|| build_tree_index(ambient, None, &[]).map(|value| value.0))?;
+            let index = refreshed.borrow_mut().take().map(Ok).unwrap_or_else(|| {
+                build_tree_index(ambient, None, AMBIENT_EXCLUDED_ROOT_ENTRIES).map(|value| value.0)
+            })?;
             let index_bytes = serde_json::to_vec_pretty(&index)?;
             let receipt = InputIndexReceipt {
                 schema: INPUT_INDEX_SCHEMA,
@@ -235,7 +242,7 @@ fn validate_input_index_current(
     let current = {
         let refreshed = refreshed.borrow();
         let prior = refreshed.as_ref().unwrap_or(&previous);
-        build_tree_index(ambient, Some(prior), &[])?.0
+        build_tree_index(ambient, Some(prior), AMBIENT_EXCLUDED_ROOT_ENTRIES)?.0
     };
     if current.payload_sha256 != receipt.payload_sha256 {
         *refreshed.borrow_mut() = Some(current);
@@ -388,7 +395,7 @@ fn trusted_rustc_sysroots() -> Result<BTreeSet<PathBuf>> {
 
 fn ambient_identity_key(ctx: &Context, ambient: &Path) -> Result<String> {
     let mut hash = Sha256::new();
-    hash_part(&mut hash, b"cargo-dotnet-ambient-sysroot-index-v1");
+    hash_part(&mut hash, b"cargo-dotnet-ambient-sysroot-index-v2");
     hash_part(&mut hash, ambient.as_os_str().as_encoded_bytes());
     hash_part(&mut hash, &rustc_identity(ctx)?);
     hash_part(&mut hash, ctx.toolchain.as_deref().unwrap_or("").as_bytes());
@@ -401,7 +408,7 @@ fn snapshot_key(
     pal_payload_sha256: &str,
 ) -> Result<String> {
     let mut hash = Sha256::new();
-    hash_part(&mut hash, b"cargo-dotnet-private-sysroot-v5");
+    hash_part(&mut hash, b"cargo-dotnet-private-sysroot-v6");
     for value in [
         ctx.host.os,
         ctx.host.arch,
@@ -448,15 +455,6 @@ fn build_tree_index(
     previous: Option<&TreeIndex>,
     excluded_root_entries: &[&str],
 ) -> Result<(TreeIndex, ScanStats)> {
-    build_tree_index_with(root, previous, excluded_root_entries, &mut |_| {})
-}
-
-fn build_tree_index_with(
-    root: &Path,
-    previous: Option<&TreeIndex>,
-    excluded_root_entries: &[&str],
-    before_entry_open: &mut dyn FnMut(&Path),
-) -> Result<(TreeIndex, ScanStats)> {
     let root = canonical_regular_directory(root, "tree index root")?;
     let capability = DirectoryCapability::open(&root)?;
     let previous = previous
@@ -466,89 +464,82 @@ fn build_tree_index_with(
         .collect::<BTreeMap<_, _>>();
     let mut entries = Vec::new();
     let mut stats = ScanStats::default();
-    let mut relative_hook = |relative: &Path| before_entry_open(&root.join(relative));
-    capability.walk_regular_tree_with_hook(
-        excluded_root_entries,
-        &mut relative_hook,
-        &mut |relative_path, node| {
-            let relative = portable_relative_path(relative_path)?;
-            let display = root.join(relative_path);
-            match node {
-                TreeWalkNode::DirectoryEnter(directory) => {
-                    let metadata = directory.metadata()?;
-                    entries.push(TreeEntry {
-                        path: relative,
-                        kind: TreeEntryKind::Directory,
-                        bytes: 0,
-                        modified_ns: modified_ns(&metadata),
-                        file_id: rust_dotnet_sdk_core::safe_fs::opened_file_identity(directory)?,
-                        executable: false,
-                        sha256: String::new(),
-                    });
-                }
-                TreeWalkNode::File(input) => {
-                    let opened_metadata = input.metadata()?;
-                    let executable_bit = executable(&opened_metadata);
-                    let modified_timestamp = modified_ns(&opened_metadata);
-                    let stable_file_id =
-                        rust_dotnet_sdk_core::safe_fs::opened_file_identity(input)?;
-                    let reused = previous.get(relative.as_str()).filter(|prior| {
-                        stat_reuse_supported(&stable_file_id)
-                            && prior.kind == TreeEntryKind::File
-                            && prior.bytes == opened_metadata.len()
-                            && prior.modified_ns == modified_timestamp
-                            && prior.file_id == stable_file_id
-                            && prior.executable == executable_bit
-                            && valid_digest(&prior.sha256)
-                    });
-                    let mut bytes_read = None;
-                    let sha256 = if let Some(prior) = reused {
-                        stats.files_reused += 1;
-                        prior.sha256.clone()
-                    } else {
-                        stats.files_hashed += 1;
-                        let mut hash = Sha256::new();
-                        let mut buffer = vec![0_u8; 1024 * 1024];
-                        let mut total = 0_u64;
-                        loop {
-                            let count = input.read(&mut buffer)?;
-                            if count == 0 {
-                                break;
-                            }
-                            hash.update(&buffer[..count]);
-                            total += count as u64;
-                        }
-                        bytes_read = Some(total);
-                        format!("{:x}", hash.finalize())
-                    };
-                    let after = input.metadata()?;
-                    if after.len() != opened_metadata.len()
-                        || modified_ns(&after) != modified_timestamp
-                        || rust_dotnet_sdk_core::safe_fs::opened_file_identity(input)?
-                            != stable_file_id
-                        || executable(&after) != executable_bit
-                        || bytes_read.is_some_and(|bytes| bytes != after.len())
-                    {
-                        bail!(
-                            "indexed file changed while it was read: {}",
-                            display.display()
-                        );
-                    }
-                    entries.push(TreeEntry {
-                        path: relative,
-                        kind: TreeEntryKind::File,
-                        bytes: opened_metadata.len(),
-                        modified_ns: modified_timestamp,
-                        file_id: stable_file_id,
-                        executable: executable_bit,
-                        sha256,
-                    });
-                }
-                TreeWalkNode::DirectoryLeave(_) => {}
+    capability.walk_regular_tree(excluded_root_entries, &mut |relative_path, node| {
+        let relative = portable_relative_path(relative_path)?;
+        let display = root.join(relative_path);
+        match node {
+            TreeWalkNode::DirectoryEnter(directory) => {
+                let metadata = directory.metadata()?;
+                entries.push(TreeEntry {
+                    path: relative,
+                    kind: TreeEntryKind::Directory,
+                    bytes: 0,
+                    modified_ns: modified_ns(&metadata),
+                    file_id: rust_dotnet_sdk_core::safe_fs::opened_file_identity(directory)?,
+                    executable: false,
+                    sha256: String::new(),
+                });
             }
-            Ok(())
-        },
-    )?;
+            TreeWalkNode::File(input) => {
+                let opened_metadata = input.metadata()?;
+                let executable_bit = executable(&opened_metadata);
+                let modified_timestamp = modified_ns(&opened_metadata);
+                let stable_file_id = rust_dotnet_sdk_core::safe_fs::opened_file_identity(input)?;
+                let reused = previous.get(relative.as_str()).filter(|prior| {
+                    stat_reuse_supported(&stable_file_id)
+                        && prior.kind == TreeEntryKind::File
+                        && prior.bytes == opened_metadata.len()
+                        && prior.modified_ns == modified_timestamp
+                        && prior.file_id == stable_file_id
+                        && prior.executable == executable_bit
+                        && valid_digest(&prior.sha256)
+                });
+                let mut bytes_read = None;
+                let sha256 = if let Some(prior) = reused {
+                    stats.files_reused += 1;
+                    prior.sha256.clone()
+                } else {
+                    stats.files_hashed += 1;
+                    let mut hash = Sha256::new();
+                    let mut buffer = vec![0_u8; 1024 * 1024];
+                    let mut total = 0_u64;
+                    loop {
+                        let count = input.read(&mut buffer)?;
+                        if count == 0 {
+                            break;
+                        }
+                        hash.update(&buffer[..count]);
+                        total += count as u64;
+                    }
+                    bytes_read = Some(total);
+                    format!("{:x}", hash.finalize())
+                };
+                let after = input.metadata()?;
+                if after.len() != opened_metadata.len()
+                    || modified_ns(&after) != modified_timestamp
+                    || rust_dotnet_sdk_core::safe_fs::opened_file_identity(input)? != stable_file_id
+                    || executable(&after) != executable_bit
+                    || bytes_read.is_some_and(|bytes| bytes != after.len())
+                {
+                    bail!(
+                        "indexed file changed while it was read: {}",
+                        display.display()
+                    );
+                }
+                entries.push(TreeEntry {
+                    path: relative,
+                    kind: TreeEntryKind::File,
+                    bytes: opened_metadata.len(),
+                    modified_ns: modified_timestamp,
+                    file_id: stable_file_id,
+                    executable: executable_bit,
+                    sha256,
+                });
+            }
+            TreeWalkNode::DirectoryLeave(_) => {}
+        }
+        Ok(())
+    })?;
     let payload_sha256 = index_payload_digest(&entries);
     Ok((
         TreeIndex {
@@ -562,13 +553,13 @@ fn build_tree_index_with(
 }
 
 fn clone_tree_indexed(source: &Path, destination: &Path) -> Result<TreeIndex> {
-    clone_tree_indexed_with(source, destination, &mut |_| {})
+    clone_tree_indexed_excluding(source, destination, &[])
 }
 
-fn clone_tree_indexed_with(
+fn clone_tree_indexed_excluding(
     source: &Path,
     destination: &Path,
-    hook: &mut dyn FnMut(&Path),
+    excluded_root_entries: &[&str],
 ) -> Result<TreeIndex> {
     let source = canonical_regular_directory(source, "snapshot source")?;
     let capability = DirectoryCapability::open(&source)?;
@@ -594,64 +585,59 @@ fn clone_tree_indexed_with(
     }
     let destination = fs::canonicalize(destination)?;
     let mut entries = Vec::new();
-    let mut relative_hook = |relative: &Path| hook(&source.join(relative));
-    capability.walk_regular_tree_with_hook(
-        &[],
-        &mut relative_hook,
-        &mut |relative_path, node| {
-            let relative = portable_relative_path(relative_path)?;
-            let dst = destination.join(relative_path);
-            match node {
-                TreeWalkNode::DirectoryEnter(directory) => {
-                    fs::create_dir(&dst)?;
-                    let metadata = directory.metadata()?;
-                    entries.push(TreeEntry {
-                        path: relative,
-                        kind: TreeEntryKind::Directory,
-                        bytes: 0,
-                        modified_ns: modified_ns(&metadata),
-                        file_id: rust_dotnet_sdk_core::safe_fs::opened_file_identity(directory)?,
-                        executable: false,
-                        sha256: String::new(),
-                    });
-                }
-                TreeWalkNode::File(input) => {
-                    let permissions = input.metadata()?.permissions();
-                    let mut output = OpenOptions::new().create_new(true).write(true).open(&dst)?;
-                    let mut hash = Sha256::new();
-                    let mut bytes = 0_u64;
-                    let mut buffer = vec![0_u8; 1024 * 1024];
-                    loop {
-                        let count = input.read(&mut buffer)?;
-                        if count == 0 {
-                            break;
-                        }
-                        output.write_all(&buffer[..count])?;
-                        hash.update(&buffer[..count]);
-                        bytes += count as u64;
+    capability.walk_regular_tree(excluded_root_entries, &mut |relative_path, node| {
+        let relative = portable_relative_path(relative_path)?;
+        let dst = destination.join(relative_path);
+        match node {
+            TreeWalkNode::DirectoryEnter(directory) => {
+                fs::create_dir(&dst)?;
+                let metadata = directory.metadata()?;
+                entries.push(TreeEntry {
+                    path: relative,
+                    kind: TreeEntryKind::Directory,
+                    bytes: 0,
+                    modified_ns: modified_ns(&metadata),
+                    file_id: rust_dotnet_sdk_core::safe_fs::opened_file_identity(directory)?,
+                    executable: false,
+                    sha256: String::new(),
+                });
+            }
+            TreeWalkNode::File(input) => {
+                let permissions = input.metadata()?.permissions();
+                let mut output = OpenOptions::new().create_new(true).write(true).open(&dst)?;
+                let mut hash = Sha256::new();
+                let mut bytes = 0_u64;
+                let mut buffer = vec![0_u8; 1024 * 1024];
+                loop {
+                    let count = input.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
                     }
-                    output.set_permissions(permissions)?;
-                    output.sync_all()?;
-                    let metadata = output.metadata()?;
-                    entries.push(TreeEntry {
-                        path: relative,
-                        kind: TreeEntryKind::File,
-                        bytes,
-                        modified_ns: modified_ns(&metadata),
-                        file_id: file_id(&metadata).unwrap_or_default(),
-                        executable: executable(&metadata),
-                        sha256: format!("{:x}", hash.finalize()),
-                    });
+                    output.write_all(&buffer[..count])?;
+                    hash.update(&buffer[..count]);
+                    bytes += count as u64;
                 }
-                TreeWalkNode::DirectoryLeave(_) => {
-                    if fs::canonicalize(&dst)? != dst {
-                        bail!("snapshot destination directory changed during copy");
-                    }
+                output.set_permissions(permissions)?;
+                output.sync_all()?;
+                let metadata = output.metadata()?;
+                entries.push(TreeEntry {
+                    path: relative,
+                    kind: TreeEntryKind::File,
+                    bytes,
+                    modified_ns: modified_ns(&metadata),
+                    file_id: file_id(&metadata).unwrap_or_default(),
+                    executable: executable(&metadata),
+                    sha256: format!("{:x}", hash.finalize()),
+                });
+            }
+            TreeWalkNode::DirectoryLeave(_) => {
+                if fs::canonicalize(&dst)? != dst {
+                    bail!("snapshot destination directory changed during copy");
                 }
             }
-            Ok(())
-        },
-    )?;
+        }
+        Ok(())
+    })?;
     if fs::canonicalize(&destination)? != destination {
         bail!("snapshot destination root changed during copy");
     }
@@ -906,6 +892,37 @@ mod tests {
     }
 
     #[test]
+    fn private_sysroot_omits_root_share_documentation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("ambient");
+        let destination = temp.path().join("private");
+        fs::create_dir_all(source.join(LIBRARY_PATH)).unwrap();
+        fs::create_dir_all(source.join("share/doc/rust/html")).unwrap();
+        fs::write(source.join(LIBRARY_PATH).join("lib.rs"), b"compiler input").unwrap();
+        fs::write(
+            source.join("share/doc/rust/html/index.html"),
+            b"documentation",
+        )
+        .unwrap();
+
+        let (source_index, _) =
+            build_tree_index(&source, None, AMBIENT_EXCLUDED_ROOT_ENTRIES).unwrap();
+        let snapshot_index =
+            clone_tree_indexed_excluding(&source, &destination, AMBIENT_EXCLUDED_ROOT_ENTRIES)
+                .unwrap();
+
+        assert_eq!(source_index.payload_sha256, snapshot_index.payload_sha256);
+        assert!(destination.join(LIBRARY_PATH).join("lib.rs").is_file());
+        assert!(!destination.join("share").exists());
+        assert!(
+            snapshot_index
+                .entries
+                .iter()
+                .all(|entry| entry.path != "share" && !entry.path.starts_with("share/"))
+        );
+    }
+
+    #[test]
     fn warm_validation_is_bounded_while_explicit_full_check_detects_nonlibrary_corruption() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("snapshot");
@@ -1091,87 +1108,6 @@ mod tests {
             audit_ambient_input_full(&object, &key, &trusted).unwrap(),
             AmbientInputAudit::Stale
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn clone_rejects_deterministic_symlink_swap_without_reading_outside_bytes() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("ambient");
-        let outside = temp.path().join("outside");
-        let destination = temp.path().join("snapshot");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&outside).unwrap();
-        fs::write(source.join("victim"), b"inside").unwrap();
-        fs::write(outside.join("sentinel"), b"do not copy").unwrap();
-        let mut swapped = false;
-        let error = clone_tree_indexed_with(&source, &destination, &mut |path| {
-            if !swapped && path.file_name().is_some_and(|name| name == "victim") {
-                fs::remove_file(path).unwrap();
-                symlink(outside.join("sentinel"), path).unwrap();
-                swapped = true;
-            }
-        })
-        .unwrap_err();
-        let error = format!("{error:#}");
-        assert!(
-            error.contains("following links") || error.contains("symlink"),
-            "{error}"
-        );
-        assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"do not copy");
-        assert!(!destination.join("victim").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn index_and_clone_keep_one_root_capability_after_enumeration() {
-        let temp = tempfile::tempdir().unwrap();
-        let expected = temp.path().join("expected");
-        let indexed = temp.path().join("indexed");
-        let index_replacement = temp.path().join("index-replacement");
-        for root in [&expected, &indexed, &index_replacement] {
-            fs::create_dir(root).unwrap();
-        }
-        fs::write(expected.join("victim"), b"inside").unwrap();
-        fs::write(indexed.join("victim"), b"inside").unwrap();
-        fs::write(index_replacement.join("victim"), b"outside-secret").unwrap();
-        let (expected_index, _) = build_tree_index(&expected, None, &[]).unwrap();
-
-        let mut index_swapped = false;
-        let (actual_index, _) = build_tree_index_with(&indexed, None, &[], &mut |_| {
-            if !index_swapped {
-                fs::rename(&indexed, temp.path().join("indexed.original")).unwrap();
-                fs::rename(&index_replacement, &indexed).unwrap();
-                index_swapped = true;
-            }
-        })
-        .unwrap();
-        assert!(index_swapped);
-        assert_eq!(actual_index.payload_sha256, expected_index.payload_sha256);
-        assert_eq!(fs::read(indexed.join("victim")).unwrap(), b"outside-secret");
-
-        let source = temp.path().join("source");
-        let clone_replacement = temp.path().join("clone-replacement");
-        let destination = temp.path().join("destination");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&clone_replacement).unwrap();
-        fs::write(source.join("victim"), b"inside").unwrap();
-        fs::write(clone_replacement.join("victim"), b"outside-secret").unwrap();
-        let mut clone_swapped = false;
-        let cloned = clone_tree_indexed_with(&source, &destination, &mut |_| {
-            if !clone_swapped {
-                fs::rename(&source, temp.path().join("source.original")).unwrap();
-                fs::rename(&clone_replacement, &source).unwrap();
-                clone_swapped = true;
-            }
-        })
-        .unwrap();
-        assert!(clone_swapped);
-        assert_eq!(cloned.payload_sha256, expected_index.payload_sha256);
-        assert_eq!(fs::read(destination.join("victim")).unwrap(), b"inside");
-        assert_eq!(fs::read(source.join("victim")).unwrap(), b"outside-secret");
     }
 
     #[cfg(unix)]

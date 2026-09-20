@@ -39,10 +39,6 @@ macro_rules! cast {
 pub fn is_rvalue_unint<'tcx>(rvalue: &Rvalue<'tcx>, ctx: &mut MethodCompileCtx<'tcx, '_>) -> bool {
     match rvalue {
         Rvalue::Repeat(operand, _) | Rvalue::Use(operand, _) => is_uninit(operand, ctx),
-        /* TODO: before enabling this, check if the aggregate is an enum, and if so, check if it has a discriminant.
-        Rvalue::Aggregate(_, field_index) => field_index
-        .iter()
-        .all(|operand| is_uninit(operand, ctx)),*/
         _ => false,
     }
 }
@@ -173,7 +169,7 @@ pub fn handle_rvalue<'tcx>(
                 let target_abi = AbiPlan::from_fn_ptr_ty(*to_ty, ctx);
                 let target_type = ctx.type_from_cache(*to_ty);
                 let Type::FnPtr(target_sig) = target_type else {
-                    rustc_middle::bug!(
+                    rustc_span::bug!(
                         "ClosureFnPointer target not a fn ptr. {}",
                         target_type.mangle(ctx)
                     )
@@ -190,7 +186,7 @@ pub fn handle_rvalue<'tcx>(
                 operand.ty(ctx.body(), ctx.tcx())
             ),
         },
-        Rvalue::Cast(CastKind::Transmute, operand, dst) => {
+        Rvalue::Cast(CastKind::Transmute | CastKind::BoxDerefTransmute, operand, dst) => {
             let dst = ctx.monomorphize(*dst);
             let dst = ctx.type_from_cache(dst);
             let src = operand.ty(&ctx.body().local_decls, ctx.tcx());
@@ -296,7 +292,9 @@ pub fn handle_rvalue<'tcx>(
 
             let (instance, _subst_ref) = if let TyKind::FnDef(def_id, subst_ref) = operand_ty.kind()
             {
-                let subst = ctx.monomorphize(*subst_ref);
+                let subst = subst_ref
+                    .no_bound_vars()
+                    .expect("function definition had bound generic arguments");
                 let env = rustc_middle::ty::TypingEnv::fully_monomorphized();
                 let Some(instance) = Instance::resolve_for_fn_ptr(ctx.tcx(), env, *def_id, subst)
                 else {

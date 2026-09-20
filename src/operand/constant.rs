@@ -5,7 +5,7 @@ use crate::r#type::{GetTypeExt, utilis::is_fat_ptr};
 use cilly::{
     Assembly, CILNode, ClassRef, Const, Float, Int, Interned, MethodRef, StaticFieldDesc, Type,
     cilnode::{IsPure, MethodKind},
-    hashable::{HashableF32, HashableF64},
+    hashable::HashableF32,
 };
 use rustc_middle::ty::ExistentialTraitRef;
 use rustc_middle::{
@@ -146,7 +146,7 @@ fn create_const_from_data<'tcx>(
             && const_alloc.provenance().ptrs().is_empty()
         {
             let scalar = Scalar::from_u128(ctx.target_layout().decode_uint(&bytes));
-            return load_const_scalar(scalar, ty, None, ctx).into();
+            return load_const_scalar(scalar, ty, None, ctx);
         }
         let (ptr, align) = alloc_ptr_unaligned(alloc_id, &alloc, origin, ctx);
         // Apply the byte offset on the raw pointer (CIL `add` is byte arithmetic), mirroring
@@ -175,7 +175,7 @@ fn create_const_from_data<'tcx>(
         ptr
     };
     let ptr = ctx.cast_ptr(ptr, tpe);
-    return ctx.load(ptr, tpe);
+    ctx.load(ptr, tpe)
 }
 pub fn load_const_value<'tcx>(
     const_val: ConstValue,
@@ -270,7 +270,6 @@ fn load_scalar_ptr(
                 .opt_item_name(def_id)
                 .expect("Static without name")
                 .to_string();
-            /* */
             if name == "__rust_alloc_error_handler_should_panic"
                 || name == "__rust_no_alloc_shim_is_unstable"
             {
@@ -466,7 +465,12 @@ fn load_const_scalar<'tcx>(
     match scalar_ty.kind() {
         TyKind::Int(int_type) => load_const_int(scalar_u128, *int_type, ctx),
         TyKind::Uint(uint_type) => load_const_uint(scalar_u128, *uint_type, ctx),
-        TyKind::Float(ftype) => load_const_float(scalar_u128, *ftype, ctx).into(),
+        TyKind::Float(ftype) => load_const_float(scalar_u128, *ftype, ctx),
+        // Pattern types (`T is <pattern>`) have the same scalar representation as `T`; the
+        // pattern only tightens the valid range/niche used by enclosing layouts.  Lower the
+        // payload through the base type instead of treating the compiler-only wrapper as an
+        // unsupported scalar kind.
+        TyKind::Pat(base, _) => load_const_scalar(scalar, *base, origin, ctx),
         TyKind::Bool => ctx.alloc_node(scalar_u128 != 0),
         TyKind::RawPtr(..) | TyKind::Ref(..) => {
             if is_fat_ptr(scalar_ty, ctx.tcx(), ctx.instance()) {
@@ -526,12 +530,19 @@ fn load_const_float(
             }
         }
         FloatTy::F32 => {
-            let value = f32::from_bits(u32::try_from(value).unwrap());
-            asm.alloc_node(Const::F32(HashableF32(value))).into()
+            // `ldc.r4` is allowed to quiet signaling NaNs on the CLR. Materialize every scalar
+            // f32 constant through the bit-preserving BitConverter-backed transmute so Rust's
+            // `from_bits`/constant-evaluation contract survives the managed boundary.
+            let bits = u32::try_from(value).unwrap();
+            let value = asm.alloc_node(Const::U32(bits));
+            asm.transmute_on_stack(Type::Int(Int::U32), Type::Float(Float::F32), value)
         }
         FloatTy::F64 => {
-            let value = f64::from_bits(u64::try_from(value).unwrap());
-            asm.alloc_node(Const::F64(HashableF64(value))).into()
+            // See the f32 arm above: integer materialization avoids a floating literal roundtrip
+            // that can canonicalize a signaling NaN payload before Rust observes it.
+            let bits = u64::try_from(value).unwrap();
+            let value = asm.alloc_node(Const::U64(bits));
+            asm.transmute_on_stack(Type::Int(Int::U64), Type::Float(Float::F64), value)
         }
         FloatTy::F128 => {
             let u128_const = asm.alloc_node(Const::U128(value));

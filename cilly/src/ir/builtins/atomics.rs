@@ -10,6 +10,69 @@ use super::{
     super::Assembly,
     math::{int_max, int_min},
 };
+
+/// Computes the containing `i32` word and bit shift for a naturally aligned sub-word atomic.
+/// Both legacy fallback loops use the same little-endian word-CAS address calculation.
+fn subword_address(
+    asm: &mut Assembly,
+) -> (
+    Interned<Type>,
+    Interned<Type>,
+    Interned<CILNode>,
+    Interned<CILNode>,
+) {
+    let i32_t = asm.alloc_type(Type::Int(Int::I32));
+    let i32_ptr_t = asm.alloc_type(Type::Ptr(i32_t));
+    let addr_ref = asm.alloc_node(CILNode::LdArg(0));
+    let addr_ptr = asm.alloc_node(CILNode::RefToPtr(addr_ref));
+    let addr_int = asm.alloc_node(CILNode::PtrCast(
+        addr_ptr,
+        Box::new(crate::cilnode::PtrCastRes::USize),
+    ));
+    let three = asm.alloc_node(Const::USize(3));
+    let not_three = asm.alloc_node(Const::USize(!3u64));
+    let word_addr_int = asm.alloc_node(CILNode::BinOp(addr_int, not_three, BinOp::And));
+    let word_addr = asm.alloc_node(CILNode::PtrCast(
+        word_addr_int,
+        Box::new(crate::cilnode::PtrCastRes::Ptr(i32_t)),
+    ));
+    let byte_off = asm.alloc_node(CILNode::BinOp(addr_int, three, BinOp::And));
+    let eight = asm.alloc_node(Const::USize(8));
+    let shift_usize = asm.alloc_node(CILNode::BinOp(byte_off, eight, BinOp::Mul));
+    let shift = asm.alloc_node(CILNode::IntCast {
+        input: shift_usize,
+        target: Int::I32,
+        extend: ExtendKind::ZeroExtend,
+    });
+    (i32_t, i32_ptr_t, word_addr, shift)
+}
+
+fn interlocked_compare_exchange_method(asm: &mut Assembly, int: Int) -> Interned<MethodRef> {
+    let tpe = Type::Int(int);
+    let reference = asm.nref(tpe);
+    let signature = asm.sig([reference, tpe, tpe], tpe);
+    let interlocked = ClassRef::interlocked(asm);
+    let name = asm.alloc_string("CompareExchange");
+    asm.alloc_methodref(MethodRef::new(
+        interlocked,
+        name,
+        signature,
+        MethodKind::Static,
+        vec![].into(),
+    ))
+}
+
+fn interlocked_compare_exchange(
+    asm: &mut Assembly,
+    int: Int,
+    addr: Interned<CILNode>,
+    value: Interned<CILNode>,
+    comparand: Interned<CILNode>,
+) -> Interned<CILNode> {
+    let method = interlocked_compare_exchange_method(asm, int);
+    asm.alloc_node(CILNode::call(method, [addr, value, comparand]))
+}
+
 /// Emits a sub-word (`u8`/`i8`/`u16`/`i16`) atomic exchange, named `atomic_xchng{8,16}_correct`, as a
 /// masked 32-bit `Interlocked.CompareExchange` loop that unconditionally splices the new sub-word and
 /// retries until the full word swaps. Unlike a plain volatile load/store, this is genuinely atomic
@@ -27,40 +90,16 @@ pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatc
     let generator = move |method: Interned<MethodRef>, asm: &mut Assembly| {
         let signature = asm[method].sig();
         let return_int = match *asm[signature].output() {
-            Type::Int(int) if int.size() == Some(width.into()) => int,
+            Type::Int(int) if int.size() == Some(width) => int,
             ref output => panic!(
                 "atomic_xchng{}_correct has incompatible return type {output:?}",
                 width * 8
             ),
         };
         // locals: 0 = word_addr (i32*), 1 = shift (i32), 2 = observed_word (i32), 3 = prev (i32)
-        let i32_t = asm.alloc_type(Type::Int(Int::I32));
-        // Loc 0 is the `int32&` argument of `Interlocked.CompareExchange` — declare it as a
-        // pointer (`int32*`), not `int32`, or the JIT rejects the call (`InvalidProgramException`,
-        // StackUnexpected). See the matching note in `emulate_subword_cmp_xchng`.
-        let i32_ptr_t = asm.alloc_type(Type::Ptr(i32_t));
+        // Loc 0 is the `int32&` argument of `Interlocked.CompareExchange` — it must be a pointer.
+        let (i32_t, i32_ptr_t, word_addr, shift) = subword_address(asm);
         // --- bb0: containing-word address + sub-word bit shift. ---
-        let addr_ref = asm.alloc_node(CILNode::LdArg(0));
-        let addr_ptr = asm.alloc_node(CILNode::RefToPtr(addr_ref));
-        let addr_int = asm.alloc_node(CILNode::PtrCast(
-            addr_ptr,
-            Box::new(crate::cilnode::PtrCastRes::USize),
-        ));
-        let three = asm.alloc_node(Const::USize(3));
-        let not_three = asm.alloc_node(Const::USize(!3u64));
-        let word_addr_int = asm.alloc_node(CILNode::BinOp(addr_int, not_three, BinOp::And));
-        let word_addr = asm.alloc_node(CILNode::PtrCast(
-            word_addr_int,
-            Box::new(crate::cilnode::PtrCastRes::Ptr(i32_t)),
-        ));
-        let byte_off = asm.alloc_node(CILNode::BinOp(addr_int, three, BinOp::And));
-        let eight = asm.alloc_node(Const::USize(8));
-        let shift_usize = asm.alloc_node(CILNode::BinOp(byte_off, eight, BinOp::Mul));
-        let shift = asm.alloc_node(CILNode::IntCast {
-            input: shift_usize,
-            target: Int::I32,
-            extend: ExtendKind::ZeroExtend,
-        });
         let bb0 = vec![
             asm.alloc_root(CILRoot::StLoc(0, word_addr)),
             asm.alloc_root(CILRoot::StLoc(1, shift)),
@@ -92,20 +131,7 @@ pub fn emulate_subword_xchng(asm: &mut Assembly, patcher: &mut MissingMethodPatc
         let new_word = asm.alloc_node(CILNode::BinOp(cleared, new_at_shift, BinOp::Or));
         let ld_word_addr2 = asm.alloc_node(CILNode::LdLoc(0));
         let ld_observed_word2 = asm.alloc_node(CILNode::LdLoc(2));
-        let cmpxchng = asm.alloc_string("CompareExchange");
-        let i32_ref = asm.nref(Type::Int(Int::I32));
-        let cmpxchng_sig = asm.sig(
-            [i32_ref, Type::Int(Int::I32), Type::Int(Int::I32)],
-            Type::Int(Int::I32),
-        );
-        let interlocked = ClassRef::interlocked(asm);
-        let cmpxchng = asm.alloc_methodref(MethodRef::new(
-            interlocked,
-            cmpxchng,
-            cmpxchng_sig,
-            MethodKind::Static,
-            vec![].into(),
-        ));
+        let cmpxchng = interlocked_compare_exchange_method(asm, Int::I32);
         let prev = asm.alloc_node(CILNode::call(
             cmpxchng,
             [ld_word_addr2, new_word, ld_observed_word2],
@@ -186,45 +212,16 @@ pub fn emulate_subword_cmp_xchng(
     let generator = move |method: Interned<MethodRef>, asm: &mut Assembly| {
         let signature = asm[method].sig();
         let return_int = match *asm[signature].output() {
-            Type::Int(int) if int.size() == Some(width.into()) => int,
+            Type::Int(int) if int.size() == Some(width) => int,
             ref output => panic!(
                 "atomic_cmpxchng{}_correct has incompatible return type {output:?}",
                 width * 8
             ),
         };
         // locals: 0 = word_addr (i32*), 1 = shift (i32), 2 = observed_word (i32), 3 = observed_sub (i32)
-        let i32_t = asm.alloc_type(Type::Int(Int::I32));
-        // Loc 0 holds the containing-word ADDRESS and is passed as the `int32&` argument of
-        // `Interlocked.CompareExchange(int32&,int32,int32)`. It MUST be declared as a pointer
-        // (`int32*`), not `int32`: a plain-`int32` local loaded onto the stack is NOT a
-        // managed/unmanaged pointer, so the JIT rejects the call with
-        // `InvalidProgramException` (StackUnexpected: int32 where int32& expected). With the
-        // local typed `int32*`, `ldloc.0` yields a pointer the runtime accepts for `int32&`.
-        let i32_ptr_t = asm.alloc_type(Type::Ptr(i32_t));
+        // Loc 0 holds the containing-word address and is passed as the `int32&` argument.
+        let (i32_t, i32_ptr_t, word_addr, shift) = subword_address(asm);
         // --- bb0: compute the containing-word address and the sub-word bit shift. ---
-        let addr_ref = asm.alloc_node(CILNode::LdArg(0));
-        let addr_ptr = asm.alloc_node(CILNode::RefToPtr(addr_ref));
-        let addr_int = asm.alloc_node(CILNode::PtrCast(
-            addr_ptr,
-            Box::new(crate::cilnode::PtrCastRes::USize),
-        ));
-        // word_addr = (i32*)(addr & ~3)
-        let three = asm.alloc_node(Const::USize(3));
-        let not_three = asm.alloc_node(Const::USize(!3u64));
-        let word_addr_int = asm.alloc_node(CILNode::BinOp(addr_int, not_three, BinOp::And));
-        let word_addr = asm.alloc_node(CILNode::PtrCast(
-            word_addr_int,
-            Box::new(crate::cilnode::PtrCastRes::Ptr(i32_t)),
-        ));
-        // shift = (i32)((addr & 3) * 8)
-        let byte_off = asm.alloc_node(CILNode::BinOp(addr_int, three, BinOp::And));
-        let eight = asm.alloc_node(Const::USize(8));
-        let shift_usize = asm.alloc_node(CILNode::BinOp(byte_off, eight, BinOp::Mul));
-        let shift = asm.alloc_node(CILNode::IntCast {
-            input: shift_usize,
-            target: Int::I32,
-            extend: ExtendKind::ZeroExtend,
-        });
         let bb0 = vec![
             asm.alloc_root(CILRoot::StLoc(0, word_addr)),
             asm.alloc_root(CILRoot::StLoc(1, shift)),
@@ -285,20 +282,7 @@ pub fn emulate_subword_cmp_xchng(
         let new_at_shift = asm.alloc_node(CILNode::BinOp(new_masked, ld_shift3, BinOp::Shl));
         let new_word = asm.alloc_node(CILNode::BinOp(cleared, new_at_shift, BinOp::Or));
         // prev = Interlocked.CompareExchange(word_addr, new_word, observed_word)
-        let cmpxchng = asm.alloc_string("CompareExchange");
-        let i32_ref = asm.nref(Type::Int(Int::I32));
-        let cmpxchng_sig = asm.sig(
-            [i32_ref, Type::Int(Int::I32), Type::Int(Int::I32)],
-            Type::Int(Int::I32),
-        );
-        let interlocked = ClassRef::interlocked(asm);
-        let cmpxchng = asm.alloc_methodref(MethodRef::new(
-            interlocked,
-            cmpxchng,
-            cmpxchng_sig,
-            MethodKind::Static,
-            vec![].into(),
-        ));
+        let cmpxchng = interlocked_compare_exchange_method(asm, Int::I32);
         let prev = asm.alloc_node(CILNode::call(
             cmpxchng,
             [ld_word_addr2, new_word, ld_observed_word],
@@ -353,22 +337,11 @@ pub fn compare_exchange(
     comaprand: Interned<CILNode>,
     native_subword: bool,
 ) -> Interned<CILNode> {
-    match int.size().unwrap_or(8) {
-        1 | 2 if native_subword => {
-            let compare_exchange = asm.alloc_string("CompareExchange");
-            let tpe = Type::Int(int);
-            let tref = asm.nref(tpe);
-            let cmpxchng_sig = asm.sig([tref, tpe, tpe], tpe);
-            let interlocked = ClassRef::interlocked(asm);
-            let mref = asm.alloc_methodref(MethodRef::new(
-                interlocked,
-                compare_exchange,
-                cmpxchng_sig,
-                MethodKind::Static,
-                vec![].into(),
-            ));
-            asm.alloc_node(CILNode::call(mref, [addr, value, comaprand]))
-        }
+    let size = int.size().unwrap_or(8);
+    if (native_subword && matches!(size, 1 | 2)) || matches!(size, 4 | 8) {
+        return interlocked_compare_exchange(asm, int, addr, value, comaprand);
+    }
+    match size {
         // Sub-word (u8/i8/u16/i16) CAS via the COMPARAND-CHECKED `_correct` builtin. The old path
         // called `atomic_cmpxchng{8,16}_i32`, which splices the new sub-word UNCONDITIONALLY — it
         // never reads the comparand, so it is an atomic *exchange*, not a CAS. As the inner step of
@@ -398,23 +371,6 @@ pub fn compare_exchange(
                 vec![].into(),
             ));
             asm.alloc_node(CILNode::call(mref, [addr, comaprand, value]))
-        }
-        4..=8 => {
-            let compare_exchange = asm.alloc_string("CompareExchange");
-
-            let tpe = Type::Int(int);
-            let tref = asm.nref(tpe);
-            let cmpxchng_sig = asm.sig([tref, tpe, tpe], tpe);
-            let interlocked = ClassRef::interlocked(asm);
-            let mref = asm.alloc_methodref(MethodRef::new(
-                interlocked,
-                compare_exchange,
-                cmpxchng_sig,
-                MethodKind::Static,
-                vec![].into(),
-            ));
-
-            asm.alloc_node(CILNode::call(mref, [addr, value, comaprand]))
         }
         _ => todo!("Can't cmpxchng {int:?}"),
     }

@@ -41,54 +41,10 @@ fn min(ty: Ty, asm: &mut Assembly) -> Node {
         TyKind::Int(IntTy::I16) => asm.alloc_node(i16::MIN),
         TyKind::Int(IntTy::I32) => asm.alloc_node(i32::MIN),
         TyKind::Int(IntTy::I64) => asm.alloc_node(i64::MIN),
-        TyKind::Uint(UintTy::Usize) => {
-            let mref = MethodRef::new(
-                ClassRef::usize_type(asm),
-                asm.alloc_string("get_MinValue"),
-                asm.sig([], Type::Int(Int::USize)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
-            asm.call(mref, &EMPTY, IsPure::NOT)
-        }
-        TyKind::Int(IntTy::Isize) => {
-            let mref = MethodRef::new(
-                ClassRef::isize_type(asm),
-                asm.alloc_string("get_MinValue"),
-                asm.sig([], Type::Int(Int::ISize)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
-            asm.call(mref, &EMPTY, IsPure::NOT)
-        }
-        TyKind::Uint(UintTy::U128) => {
-            let mref = MethodRef::new(
-                ClassRef::uint_128(asm),
-                asm.alloc_string("get_MinValue"),
-                asm.sig([], Type::Int(Int::U128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
-            asm.call(mref, &EMPTY, IsPure::NOT)
-        }
-        TyKind::Int(IntTy::I128) => {
-            let mref = MethodRef::new(
-                ClassRef::int_128(asm),
-                asm.alloc_string("get_MinValue"),
-                asm.sig([], Type::Int(Int::I128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
-            asm.call(mref, &EMPTY, IsPure::NOT)
-        }
+        TyKind::Uint(UintTy::Usize) => bcl_bound(asm, Int::USize, "get_MinValue"),
+        TyKind::Int(IntTy::Isize) => bcl_bound(asm, Int::ISize, "get_MinValue"),
+        TyKind::Uint(UintTy::U128) => bcl_bound(asm, Int::U128, "get_MinValue"),
+        TyKind::Int(IntTy::I128) => bcl_bound(asm, Int::I128, "get_MinValue"),
         _ => todo!("Can't get min of {ty:?}"),
     }
 }
@@ -102,80 +58,48 @@ fn max(ty: Ty, asm: &mut Assembly) -> Node {
         TyKind::Int(IntTy::I16) => asm.alloc_node(i16::MAX),
         TyKind::Int(IntTy::I32) => asm.alloc_node(i32::MAX),
         TyKind::Int(IntTy::I64) => asm.alloc_node(i64::MAX),
-        TyKind::Uint(UintTy::Usize) => {
-            let mref = MethodRef::new(
-                ClassRef::usize_type(asm),
-                asm.alloc_string("get_MaxValue"),
-                asm.sig([], Type::Int(Int::USize)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
-            asm.call(mref, &EMPTY, IsPure::NOT)
-        }
-        TyKind::Int(IntTy::Isize) => {
-            let mref = MethodRef::new(
-                ClassRef::isize_type(asm),
-                asm.alloc_string("get_MaxValue"),
-                asm.sig([], Type::Int(Int::ISize)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
-            asm.call(mref, &EMPTY, IsPure::NOT)
-        }
-        TyKind::Uint(UintTy::U128) => {
-            let mref = MethodRef::new(
-                ClassRef::uint_128(asm),
-                asm.alloc_string("get_MaxValue"),
-                asm.sig([], Type::Int(Int::U128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
-            asm.call(mref, &EMPTY, IsPure::NOT)
-        }
-        TyKind::Int(IntTy::I128) => {
-            let mref = MethodRef::new(
-                ClassRef::int_128(asm),
-                asm.alloc_string("get_MaxValue"),
-                asm.sig([], Type::Int(Int::I128)),
-                MethodKind::Static,
-                vec![].into(),
-            );
-            let mref = asm.alloc_methodref(mref);
-            const EMPTY: [Interned<cilly::ir::CILNode>; 0] = [];
-            asm.call(mref, &EMPTY, IsPure::NOT)
-        }
+        TyKind::Uint(UintTy::Usize) => bcl_bound(asm, Int::USize, "get_MaxValue"),
+        TyKind::Int(IntTy::Isize) => bcl_bound(asm, Int::ISize, "get_MaxValue"),
+        TyKind::Uint(UintTy::U128) => bcl_bound(asm, Int::U128, "get_MaxValue"),
+        TyKind::Int(IntTy::I128) => bcl_bound(asm, Int::I128, "get_MaxValue"),
         _ => todo!("Can't get max of {ty:?}"),
     }
 }
 
-/// `conv_u8` mirror: zero-extend to U8.
-fn cu8(ctx: &mut MethodCompileCtx<'_, '_>, v: Node) -> Node {
-    ctx.int_cast(v, Int::U8, ExtendKind::ZeroExtend)
+fn bcl_bound(asm: &mut Assembly, int: Int, name: &'static str) -> Node {
+    let class = match int {
+        Int::USize => ClassRef::usize_type(asm),
+        Int::ISize => ClassRef::isize_type(asm),
+        Int::U128 => ClassRef::uint_128(asm),
+        Int::I128 => ClassRef::int_128(asm),
+        _ => unreachable!("BCL bounds are only needed for platform and 128-bit integers"),
+    };
+    let method = MethodRef::new(
+        class,
+        asm.alloc_string(name),
+        asm.sig([], Type::Int(int)),
+        MethodKind::Static,
+        vec![].into(),
+    );
+    let method = asm.alloc_methodref(method);
+    asm.call(method, &[] as &[Node], IsPure::NOT)
 }
-fn cu32(ctx: &mut MethodCompileCtx<'_, '_>, v: Node) -> Node {
-    ctx.int_cast(v, Int::U32, ExtendKind::ZeroExtend)
+
+macro_rules! int_cast {
+    ($name:ident, $int:ident, $extend:ident) => {
+        fn $name(ctx: &mut MethodCompileCtx<'_, '_>, v: Node) -> Node {
+            ctx.int_cast(v, Int::$int, ExtendKind::$extend)
+        }
+    };
 }
-fn cu64(ctx: &mut MethodCompileCtx<'_, '_>, v: Node) -> Node {
-    ctx.int_cast(v, Int::U64, ExtendKind::ZeroExtend)
-}
-fn ci16(ctx: &mut MethodCompileCtx<'_, '_>, v: Node) -> Node {
-    ctx.int_cast(v, Int::I16, ExtendKind::SignExtend)
-}
-fn ci32(ctx: &mut MethodCompileCtx<'_, '_>, v: Node) -> Node {
-    ctx.int_cast(v, Int::I32, ExtendKind::SignExtend)
-}
-fn ci64(ctx: &mut MethodCompileCtx<'_, '_>, v: Node) -> Node {
-    ctx.int_cast(v, Int::I64, ExtendKind::SignExtend)
-}
-fn ci8(ctx: &mut MethodCompileCtx<'_, '_>, v: Node) -> Node {
-    ctx.int_cast(v, Int::I8, ExtendKind::SignExtend)
-}
+
+int_cast!(cu8, U8, ZeroExtend);
+int_cast!(cu32, U32, ZeroExtend);
+int_cast!(cu64, U64, ZeroExtend);
+int_cast!(ci16, I16, SignExtend);
+int_cast!(ci32, I32, SignExtend);
+int_cast!(ci64, I64, SignExtend);
+int_cast!(ci8, I8, SignExtend);
 
 pub fn mul<'tcx>(
     ops_a: Node,
@@ -475,14 +399,21 @@ pub fn add_signed<'tcx>(
         _ => (),
     }
     let res = super::add_unchecked(ty, ty, ctx, ops_a, ops_b);
-    // (a < 0 && b < 0 && res > 0) || (a > 0 && b > 0 && res < 0)
+    // (a < 0 && b < 0 && res >= 0) || (a > 0 && b > 0 && res < 0)
+    //
+    // The non-negative check is deliberately expressed as `!(res < 0)` rather
+    // than `res > 0`.  In a wrapping integer domain `MIN + MIN` can produce
+    // zero, which is still an overflow even though it is not strictly
+    // positive (the previous predicate missed this edge case for i64/i128).
     let z = zero(ty, ctx);
     let a_lt = super::lt_unchecked(ty, ops_a, z, ctx);
     let z = zero(ty, ctx);
     let b_lt = super::lt_unchecked(ty, ops_b, z, ctx);
     let z = zero(ty, ctx);
-    let res_gt = super::gt_unchecked(ty, res, z, ctx);
-    let inner_left = ctx.biop(b_lt, res_gt, BinOp::And);
+    let res_lt = super::lt_unchecked(ty, res, z, ctx);
+    let f = ctx.alloc_node(false);
+    let res_non_negative = ctx.biop(res_lt, f, BinOp::Eq);
+    let inner_left = ctx.biop(b_lt, res_non_negative, BinOp::And);
     let left = ctx.biop(a_lt, inner_left, BinOp::And);
 
     let z = zero(ty, ctx);

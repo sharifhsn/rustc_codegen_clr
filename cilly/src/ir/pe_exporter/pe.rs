@@ -1122,7 +1122,7 @@ fn write_base_relocation_block(out: &mut Vec<u8>, fixup_rva: u32) {
     const PAGE_SIZE: u32 = 0x1000;
     let page_rva = fixup_rva & !(PAGE_SIZE - 1);
     let offset_in_page = fixup_rva - page_rva;
-    let entry = (u16::from(IMAGE_REL_BASED_HIGHLOW) << 12) | u16::try_from(offset_in_page).unwrap();
+    let entry = (IMAGE_REL_BASED_HIGHLOW << 12) | u16::try_from(offset_in_page).unwrap();
     out.extend_from_slice(&page_rva.to_le_bytes());
     out.extend_from_slice(&RELOC_CONTENT_LEN.to_le_bytes()); // BlockSize: 8-byte header + 1 entry (2B) + 2B ABSOLUTE padding = 12.
     out.extend_from_slice(&entry.to_le_bytes());
@@ -1714,7 +1714,7 @@ mod tests {
         );
         assert_eq!(&data[checksum_off..checksum_off + 7], b"SHA256\0");
 
-        assert!(pe.sections.is_empty() == false, "at least .text must exist");
+        assert!(!pe.sections.is_empty(), "at least .text must exist");
     }
 
     /// Regression test for a real, confirmed macOS ARM64 CoreCLR load bug (`FileLoadException

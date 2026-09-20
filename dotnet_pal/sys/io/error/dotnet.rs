@@ -57,6 +57,7 @@ pub fn decode_error_kind(code: i32) -> crate::io::ErrorKind {
     match code {
         1 => ErrorKind::PermissionDenied,        // EPERM
         2 => ErrorKind::NotFound,                // ENOENT
+        22 => ErrorKind::InvalidInput,            // EINVAL
         13 => ErrorKind::PermissionDenied,       // EACCES
         11 => ErrorKind::WouldBlock,             // EAGAIN/EWOULDBLOCK (load-bearing)
         98 => ErrorKind::AddrInUse,              // EADDRINUSE
@@ -75,6 +76,7 @@ pub fn error_string(errno: i32) -> String {
     match errno {
         0 => "success".to_string(),
         2 => "no such file or directory".to_string(),
+        22 => "invalid argument".to_string(),
         11 => "resource temporarily unavailable".to_string(),
         13 => "permission denied".to_string(),
         98 => "address already in use".to_string(),
@@ -83,4 +85,12 @@ pub fn error_string(errno: i32) -> String {
         111 => "connection refused".to_string(),
         _ => format!("error {errno}"),
     }
+}
+
+/// Format the thread-local errno for `std::io::Error`'s display implementation.  The managed
+/// PAL does not expose a `strerror_r`-style API, so preserve the same deterministic numeric text
+/// returned by `error_string` instead of leaving the current-nightly `format_error` re-export
+/// unresolved.
+pub fn format_error(errno: i32, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+    f.write_str(&error_string(errno))
 }

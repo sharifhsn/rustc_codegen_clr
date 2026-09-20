@@ -34,7 +34,7 @@ use rustc_middle::mir::interpret::{AllocId, GlobalAlloc};
 use rustc_middle::mir::{Mutability, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::mono::{CollectionMode, MonoItem};
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::{GenericArgs, Instance, InstanceKind, TyCtxt, TyKind, TypingEnv};
+use rustc_middle::ty::{GenericArgs, Instance, InstanceKind, ShimKind, TyCtxt, TyKind, TypingEnv};
 
 use crate::utilis::{garg_to_bool, garg_to_usize};
 
@@ -460,12 +460,11 @@ pub fn interpret<'tcx>(
         for statement in &block_data.statements {
             if let StatementKind::Assign(bx) = &statement.kind {
                 let (target, rvalue) = bx.as_ref();
-                if let Rvalue::Use(src, _) = rvalue {
-                    if let (Some(src_local), Some(tgt_local)) =
+                if let Rvalue::Use(src, _) = rvalue
+                    && let (Some(src_local), Some(tgt_local)) =
                         (src.place().and_then(|p| p.as_local()), target.as_local())
-                    {
-                        locals[usize::from(tgt_local)] = locals[usize::from(src_local)].clone();
-                    }
+                {
+                    locals[usize::from(tgt_local)] = locals[usize::from(src_local)].clone();
                 }
                 // Rvalue::Cast(ReifyFnPointer, ..) and others: ignored — the method's fn is read from
                 // the call's generic args, not from a tracked local.
@@ -488,7 +487,9 @@ pub fn interpret<'tcx>(
                 let TyKind::FnDef(def_id, subst_ref) = func_ty.kind() else {
                     return;
                 };
-                let subst_ref = ctx.monomorphize(*subst_ref);
+                let subst_ref = subst_ref
+                    .no_bound_vars()
+                    .expect("comptime: function definition had bound generic arguments");
                 let env = TypingEnv::fully_monomorphized();
                 let call_instance = Instance::try_resolve(ctx.tcx(), env, *def_id, subst_ref)
                     .expect("comptime: invalid function def")
@@ -556,7 +557,7 @@ pub fn interpret<'tcx>(
                     let nullability = garg_to_string(subst_ref[2], ctx.tcx())
                         .parse::<u8>()
                         .ok()
-                        .filter(|flag| matches!(flag, 0 | 1 | 2))
+                        .filter(|flag| matches!(flag, 0..=2))
                         .expect("comptime: field nullability must be 0, 1, or 2");
                     class.fields.push((tpe, field_name));
                     class.field_nullability.push(nullability);
@@ -604,7 +605,7 @@ pub fn interpret<'tcx>(
                     let nullability = garg_to_string(subst_ref[1], ctx.tcx())
                         .parse::<u8>()
                         .ok()
-                        .filter(|flag| matches!(flag, 0 | 1 | 2))
+                        .filter(|flag| matches!(flag, 0..=2))
                         .expect(
                             "comptime: base constructor argument nullability must be 0, 1, or 2",
                         );
@@ -624,7 +625,9 @@ pub fn interpret<'tcx>(
                     let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
                         panic!("comptime: method target is not a function definition");
                     };
-                    let fsubst = ctx.monomorphize(*fsubst);
+                    let fsubst = fsubst
+                        .no_bound_vars()
+                        .expect("comptime: method target had bound generic arguments");
                     let target = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
                         .expect("comptime: invalid method target")
                         .expect("comptime: could not resolve method target instance");
@@ -655,7 +658,9 @@ pub fn interpret<'tcx>(
                             "comptime: abstract method signature carrier is not a function definition"
                         );
                     };
-                    let fsubst = ctx.monomorphize(*fsubst);
+                    let fsubst = fsubst
+                        .no_bound_vars()
+                        .expect("comptime: abstract method carrier had bound generic arguments");
                     let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
                         .expect("comptime: invalid abstract method signature carrier")
                         .expect("comptime: could not resolve abstract method signature carrier instance");
@@ -712,7 +717,9 @@ pub fn interpret<'tcx>(
                             "comptime: generic abstract method signature carrier is not a function definition"
                         );
                     };
-                    let fsubst = ctx.monomorphize(*fsubst);
+                    let fsubst = fsubst.no_bound_vars().expect(
+                        "comptime: generic abstract method carrier had bound generic arguments",
+                    );
                     let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
                         .expect("comptime: invalid generic abstract method signature carrier")
                         .expect("comptime: could not resolve generic abstract method signature carrier instance");
@@ -814,7 +821,9 @@ pub fn interpret<'tcx>(
                             "comptime: default interface method target is not a function definition"
                         );
                     };
-                    let fsubst = ctx.monomorphize(*fsubst);
+                    let fsubst = fsubst
+                        .no_bound_vars()
+                        .expect("comptime: default method target had bound generic arguments");
                     let target = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
                         .expect("comptime: invalid default interface method target")
                         .expect(
@@ -851,7 +860,9 @@ pub fn interpret<'tcx>(
                             "comptime: static abstract method signature carrier is not a function definition"
                         );
                     };
-                    let fsubst = ctx.monomorphize(*fsubst);
+                    let fsubst = fsubst.no_bound_vars().expect(
+                        "comptime: static abstract method carrier had bound generic arguments",
+                    );
                     let carrier = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
                         .expect("comptime: invalid static abstract method signature carrier")
                         .expect("comptime: could not resolve static abstract method signature carrier instance");
@@ -938,7 +949,9 @@ pub fn interpret<'tcx>(
                     let TyKind::FnDef(fdef, fsubst) = fn_ty.kind() else {
                         panic!("comptime: static method target is not a function definition");
                     };
-                    let fsubst = ctx.monomorphize(*fsubst);
+                    let fsubst = fsubst
+                        .no_bound_vars()
+                        .expect("comptime: static method target had bound generic arguments");
                     let target = Instance::try_resolve(ctx.tcx(), env, *fdef, fsubst)
                         .expect("comptime: invalid static method target")
                         .expect("comptime: could not resolve static method target instance");
@@ -1139,7 +1152,6 @@ pub fn interpret<'tcx>(
                 };
                 block_id = *next;
             }
-            TerminatorKind::Return => return,
             // Be lenient: a diverging/odd terminator just ends interpretation.
             _ => return,
         }
@@ -1213,11 +1225,10 @@ const CLR_OPERATOR_METHOD_NAMES: &[&str] = &[
 fn well_known_primitive_type(name: &str) -> Option<Type> {
     Some(match name {
         "System.Boolean" => Type::Bool,
-        "System.Char" => Int::U16.into(),
+        "System.Char" | "System.UInt16" => Int::U16.into(),
         "System.SByte" => Int::I8.into(),
         "System.Byte" => Int::U8.into(),
         "System.Int16" => Int::I16.into(),
-        "System.UInt16" => Int::U16.into(),
         "System.Int32" => Int::I32.into(),
         "System.UInt32" => Int::U32.into(),
         "System.Int64" => Int::I64.into(),
@@ -1798,8 +1809,7 @@ fn annotate_method_nullability(
     parameter_flags: &[u8],
 ) -> MethodDef {
     assert!(
-        matches!(return_flag, 0 | 1 | 2)
-            && parameter_flags.iter().all(|flag| matches!(flag, 0 | 1 | 2)),
+        matches!(return_flag, 0..=2) && parameter_flags.iter().all(|flag| matches!(flag, 0..=2)),
         "comptime: nullable-reference flags must be 0, 1, or 2"
     );
     if return_flag == 0 && parameter_flags.iter().all(|flag| *flag == 0) {
@@ -1908,7 +1918,7 @@ impl<'tcx> AliasMonoClosure<'tcx> {
             let ty = instance.ty(self.tcx, TypingEnv::fully_monomorphized());
             let drop = Instance::resolve_drop_glue(self.tcx, ty);
             if self.tcx.should_codegen_locally(drop)
-                && !matches!(drop.def, InstanceKind::DropGlue(_, None))
+                && !matches!(drop.def, InstanceKind::Shim(ShimKind::DropGlue(_, None)))
             {
                 self.visit(MonoItem::Fn(drop));
             }
@@ -1920,7 +1930,7 @@ impl<'tcx> AliasMonoClosure<'tcx> {
         }
         if self.tcx.needs_thread_local_shim(def_id) {
             self.visit(MonoItem::Fn(Instance {
-                def: InstanceKind::ThreadLocalShim(def_id),
+                def: InstanceKind::Shim(ShimKind::ThreadLocal(def_id)),
                 args: GenericArgs::empty(),
             }));
         }
@@ -1983,6 +1993,162 @@ fn method_ref_has_body(method: Interned<MethodRef>, ctx: &MethodCompileCtx<'_, '
     })
 }
 
+fn pending_member_arg_names<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    carrier: Instance<'tcx>,
+    signature: &cilly::FnSig,
+    method_name: &str,
+    parameter_names: &[String],
+    has_receiver: bool,
+) -> Vec<Option<Interned<cilly::IString>>> {
+    let input_count = signature.inputs().len();
+    let receiver_count = usize::from(has_receiver);
+    if parameter_names.is_empty() && input_count > receiver_count {
+        return crate::assembly::carrier_arg_names(carrier, 0, input_count, ctx);
+    }
+    assert_eq!(
+        parameter_names.len() + receiver_count,
+        input_count,
+        "comptime: managed method `{method_name}` declared {} parameter name(s), but its signature has {} input(s)",
+        parameter_names.len(),
+        input_count.saturating_sub(receiver_count),
+    );
+    has_receiver
+        .then_some(None)
+        .into_iter()
+        .chain(
+            parameter_names
+                .iter()
+                .map(|name| Some(ctx.alloc_string(name.clone()))),
+        )
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_alias_member<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    class_idx: ClassDefIdx,
+    class: &PendingClass<'tcx>,
+    method_name: &str,
+    target: Instance<'tcx>,
+    parameter_names: &[String],
+    nullability: &str,
+    member_kind: PendingMemberKind,
+    member_index: usize,
+    method_kind: MethodKind,
+    has_receiver: bool,
+) -> MethodDef {
+    let fn_sig = AbiPlan::from_instance(target, ctx).signature().clone();
+    let receiver_count = usize::from(has_receiver);
+    let arg_names = pending_member_arg_names(
+        ctx,
+        target,
+        &fn_sig,
+        method_name,
+        parameter_names,
+        has_receiver,
+    );
+    let sig = ctx.alloc_sig(fn_sig);
+    let target_ref = method_ref_for_instance(target, ctx);
+    ensure_alias_target_defined(target, target_ref, ctx);
+    let mname = ctx.alloc_string(method_name.to_owned());
+    let mut mdef = MethodDef::new(
+        Access::Extern,
+        class_idx,
+        mname,
+        sig,
+        method_kind,
+        MethodImpl::AliasFor(target_ref),
+        arg_names,
+    );
+    if let Some((context, return_flag, parameter_flags)) = parse_nullability_spec(
+        nullability,
+        ctx[sig].inputs().len().saturating_sub(receiver_count),
+    ) {
+        mdef = mdef.with_nullability(context, return_flag, parameter_flags);
+    }
+    mdef = attach_pending_member_attrs(
+        ctx,
+        mdef,
+        class,
+        PendingMemberTarget {
+            kind: member_kind,
+            index: member_index,
+        },
+        ctx[sig].inputs().len().saturating_sub(receiver_count),
+    );
+    mdef
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_missing_member<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    class_idx: ClassDefIdx,
+    method_name: &str,
+    carrier: Instance<'tcx>,
+    fn_sig: cilly::FnSig,
+    parameter_names: &[String],
+    has_receiver: bool,
+    out_params: &[u16],
+    generic_names: &[String],
+    nullability: &str,
+    member_kind: PendingMemberKind,
+    member_index: usize,
+    class: &PendingClass<'tcx>,
+) -> MethodDef {
+    let receiver_count = usize::from(has_receiver);
+    let arg_names = pending_member_arg_names(
+        ctx,
+        carrier,
+        &fn_sig,
+        method_name,
+        parameter_names,
+        has_receiver,
+    );
+    let sig = ctx.alloc_sig(fn_sig);
+    let mut mdef = MethodDef::new(
+        Access::Extern,
+        class_idx,
+        ctx.alloc_string(method_name),
+        sig,
+        if has_receiver {
+            MethodKind::Virtual
+        } else {
+            MethodKind::Static
+        },
+        MethodImpl::Missing,
+        arg_names,
+    )
+    .with_abstract();
+    if !out_params.is_empty() {
+        mdef = mdef.with_out_params(out_params.to_vec());
+    }
+    if !generic_names.is_empty() {
+        mdef = mdef.with_generic_params(
+            generic_names
+                .iter()
+                .map(|name| ctx.alloc_string(name.clone()))
+                .collect(),
+        );
+    }
+    if let Some((context, return_flag, parameter_flags)) = parse_nullability_spec(
+        nullability,
+        ctx[sig].inputs().len().saturating_sub(receiver_count),
+    ) {
+        mdef = mdef.with_nullability(context, return_flag, parameter_flags);
+    }
+    attach_pending_member_attrs(
+        ctx,
+        mdef,
+        class,
+        PendingMemberTarget {
+            kind: member_kind,
+            index: member_index,
+        },
+        ctx[sig].inputs().len().saturating_sub(receiver_count),
+    )
+}
+
 /// Ensures a comptime-declared managed member's complete Rust mono graph is defined in this shard.
 ///
 /// The declaration is an extra backend reachability root: rustc cannot infer it from an
@@ -2030,6 +2196,136 @@ fn ensure_alias_target_defined<'tcx>(
         "comptime alias target `{}` was not emitted by its monomorphization closure",
         tcx.def_path_str(target.def_id())
     );
+}
+
+fn emit_field_property<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    class_idx: ClassDefIdx,
+    class: &PendingClass<'tcx>,
+    field_index: usize,
+    receiver: Type,
+    method_kind: MethodKind,
+) {
+    let (tpe, fname) = &class.fields[field_index];
+    let tpe = *tpe;
+    let nullability = class.field_nullability[field_index];
+    let fname_str = ctx.alloc_string(fname.clone());
+    let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, tpe));
+    let mut prop_name_str = fname.clone();
+    if let Some(first) = prop_name_str.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+
+    let this = ctx.alloc_node(CILNode::LdArg(0));
+    let load = ctx.ld_field(this, fdesc);
+    let ret = ctx.alloc_root(CILRoot::Ret(load));
+    let getter_sig = ctx.sig([receiver], tpe);
+    let getter_name = ctx.alloc_string(format!("get_{prop_name_str}"));
+    let getter_def = MethodDef::new(
+        Access::Extern,
+        class_idx,
+        getter_name,
+        getter_sig,
+        method_kind,
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        },
+        vec![None],
+    );
+    let getter_def = annotate_method_nullability(getter_def, nullability, &[]);
+    let getter_ref = ctx.alloc_methodref(getter_def.ref_to());
+    ctx.new_method(getter_def);
+
+    let setter_ref = if class.has_readonly_properties {
+        None
+    } else {
+        let obj = ctx.alloc_node(CILNode::LdArg(0));
+        let value = ctx.alloc_node(CILNode::LdArg(1));
+        let store = ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value))));
+        let set_ret = ctx.alloc_root(CILRoot::VoidRet);
+        let setter_sig = ctx.sig([receiver, tpe], Type::Void);
+        let setter_name = ctx.alloc_string(format!("set_{prop_name_str}"));
+        let setter_def = MethodDef::new(
+            Access::Extern,
+            class_idx,
+            setter_name,
+            setter_sig,
+            method_kind,
+            MethodImpl::MethodBody {
+                blocks: vec![BasicBlock::new(vec![store, set_ret], 0, None)],
+                locals: vec![],
+            },
+            vec![None, None],
+        );
+        let setter_def = annotate_method_nullability(setter_def, 0, &[nullability]);
+        let setter_ref = ctx.alloc_methodref(setter_def.ref_to());
+        ctx.new_method(setter_def);
+        Some(setter_ref)
+    };
+
+    let prop_name = ctx.alloc_string(prop_name_str.clone());
+    let mut property = cilly::class::PropertyDef::new(prop_name, tpe, Some(getter_ref), setter_ref);
+    if nullability != 0 {
+        property = property.with_nullability(nullability);
+    }
+    if let Some(attributes) = class.property_custom_attrs.get(&prop_name_str) {
+        let attributes = attributes
+            .iter()
+            .map(|attribute| pending_custom_attr_to_cilly(ctx, attribute))
+            .collect();
+        property = property.with_custom_attributes(attributes);
+    }
+    ctx.class_mut(class_idx).add_property(property);
+}
+
+fn emit_constructor<'tcx>(
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    class_idx: ClassDefIdx,
+    class: &PendingClass<'tcx>,
+    signature: Interned<cilly::FnSig>,
+    roots: Vec<Interned<CILRoot>>,
+    arg_names: Vec<Option<Interned<cilly::IString>>>,
+    nullability: &[u8],
+) {
+    let access = if class.constructor_access == Access::Public {
+        Access::Extern
+    } else {
+        class.constructor_access
+    };
+    let name = ctx.alloc_string(".ctor");
+    let definition = MethodDef::new(
+        access,
+        class_idx,
+        name,
+        signature,
+        MethodKind::Constructor,
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(roots, 0, None)],
+            locals: vec![],
+        },
+        arg_names,
+    );
+    ctx.new_method(annotate_method_nullability(definition, 0, nullability));
+}
+
+fn base_ctor_args(ctx: &mut MethodCompileCtx<'_, '_>, count: usize) -> Vec<Interned<CILNode>> {
+    (0..=count)
+        .map(|index| {
+            ctx.alloc_node(CILNode::LdArg(
+                u32::try_from(index).expect("comptime: too many base ctor args"),
+            ))
+        })
+        .collect()
+}
+
+fn base_ctor_arg_names(
+    ctx: &mut MethodCompileCtx<'_, '_>,
+    count: usize,
+) -> Vec<Option<Interned<cilly::IString>>> {
+    std::iter::once(None)
+        .chain((0..count).map(|index| Some(ctx.alloc_string(format!("baseArg{index}")))))
+        .collect()
 }
 
 fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<'tcx>) {
@@ -2344,53 +2640,20 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     for (method_index, (method_name, target, parameter_names, nullability)) in
         class.methods.iter().enumerate()
     {
-        let fn_sig = AbiPlan::from_instance(*target, ctx).signature().clone();
-        let arg_names = if parameter_names.is_empty() && fn_sig.inputs().len() > 1 {
-            // Compatibility for the legacy hand-written intrinsic surface, which passes an empty
-            // name list. New macro expansions always provide the exact managed names.
-            crate::assembly::carrier_arg_names(*target, 0, fn_sig.inputs().len(), ctx)
-        } else {
-            assert_eq!(
-                parameter_names.len() + 1,
-                fn_sig.inputs().len(),
-                "comptime: instance method `{method_name}` declared {} managed parameter name(s), but its signature has {} caller-visible parameter(s)",
-                parameter_names.len(),
-                fn_sig.inputs().len().saturating_sub(1),
-            );
-            let mut names = Vec::with_capacity(fn_sig.inputs().len());
-            names.push(None); // implicit `this`
-            for parameter_name in parameter_names {
-                names.push(Some(ctx.alloc_string(parameter_name.clone())));
-            }
-            names
-        };
-        let sig = ctx.alloc_sig(fn_sig);
-        let target_name = fn_name_for_instance(ctx.tcx(), *target);
-        let target_name = ctx.alloc_string(target_name);
-        let main_module = *ctx.main_module();
-        let target_mref =
-            MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
-        let target_ref = ctx.alloc_methodref(target_mref);
-        ensure_alias_target_defined(*target, target_ref, ctx);
-        let mname = ctx.alloc_string(method_name.clone());
-        // `Access::Extern` marks this as a dead-code-elimination ROOT — a Rust-defined managed class is
-        // an exported surface with no internal caller, so (like `#[unsafe(no_mangle)]` exports) its methods must
-        // be roots or the whole class would be culled. The DCE also follows the `AliasFor` edge to keep
-        // the target Rust fn alive (see `Assembly::eliminate_dead_fns`).
-        let mut mdef = MethodDef::new(
-            Access::Extern,
+        let mut mdef = emit_alias_member(
+            ctx,
             class_idx,
-            mname,
-            sig,
+            class,
+            method_name,
+            *target,
+            parameter_names,
+            nullability,
+            PendingMemberKind::Instance,
+            method_index,
             MethodKind::Virtual,
-            MethodImpl::AliasFor(target_ref),
-            arg_names,
+            true,
         );
-        if let Some((context, return_flag, parameter_flags)) =
-            parse_nullability_spec(nullability, ctx[sig].inputs().len().saturating_sub(1))
-        {
-            mdef = mdef.with_nullability(context, return_flag, parameter_flags);
-        }
+        let sig = mdef.sig();
         if let Some((base_asm, base_type)) = class.method_overrides.get(method_name) {
             let base_cls = ctx.alloc_string(base_type.clone());
             let base_asm_ref = if base_asm.is_empty() {
@@ -2426,17 +2689,6 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             }
             entry.2 = Some(delegate_ty);
         }
-        let parameter_count = ctx[sig].inputs().len().saturating_sub(1);
-        mdef = attach_pending_member_attrs(
-            ctx,
-            mdef,
-            class,
-            PendingMemberTarget {
-                kind: PendingMemberKind::Instance,
-                index: method_index,
-            },
-            parameter_count,
-        );
         ctx.new_method(mdef);
     }
 
@@ -2490,56 +2742,22 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                  `#[dotnet_interface]` macro, which only accepts `#[dotnet_out]` on `&mut T`"
             );
         }
-        let arg_names = if parameter_names.is_empty() && fn_sig.inputs().len() > 1 {
-            crate::assembly::carrier_arg_names(*carrier, 1, fn_sig.inputs().len(), ctx)
-        } else {
-            assert_eq!(
-                parameter_names.len() + 1,
-                fn_sig.inputs().len(),
-                "comptime: abstract method `{method_name}` declared {} managed parameter name(s), but its receiver-bearing signature has {} input(s)",
-                parameter_names.len(),
-                fn_sig.inputs().len(),
-            );
-            let mut names = Vec::with_capacity(parameter_names.len() + 1);
-            names.push(None);
-            for parameter_name in parameter_names {
-                names.push(Some(ctx.alloc_string(parameter_name.clone())));
-            }
-            names
-        };
-        let sig = ctx.alloc_sig(fn_sig);
-        let mname = ctx.alloc_string(method_name.clone());
-        let mut mdef = MethodDef::new(
-            Access::Extern,
+        let mdef = emit_missing_member(
+            ctx,
             class_idx,
-            mname,
-            sig,
-            MethodKind::Virtual,
-            MethodImpl::Missing,
-            arg_names,
-        )
-        .with_abstract();
-        if !out_params.is_empty() {
-            mdef = mdef.with_out_params(out_params.clone());
-        }
-        // A generic method DEFINITION (`rustc_codegen_clr_add_generic_abstract_method_def`):
-        // attach the declared type-parameter names — the PE writer (export.rs Pass 3) stamps
-        // `SIG_GENERIC` + `GenParamCount` on the signature blob, emits one method-owned
-        // `GenericParam` row per name, and asserts every `!!N` marker in the signature is in
-        // range of this list.
-        if !generic_names.is_empty() {
-            mdef = mdef.with_generic_params(
-                generic_names
-                    .iter()
-                    .map(|n| ctx.alloc_string(n.clone()))
-                    .collect(),
-            );
-        }
-        if let Some((context, return_flag, parameter_flags)) =
-            parse_nullability_spec(nullability, ctx[sig].inputs().len().saturating_sub(1))
-        {
-            mdef = mdef.with_nullability(context, return_flag, parameter_flags);
-        }
+            method_name,
+            *carrier,
+            fn_sig,
+            parameter_names,
+            true,
+            out_params,
+            generic_names,
+            nullability,
+            PendingMemberKind::Abstract,
+            method_index,
+            class,
+        );
+        let sig = mdef.sig();
         // An abstract accessor of an INTERFACE event (`#[dotnet_event]` inside
         // `#[dotnet_interface]`) — same binding block as the virtual (class) loop above: the
         // delegate type is the accessor's own second signature input (index 0 is the receiver).
@@ -2622,17 +2840,6 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
             );
             *slot = Some((mref, mref_tpe));
         }
-        let parameter_count = ctx[sig].inputs().len().saturating_sub(1);
-        mdef = attach_pending_member_attrs(
-            ctx,
-            mdef,
-            class,
-            PendingMemberTarget {
-                kind: PendingMemberKind::Abstract,
-                index: method_index,
-            },
-            parameter_count,
-        );
         ctx.new_method(mdef);
     }
 
@@ -2692,48 +2899,20 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
         // name+signature, so the byref mapping must be consistent across both member kinds.
         // `skip = 0`: a static carrier has no receiver input.
         let fn_sig = byref_interface_sig(ctx, method_name, *carrier, physical_sig, 0);
-        let arg_names = if parameter_names.is_empty() && !fn_sig.inputs().is_empty() {
-            crate::assembly::carrier_arg_names(*carrier, 0, fn_sig.inputs().len(), ctx)
-        } else {
-            assert_eq!(
-                parameter_names.len(),
-                fn_sig.inputs().len(),
-                "comptime: static abstract method `{method_name}` declared {} managed parameter name(s), but its signature has {} input(s)",
-                parameter_names.len(),
-                fn_sig.inputs().len(),
-            );
-            parameter_names
-                .iter()
-                .map(|name| Some(ctx.alloc_string(name.clone())))
-                .collect()
-        };
-        let sig = ctx.alloc_sig(fn_sig);
-        let mname = ctx.alloc_string(method_name.clone());
-        let mut mdef = MethodDef::new(
-            Access::Extern,
-            class_idx,
-            mname,
-            sig,
-            MethodKind::Static,
-            MethodImpl::Missing,
-            arg_names,
-        )
-        .with_abstract();
-        if let Some((context, return_flag, parameter_flags)) =
-            parse_nullability_spec(nullability, ctx[sig].inputs().len())
-        {
-            mdef = mdef.with_nullability(context, return_flag, parameter_flags);
-        }
-        let parameter_count = ctx[sig].inputs().len();
-        mdef = attach_pending_member_attrs(
+        let mdef = emit_missing_member(
             ctx,
-            mdef,
+            class_idx,
+            method_name,
+            *carrier,
+            fn_sig,
+            parameter_names,
+            false,
+            &[],
+            &[],
+            nullability,
+            PendingMemberKind::StaticAbstract,
+            method_index,
             class,
-            PendingMemberTarget {
-                kind: PendingMemberKind::StaticAbstract,
-                index: method_index,
-            },
-            parameter_count,
         );
         ctx.new_method(mdef);
     }
@@ -2784,59 +2963,18 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
                  alias, which the `#[dotnet_interface]` macro cannot see"
             );
         }
-        let fn_sig = AbiPlan::from_instance(*target, ctx).signature().clone();
-        let arg_names = if parameter_names.is_empty() && fn_sig.inputs().len() > 1 {
-            crate::assembly::carrier_arg_names(*target, 0, fn_sig.inputs().len(), ctx)
-        } else {
-            assert_eq!(
-                parameter_names.len() + 1,
-                fn_sig.inputs().len(),
-                "comptime: default interface method `{method_name}` declared {} managed parameter name(s), but its receiver-bearing signature has {} input(s)",
-                parameter_names.len(),
-                fn_sig.inputs().len(),
-            );
-            let mut names = Vec::with_capacity(parameter_names.len() + 1);
-            names.push(None);
-            for parameter_name in parameter_names {
-                names.push(Some(ctx.alloc_string(parameter_name.clone())));
-            }
-            names
-        };
-        let sig = ctx.alloc_sig(fn_sig);
-        let target_name = fn_name_for_instance(ctx.tcx(), *target);
-        let target_name = ctx.alloc_string(target_name);
-        let main_module = *ctx.main_module();
-        let target_mref =
-            MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
-        let target_ref = ctx.alloc_methodref(target_mref);
-        ensure_alias_target_defined(*target, target_ref, ctx);
-        let mname = ctx.alloc_string(method_name.clone());
-        // `Access::Extern` = DCE root, and the `AliasFor` edge keeps the lifted Rust fn alive —
-        // same rationale as the class-virtual loop.
-        let mut mdef = MethodDef::new(
-            Access::Extern,
-            class_idx,
-            mname,
-            sig,
-            MethodKind::Virtual,
-            MethodImpl::AliasFor(target_ref),
-            arg_names,
-        );
-        if let Some((context, return_flag, parameter_flags)) =
-            parse_nullability_spec(nullability, ctx[sig].inputs().len().saturating_sub(1))
-        {
-            mdef = mdef.with_nullability(context, return_flag, parameter_flags);
-        }
-        let parameter_count = ctx[sig].inputs().len().saturating_sub(1);
-        mdef = attach_pending_member_attrs(
+        let mdef = emit_alias_member(
             ctx,
-            mdef,
+            class_idx,
             class,
-            PendingMemberTarget {
-                kind: PendingMemberKind::Default,
-                index: method_index,
-            },
-            parameter_count,
+            method_name,
+            *target,
+            parameter_names,
+            nullability,
+            PendingMemberKind::Default,
+            method_index,
+            MethodKind::Virtual,
+            true,
         );
         ctx.new_method(mdef);
     }
@@ -2865,63 +3003,25 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     for (method_index, (method_name, target, parameter_names, nullability)) in
         class.static_methods.iter().enumerate()
     {
-        let fn_sig = AbiPlan::from_instance(*target, ctx).signature().clone();
-        let arg_names = if parameter_names.is_empty() && !fn_sig.inputs().is_empty() {
-            crate::assembly::carrier_arg_names(*target, 0, fn_sig.inputs().len(), ctx)
-        } else {
-            assert_eq!(
-                parameter_names.len(),
-                fn_sig.inputs().len(),
-                "comptime: static method `{method_name}` declared {} managed parameter name(s), but its signature has {} parameter(s)",
-                parameter_names.len(),
-                fn_sig.inputs().len(),
-            );
-            let mut names = Vec::with_capacity(parameter_names.len());
-            for parameter_name in parameter_names {
-                names.push(Some(ctx.alloc_string(parameter_name.clone())));
-            }
-            names
-        };
-        let sig = ctx.alloc_sig(fn_sig);
-        let target_name = fn_name_for_instance(ctx.tcx(), *target);
-        let target_name = ctx.alloc_string(target_name);
-        let main_module = *ctx.main_module();
-        let target_mref =
-            MethodRef::new(main_module, target_name, sig, MethodKind::Static, [].into());
-        let target_ref = ctx.alloc_methodref(target_mref);
-        ensure_alias_target_defined(*target, target_ref, ctx);
-        let mname = ctx.alloc_string(method_name.clone());
-        let mut mdef = MethodDef::new(
-            Access::Extern,
+        let mut mdef = emit_alias_member(
+            ctx,
             class_idx,
-            mname,
-            sig,
+            class,
+            method_name,
+            *target,
+            parameter_names,
+            nullability,
+            PendingMemberKind::Static,
+            method_index,
             MethodKind::Static,
-            MethodImpl::AliasFor(target_ref),
-            arg_names,
+            false,
         );
-        if let Some((context, return_flag, parameter_flags)) =
-            parse_nullability_spec(nullability, ctx[sig].inputs().len())
-        {
-            mdef = mdef.with_nullability(context, return_flag, parameter_flags);
-        }
         // A CLR operator-overload name (`op_Addition`, `op_Equality`, …, see
         // `CLR_OPERATOR_METHOD_NAMES`'s doc) — stamp `SpecialName` so Roslyn binds the operator
         // syntax to it, not just the literal method-call name.
         if CLR_OPERATOR_METHOD_NAMES.contains(&method_name.as_str()) {
             mdef = mdef.with_special_name();
         }
-        let parameter_count = ctx[sig].inputs().len();
-        mdef = attach_pending_member_attrs(
-            ctx,
-            mdef,
-            class,
-            PendingMemberTarget {
-                kind: PendingMemberKind::Static,
-                index: method_index,
-            },
-            parameter_count,
-        );
         ctx.new_method(mdef);
     }
 
@@ -2930,314 +3030,195 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     // ctors (overloaded by arity): a field-initializing *primary* ctor `.ctor(field0, …)` and/or a
     // parameterless *default* ctor `.ctor()`. If neither is requested we still emit the parameterless
     // ctor (the historical default — so `new <Name>()` always works).
-    if !class.is_value_type {
-        if let Some(base) = extends {
-            let self_ty = Type::ClassRef(*class_idx);
-            // Reference to the base class's `.ctor` (e.g. System.Object::.ctor). Chaining to a base
-            // constructor is a plain `call instance void …::.ctor()`, so this methodref is `Instance`
-            // kind, NOT `Constructor` — the latter is for `newobj` and is rejected as a CIL-root call.
-            // The base ctor's `this` param is typed as the DERIVED class (the actual `this` at the
-            // call). The methodref still targets the base's `.ctor` (its `class` is `base`), so the IL
-            // is `call instance void <base>::.ctor()`; typing the param as the derived type just lets
-            // the inheritance-unaware CIL checker accept the `this` argument, which is a sound upcast
-            // (a derived reference IS-A base reference).
-            // `base_ctor_arg_types` (`rustc_codegen_clr_add_base_ctor_arg`, empty by default) makes
-            // the base ctor's signature `(this, arg0, arg1, …)` instead of just `(this)` — see that
-            // intrinsic's doc. Each declared arg becomes a LEADING parameter on every ctor this
-            // class synthesizes below, forwarded verbatim into the base call.
-            let n_base_args = class.base_ctor_arg_types.len();
-            let mut base_ctor_inputs = vec![self_ty];
-            base_ctor_inputs.extend(class.base_ctor_arg_types.iter().copied());
-            let base_ctor_sig = ctx.sig(base_ctor_inputs.clone(), Type::Void);
-            let base_ctor_name = ctx.alloc_string(".ctor");
-            let base_ctor = ctx.alloc_methodref(MethodRef::new(
-                base,
-                base_ctor_name,
-                base_ctor_sig,
-                MethodKind::Instance,
-                [].into(),
-            ));
+    if !class.is_value_type
+        && let Some(base) = extends
+    {
+        let self_ty = Type::ClassRef(*class_idx);
+        // Reference to the base class's `.ctor` (e.g. System.Object::.ctor). Chaining to a base
+        // constructor is a plain `call instance void …::.ctor()`, so this methodref is `Instance`
+        // kind, NOT `Constructor` — the latter is for `newobj` and is rejected as a CIL-root call.
+        // The base ctor's `this` param is typed as the DERIVED class (the actual `this` at the
+        // call). The methodref still targets the base's `.ctor` (its `class` is `base`), so the IL
+        // is `call instance void <base>::.ctor()`; typing the param as the derived type just lets
+        // the inheritance-unaware CIL checker accept the `this` argument, which is a sound upcast
+        // (a derived reference IS-A base reference).
+        // `base_ctor_arg_types` (`rustc_codegen_clr_add_base_ctor_arg`, empty by default) makes
+        // the base ctor's signature `(this, arg0, arg1, …)` instead of just `(this)` — see that
+        // intrinsic's doc. Each declared arg becomes a LEADING parameter on every ctor this
+        // class synthesizes below, forwarded verbatim into the base call.
+        let n_base_args = class.base_ctor_arg_types.len();
+        let mut base_ctor_inputs = vec![self_ty];
+        base_ctor_inputs.extend(class.base_ctor_arg_types.iter().copied());
+        let base_ctor_sig = ctx.sig(base_ctor_inputs.clone(), Type::Void);
+        let base_ctor_name = ctx.alloc_string(".ctor");
+        let base_ctor = ctx.alloc_methodref(MethodRef::new(
+            base,
+            base_ctor_name,
+            base_ctor_sig,
+            MethodKind::Instance,
+            [].into(),
+        ));
 
-            // Field-initializing primary ctor: `.ctor(this, base_arg0…, field0, field1, …)`:
-            // `ldarg.0; call base::.ctor(base_args); [ldarg.0; ldarg.{i}; stfld field_i;]* ret`.
-            if class.has_primary_ctor {
-                let mut inputs = vec![self_ty];
-                inputs.extend(class.base_ctor_arg_types.iter().copied());
-                inputs.extend(class.fields.iter().map(|(tpe, _)| *tpe));
-                let n_inputs = inputs.len();
-                let ctor_sig = ctx.sig(inputs, Type::Void);
-                // `this` plus `ldarg.{1..=n_base_args}`, forwarding the leading base-ctor-arg params.
-                let mut base_args = vec![ctx.alloc_node(CILNode::LdArg(0))];
-                for i in 0..n_base_args {
-                    base_args.push(ctx.alloc_node(CILNode::LdArg(
-                        u32::try_from(i + 1).expect("comptime: too many base ctor args"),
-                    )));
-                }
-                let call_base = ctx.alloc_root(CILRoot::call(base_ctor, base_args));
-                let mut roots = vec![call_base];
-                for (idx, (tpe, fname)) in class.fields.iter().enumerate() {
-                    let fname = ctx.alloc_string(fname.clone());
-                    let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname, *tpe));
-                    let obj = ctx.alloc_node(CILNode::LdArg(0));
-                    let value = ctx.alloc_node(CILNode::LdArg(
-                        u32::try_from(n_base_args + idx + 1)
-                            .expect("comptime: too many ctor fields"),
-                    ));
-                    roots.push(ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value)))));
-                }
-                roots.push(ctx.alloc_root(CILRoot::VoidRet));
-                let ctor_name = ctx.alloc_string(".ctor");
-                let mut ctor_arg_names = Vec::with_capacity(n_inputs);
-                ctor_arg_names.push(None); // implicit `this`
-                for index in 0..n_base_args {
-                    let name = ctx.alloc_string(format!("baseArg{index}"));
-                    ctor_arg_names.push(Some(name));
-                }
-                for (_, field_name) in &class.fields {
-                    let name = ctx.alloc_string(field_name.clone());
-                    ctor_arg_names.push(Some(name));
-                }
-                let ctor_access = if class.constructor_access == Access::Public {
-                    Access::Extern
-                } else {
-                    class.constructor_access
-                };
-                let ctor_def = MethodDef::new(
-                    ctor_access,
-                    class_idx,
-                    ctor_name,
-                    ctor_sig,
-                    MethodKind::Constructor,
-                    MethodImpl::MethodBody {
-                        blocks: vec![BasicBlock::new(roots, 0, None)],
-                        locals: vec![],
-                    },
-                    ctor_arg_names,
-                );
-                let mut ctor_nullability = class.base_ctor_arg_nullability.clone();
-                ctor_nullability.extend(class.field_nullability.iter().copied());
-                let ctor_def = annotate_method_nullability(ctor_def, 0, &ctor_nullability);
-                ctx.new_method(ctor_def);
+        // Field-initializing primary ctor: `.ctor(this, base_arg0…, field0, field1, …)`:
+        // `ldarg.0; call base::.ctor(base_args); [ldarg.0; ldarg.{i}; stfld field_i;]* ret`.
+        if class.has_primary_ctor {
+            let mut inputs = vec![self_ty];
+            inputs.extend(class.base_ctor_arg_types.iter().copied());
+            inputs.extend(class.fields.iter().map(|(tpe, _)| *tpe));
+            let ctor_sig = ctx.sig(inputs, Type::Void);
+            // `this` plus `ldarg.{1..=n_base_args}`, forwarding the leading base-ctor-arg params.
+            let base_args = base_ctor_args(ctx, n_base_args);
+            let call_base = ctx.alloc_root(CILRoot::call(base_ctor, base_args));
+            let mut roots = vec![call_base];
+            for (idx, (tpe, fname)) in class.fields.iter().enumerate() {
+                let fname = ctx.alloc_string(fname.clone());
+                let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname, *tpe));
+                let obj = ctx.alloc_node(CILNode::LdArg(0));
+                let value = ctx.alloc_node(CILNode::LdArg(
+                    u32::try_from(n_base_args + idx + 1).expect("comptime: too many ctor fields"),
+                ));
+                roots.push(ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value)))));
             }
+            roots.push(ctx.alloc_root(CILRoot::VoidRet));
+            let mut ctor_arg_names = base_ctor_arg_names(ctx, n_base_args);
+            for (_, field_name) in &class.fields {
+                let name = ctx.alloc_string(field_name.clone());
+                ctor_arg_names.push(Some(name));
+            }
+            let mut ctor_nullability = class.base_ctor_arg_nullability.clone();
+            ctor_nullability.extend(class.field_nullability.iter().copied());
+            emit_constructor(
+                ctx,
+                class_idx,
+                class,
+                ctor_sig,
+                roots,
+                ctor_arg_names,
+                &ctor_nullability,
+            );
+        }
 
-            // Default ctor `.ctor(this, base_arg0…)`: `ldarg.0; call base::.ctor(base_args); ret`.
-            // Not actually parameterless once `base_ctor_arg_types` is non-empty — the name is
-            // historical (it still means "no field-init params", just base-forwarding ones).
-            // Emitted when explicitly requested, or implicitly whenever no primary ctor exists (so
-            // every reference class has at least one ctor). When BOTH exist they overload by arity
-            // — UNLESS `n_base_args > 0` and `class.fields` is empty, in which case they'd collide
-            // (identical signatures); that combination is rejected below with a clear panic rather
-            // than silently emitting an invalid duplicate `.ctor`.
-            if class.has_default_ctor || !class.has_primary_ctor {
-                if class.has_primary_ctor && class.fields.is_empty() && n_base_args > 0 {
-                    panic!(
-                        "comptime: `{}` requests both a primary ctor and a default ctor, but with \
+        // Default ctor `.ctor(this, base_arg0…)`: `ldarg.0; call base::.ctor(base_args); ret`.
+        // Not actually parameterless once `base_ctor_arg_types` is non-empty — the name is
+        // historical (it still means "no field-init params", just base-forwarding ones).
+        // Emitted when explicitly requested, or implicitly whenever no primary ctor exists (so
+        // every reference class has at least one ctor). When BOTH exist they overload by arity
+        // — UNLESS `n_base_args > 0` and `class.fields` is empty, in which case they'd collide
+        // (identical signatures); that combination is rejected below with a clear panic rather
+        // than silently emitting an invalid duplicate `.ctor`.
+        if class.has_default_ctor || !class.has_primary_ctor {
+            if class.has_primary_ctor && class.fields.is_empty() && n_base_args > 0 {
+                panic!(
+                    "comptime: `{}` requests both a primary ctor and a default ctor, but with \
                          `base_ctor_arg_types` set and no instance fields the primary ctor's \
                          signature `(base_args…)` is identical to the default ctor's — drop one of \
                          `has_default_ctor`/`has_primary_ctor`, or add at least one field",
-                        class.name
-                    );
-                }
-                let ctor_sig = ctx.sig(base_ctor_inputs, Type::Void);
-                let mut base_args = vec![ctx.alloc_node(CILNode::LdArg(0))];
-                for i in 0..n_base_args {
-                    base_args.push(ctx.alloc_node(CILNode::LdArg(
-                        u32::try_from(i + 1).expect("comptime: too many base ctor args"),
-                    )));
-                }
-                let call_base = ctx.alloc_root(CILRoot::call(base_ctor, base_args));
-                let ret = ctx.alloc_root(CILRoot::VoidRet);
-                let ctor_name = ctx.alloc_string(".ctor");
-                let mut ctor_arg_names = Vec::with_capacity(1 + n_base_args);
-                ctor_arg_names.push(None); // implicit `this`
-                for index in 0..n_base_args {
-                    let name = ctx.alloc_string(format!("baseArg{index}"));
-                    ctor_arg_names.push(Some(name));
-                }
-                let ctor_access = if class.constructor_access == Access::Public {
-                    Access::Extern
-                } else {
-                    class.constructor_access
-                };
-                let ctor_def = MethodDef::new(
-                    ctor_access,
+                    class.name
+                );
+            }
+            let ctor_sig = ctx.sig(base_ctor_inputs, Type::Void);
+            let base_args = base_ctor_args(ctx, n_base_args);
+            let call_base = ctx.alloc_root(CILRoot::call(base_ctor, base_args));
+            let ret = ctx.alloc_root(CILRoot::VoidRet);
+            let ctor_arg_names = base_ctor_arg_names(ctx, n_base_args);
+            emit_constructor(
+                ctx,
+                class_idx,
+                class,
+                ctor_sig,
+                vec![call_base, ret],
+                ctor_arg_names,
+                &class.base_ctor_arg_nullability,
+            );
+        }
+
+        // For a primary-ctor (record-like) class, also emit a public accessor per field —
+        // `read_<field>(this) -> field_ty` = `ldarg.0; ldfld field; ret` — so a managed caller can
+        // observe the ctor-initialized state (the fields themselves are private).
+        if class.has_primary_ctor {
+            for (field_index, (tpe, fname)) in class.fields.iter().enumerate() {
+                let nullability = class.field_nullability[field_index];
+                let fname_str = ctx.alloc_string(fname.clone());
+                let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
+                let this = ctx.alloc_node(CILNode::LdArg(0));
+                let load = ctx.ld_field(this, fdesc);
+                let ret = ctx.alloc_root(CILRoot::Ret(load));
+                let getter_sig = ctx.sig([self_ty], *tpe);
+                let getter_name = ctx.alloc_string(format!("read_{fname}"));
+                let getter_def = MethodDef::new(
+                    Access::Extern,
                     class_idx,
-                    ctor_name,
-                    ctor_sig,
-                    MethodKind::Constructor,
+                    getter_name,
+                    getter_sig,
+                    MethodKind::Virtual,
                     MethodImpl::MethodBody {
-                        blocks: vec![BasicBlock::new(vec![call_base, ret], 0, None)],
+                        blocks: vec![BasicBlock::new(vec![ret], 0, None)],
                         locals: vec![],
                     },
-                    ctor_arg_names,
+                    vec![None],
                 );
-                let ctor_def =
-                    annotate_method_nullability(ctor_def, 0, &class.base_ctor_arg_nullability);
-                ctx.new_method(ctor_def);
+                let getter_def = annotate_method_nullability(getter_def, nullability, &[]);
+                ctx.new_method(getter_def);
             }
+        }
 
-            // For a primary-ctor (record-like) class, also emit a public accessor per field —
-            // `read_<field>(this) -> field_ty` = `ldarg.0; ldfld field; ret` — so a managed caller can
-            // observe the ctor-initialized state (the fields themselves are private).
-            if class.has_primary_ctor {
-                for (field_index, (tpe, fname)) in class.fields.iter().enumerate() {
-                    let nullability = class.field_nullability[field_index];
-                    let fname_str = ctx.alloc_string(fname.clone());
-                    let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
-                    let this = ctx.alloc_node(CILNode::LdArg(0));
-                    let load = ctx.ld_field(this, fdesc);
-                    let ret = ctx.alloc_root(CILRoot::Ret(load));
-                    let getter_sig = ctx.sig([self_ty], *tpe);
-                    let getter_name = ctx.alloc_string(format!("read_{fname}"));
-                    let getter_def = MethodDef::new(
-                        Access::Extern,
-                        class_idx,
-                        getter_name,
-                        getter_sig,
-                        MethodKind::Virtual,
-                        MethodImpl::MethodBody {
-                            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-                            locals: vec![],
-                        },
-                        vec![None],
-                    );
-                    let getter_def = annotate_method_nullability(getter_def, nullability, &[]);
-                    ctx.new_method(getter_def);
-                }
+        // Field setters: `set_<field>(this, value)` = `ldarg.0; ldarg.1; stfld field; ret`, paired
+        // with the `read_<field>` accessor so a managed caller can update the field state too.
+        if class.has_field_setters {
+            for (field_index, (tpe, fname)) in class.fields.iter().enumerate() {
+                let nullability = class.field_nullability[field_index];
+                let fname_str = ctx.alloc_string(fname.clone());
+                let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
+                let obj = ctx.alloc_node(CILNode::LdArg(0));
+                let value = ctx.alloc_node(CILNode::LdArg(1));
+                let store = ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value))));
+                let ret = ctx.alloc_root(CILRoot::VoidRet);
+                let setter_sig = ctx.sig([self_ty, *tpe], Type::Void);
+                let setter_name = ctx.alloc_string(format!("set_{fname}"));
+                let setter_def = MethodDef::new(
+                    Access::Extern,
+                    class_idx,
+                    setter_name,
+                    setter_sig,
+                    MethodKind::Virtual,
+                    MethodImpl::MethodBody {
+                        blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
+                        locals: vec![],
+                    },
+                    vec![None, None],
+                );
+                let setter_def = annotate_method_nullability(setter_def, 0, &[nullability]);
+                ctx.new_method(setter_def);
             }
+        }
 
-            // Field setters: `set_<field>(this, value)` = `ldarg.0; ldarg.1; stfld field; ret`, paired
-            // with the `read_<field>` accessor so a managed caller can update the field state too.
-            if class.has_field_setters {
-                for (field_index, (tpe, fname)) in class.fields.iter().enumerate() {
-                    let nullability = class.field_nullability[field_index];
-                    let fname_str = ctx.alloc_string(fname.clone());
-                    let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
-                    let obj = ctx.alloc_node(CILNode::LdArg(0));
-                    let value = ctx.alloc_node(CILNode::LdArg(1));
-                    let store = ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value))));
-                    let ret = ctx.alloc_root(CILRoot::VoidRet);
-                    let setter_sig = ctx.sig([self_ty, *tpe], Type::Void);
-                    let setter_name = ctx.alloc_string(format!("set_{fname}"));
-                    let setter_def = MethodDef::new(
-                        Access::Extern,
-                        class_idx,
-                        setter_name,
-                        setter_sig,
-                        MethodKind::Virtual,
-                        MethodImpl::MethodBody {
-                            blocks: vec![BasicBlock::new(vec![store, ret], 0, None)],
-                            locals: vec![],
-                        },
-                        vec![None, None],
-                    );
-                    let setter_def = annotate_method_nullability(setter_def, 0, &[nullability]);
-                    ctx.new_method(setter_def);
-                }
-            }
-
-            // Field-backed PROPERTIES: `get_<field>(this) -> field_ty` / `set_<field>(this, value)` —
-            // structurally identical bodies to the `read_<field>`/`set_<field>` accessors above, but
-            // ALSO linked into a real §II.22.34 `Property` row (via `add_property`, which stamps
-            // `SpecialName` on both accessor `MethodDef`s and emits the `MethodSemantics`
-            // Getter/Setter rows) — so reflection-based consumers that specifically scan
-            // `Type.GetProperties()` (e.g. EF Core's default entity-type discovery convention) see a
-            // genuine `.NET` property, not just two same-shaped ordinary methods.
-            //
-            // Deliberately a SEPARATE opt-in from `has_field_setters` (`properties = true`, not a
-            // `field_setters` variant): once a method is linked as a property accessor via
-            // `MethodSemantics`, C#/Roslyn REJECTS explicitly calling it by name (`CS0571: cannot
-            // explicitly call operator or accessor`) — confirmed empirically, not merely a metadata
-            // nicety. `cd_typedef`'s `Counter` calls `read_value()`/`set_value(42)` by explicit
-            // method-call syntax and MUST keep working, so `has_field_setters`'s `read_*`/`set_*`
-            // accessors are never linked into a `PropertyDef`; a class that wants real properties
-            // opts in separately (and gets `get_*`/`set_*` accessors instead, matching Roslyn's own
-            // naming for `{ get; set; }`).
-            if class.has_properties || class.has_readonly_properties {
-                for (field_index, (tpe, fname)) in class.fields.iter().enumerate() {
-                    let nullability = class.field_nullability[field_index];
-                    let fname_str = ctx.alloc_string(fname.clone());
-                    let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
-                    // Accessor names follow the public CLR property, not the private backing field:
-                    // `firmNumber` -> `get_FirmNumber` / `set_FirmNumber`. This is Roslyn's metadata
-                    // convention and lets Rust call a schema-stable accessor without exposing or
-                    // colliding with the backing field.
-                    let mut prop_name_str = fname.clone();
-                    if let Some(first) = prop_name_str.get_mut(0..1) {
-                        first.make_ascii_uppercase();
-                    }
-
-                    let this = ctx.alloc_node(CILNode::LdArg(0));
-                    let load = ctx.ld_field(this, fdesc);
-                    let ret = ctx.alloc_root(CILRoot::Ret(load));
-                    let getter_sig = ctx.sig([self_ty], *tpe);
-                    let getter_name = ctx.alloc_string(format!("get_{prop_name_str}"));
-                    let getter_def = MethodDef::new(
-                        Access::Extern,
-                        class_idx,
-                        getter_name,
-                        getter_sig,
-                        MethodKind::Virtual,
-                        MethodImpl::MethodBody {
-                            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-                            locals: vec![],
-                        },
-                        vec![None],
-                    );
-                    let getter_def = annotate_method_nullability(getter_def, nullability, &[]);
-                    let getter_ref = ctx.alloc_methodref(getter_def.ref_to());
-                    ctx.new_method(getter_def);
-
-                    let setter_ref = if class.has_readonly_properties {
-                        None
-                    } else {
-                        let obj = ctx.alloc_node(CILNode::LdArg(0));
-                        let value = ctx.alloc_node(CILNode::LdArg(1));
-                        let store =
-                            ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value))));
-                        let set_ret = ctx.alloc_root(CILRoot::VoidRet);
-                        let setter_sig = ctx.sig([self_ty, *tpe], Type::Void);
-                        let setter_name = ctx.alloc_string(format!("set_{prop_name_str}"));
-                        let setter_def = MethodDef::new(
-                            Access::Extern,
-                            class_idx,
-                            setter_name,
-                            setter_sig,
-                            MethodKind::Virtual,
-                            MethodImpl::MethodBody {
-                                blocks: vec![BasicBlock::new(vec![store, set_ret], 0, None)],
-                                locals: vec![],
-                            },
-                            vec![None, None],
-                        );
-                        let setter_def = annotate_method_nullability(setter_def, 0, &[nullability]);
-                        let setter_ref = ctx.alloc_methodref(setter_def.ref_to());
-                        ctx.new_method(setter_def);
-                        Some(setter_ref)
-                    };
-
-                    // Property name: the field name, capitalized (`id` -> `Id`) — Roslyn's own
-                    // convention for an auto-property backing a lowerCamelCase field, and what a C#
-                    // consumer expects to write (`w.Id`, not `w.id`).
-                    let prop_name = ctx.alloc_string(prop_name_str.clone());
-                    let mut property = cilly::class::PropertyDef::new(
-                        prop_name,
-                        *tpe,
-                        Some(getter_ref),
-                        setter_ref,
-                    );
-                    if nullability != 0 {
-                        property = property.with_nullability(nullability);
-                    }
-                    if let Some(attributes) = class.property_custom_attrs.get(&prop_name_str) {
-                        let attributes = attributes
-                            .iter()
-                            .map(|attribute| pending_custom_attr_to_cilly(ctx, attribute))
-                            .collect();
-                        property = property.with_custom_attributes(attributes);
-                    }
-                    ctx.class_mut(class_idx).add_property(property);
-                }
+        // Field-backed PROPERTIES: `get_<field>(this) -> field_ty` / `set_<field>(this, value)` —
+        // structurally identical bodies to the `read_<field>`/`set_<field>` accessors above, but
+        // ALSO linked into a real §II.22.34 `Property` row (via `add_property`, which stamps
+        // `SpecialName` on both accessor `MethodDef`s and emits the `MethodSemantics`
+        // Getter/Setter rows) — so reflection-based consumers that specifically scan
+        // `Type.GetProperties()` (e.g. EF Core's default entity-type discovery convention) see a
+        // genuine `.NET` property, not just two same-shaped ordinary methods.
+        //
+        // Deliberately a SEPARATE opt-in from `has_field_setters` (`properties = true`, not a
+        // `field_setters` variant): once a method is linked as a property accessor via
+        // `MethodSemantics`, C#/Roslyn REJECTS explicitly calling it by name (`CS0571: cannot
+        // explicitly call operator or accessor`) — confirmed empirically, not merely a metadata
+        // nicety. `cd_typedef`'s `Counter` calls `read_value()`/`set_value(42)` by explicit
+        // method-call syntax and MUST keep working, so `has_field_setters`'s `read_*`/`set_*`
+        // accessors are never linked into a `PropertyDef`; a class that wants real properties
+        // opts in separately (and gets `get_*`/`set_*` accessors instead, matching Roslyn's own
+        // naming for `{ get; set; }`).
+        if class.has_properties || class.has_readonly_properties {
+            for field_index in 0..class.fields.len() {
+                emit_field_property(
+                    ctx,
+                    class_idx,
+                    class,
+                    field_index,
+                    self_ty,
+                    MethodKind::Virtual,
+                );
             }
         }
     }
@@ -3251,77 +3232,15 @@ fn finish_type<'tcx>(ctx: &mut MethodCompileCtx<'tcx, '_>, class: &PendingClass<
     if class.is_value_type && (class.has_properties || class.has_readonly_properties) {
         let self_ty = Type::ClassRef(*class_idx);
         let self_ref = ctx.nref(self_ty);
-        for (field_index, (tpe, fname)) in class.fields.iter().enumerate() {
-            let nullability = class.field_nullability[field_index];
-            let fname_str = ctx.alloc_string(fname.clone());
-            let fdesc = ctx.alloc_field(FieldDesc::new(*class_idx, fname_str, *tpe));
-            let mut prop_name_str = fname.clone();
-            if let Some(first) = prop_name_str.get_mut(0..1) {
-                first.make_ascii_uppercase();
-            }
-
-            let this = ctx.alloc_node(CILNode::LdArg(0));
-            let load = ctx.ld_field(this, fdesc);
-            let ret = ctx.alloc_root(CILRoot::Ret(load));
-            let getter_sig = ctx.sig([self_ref], *tpe);
-            let getter_name = ctx.alloc_string(format!("get_{prop_name_str}"));
-            let getter_def = MethodDef::new(
-                Access::Extern,
+        for field_index in 0..class.fields.len() {
+            emit_field_property(
+                ctx,
                 class_idx,
-                getter_name,
-                getter_sig,
+                class,
+                field_index,
+                self_ref,
                 MethodKind::Instance,
-                MethodImpl::MethodBody {
-                    blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-                    locals: vec![],
-                },
-                vec![None],
             );
-            let getter_def = annotate_method_nullability(getter_def, nullability, &[]);
-            let getter_ref = ctx.alloc_methodref(getter_def.ref_to());
-            ctx.new_method(getter_def);
-
-            let setter_ref = if class.has_readonly_properties {
-                None
-            } else {
-                let obj = ctx.alloc_node(CILNode::LdArg(0));
-                let value = ctx.alloc_node(CILNode::LdArg(1));
-                let store = ctx.alloc_root(CILRoot::SetField(Box::new((fdesc, obj, value))));
-                let set_ret = ctx.alloc_root(CILRoot::VoidRet);
-                let setter_sig = ctx.sig([self_ref, *tpe], Type::Void);
-                let setter_name = ctx.alloc_string(format!("set_{prop_name_str}"));
-                let setter_def = MethodDef::new(
-                    Access::Extern,
-                    class_idx,
-                    setter_name,
-                    setter_sig,
-                    MethodKind::Instance,
-                    MethodImpl::MethodBody {
-                        blocks: vec![BasicBlock::new(vec![store, set_ret], 0, None)],
-                        locals: vec![],
-                    },
-                    vec![None, None],
-                );
-                let setter_def = annotate_method_nullability(setter_def, 0, &[nullability]);
-                let setter_ref = ctx.alloc_methodref(setter_def.ref_to());
-                ctx.new_method(setter_def);
-                Some(setter_ref)
-            };
-
-            let prop_name = ctx.alloc_string(prop_name_str.clone());
-            let mut property =
-                cilly::class::PropertyDef::new(prop_name, *tpe, Some(getter_ref), setter_ref);
-            if nullability != 0 {
-                property = property.with_nullability(nullability);
-            }
-            if let Some(attributes) = class.property_custom_attrs.get(&prop_name_str) {
-                let attributes = attributes
-                    .iter()
-                    .map(|attribute| pending_custom_attr_to_cilly(ctx, attribute))
-                    .collect();
-                property = property.with_custom_attributes(attributes);
-            }
-            ctx.class_mut(class_idx).add_property(property);
         }
     }
 }

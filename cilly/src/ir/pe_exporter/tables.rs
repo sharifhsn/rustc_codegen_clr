@@ -19,8 +19,8 @@ use super::heaps::{BlobHeap, GuidHeap, StringsHeap, UserStringHeap, write_compre
 use super::sig::{self, TypeDefOrRefResolver};
 use crate::DotnetRuntime;
 use crate::ir::{
-    Assembly, ClassRef, Const, FieldDesc, Interned, MethodDefIdx, PInvokeCallConv, StaticFieldDesc,
-    Type,
+    Assembly, ClassRef, Const, FieldDesc, IString, Interned, MethodDefIdx, PInvokeCallConv,
+    StaticFieldDesc, Type,
 };
 use std::collections::HashMap;
 
@@ -447,10 +447,11 @@ pub struct MetadataBuilder {
     /// so [`TokenSink::method_token`] can look up an in-assembly method without a second table
     /// scan.
     method_def_cache: HashMap<MethodDefIdx, Token>,
-    /// `(owning TypeDef token bits, #Strings name offset)` -> the first matching Field row.
-    /// Field operands are common in method bodies, so resolving them must not scan TypeDef and
-    /// Field table runs for every instruction.
-    field_def_cache: HashMap<(u32, u32), Token>,
+    /// `(owning TypeDef token bits, #Strings name offset, #Blob signature offset)` -> Field row.
+    /// ECMA-335 field identity includes the signature: rustc can emit several shard-local helper
+    /// statics with the same owner/name but different pointer-to-array types. Resolving by name
+    /// alone silently aliases those fields during body emission.
+    field_def_cache: HashMap<(u32, u32, u32), Token>,
     /// `(MethodDef token, Param.Sequence)` -> Param token for custom-attribute attachment.
     method_param_cache: HashMap<(Token, u16), Token>,
 
@@ -556,6 +557,20 @@ fn encode_custom_attr_fixed_arg(
         crate::ir::class::CustomAttrArg::I32(i) => out.extend_from_slice(&i.to_le_bytes()),
         crate::ir::class::CustomAttrArg::I64(i) => out.extend_from_slice(&i.to_le_bytes()),
     }
+}
+
+macro_rules! write_rows {
+    ($rows:expr, $row:ident, $body:block) => {
+        for $row in $rows $body
+    };
+}
+
+macro_rules! write_sorted_rows {
+    ($rows:expr, $key:expr, $row:ident, $body:block) => {{
+        let mut rows: Vec<_> = $rows.iter().collect();
+        rows.sort_by_key($key);
+        for $row in rows $body
+    }};
 }
 
 impl MetadataBuilder {
@@ -684,6 +699,30 @@ impl MetadataBuilder {
     /// row exists yet at any of those calls) and MUST re-stamp the correct run-start once that
     /// class's fields/methods are about to be appended, via
     /// [`MetadataBuilder::set_type_def_field_list`] / [`MetadataBuilder::set_type_def_method_list`].
+    fn push_type_def(&mut self, namespace: &str, name: &str, flags: u32, extends: u32) -> Token {
+        let name_off = self.strings.intern(name);
+        let namespace_off = self.strings.intern(namespace);
+        let field_list = u32::try_from(self.field.len() + 1).unwrap();
+        let method_list = u32::try_from(self.method_def.len() + 1).unwrap();
+        self.type_def.push(TypeDefRow {
+            flags,
+            name: name_off,
+            namespace: namespace_off,
+            extends,
+            field_list,
+            method_list,
+        });
+        let rid = u32::try_from(self.type_def.len()).unwrap();
+        let tok = Token::new(Token::TABLE_TYPE_DEF, rid);
+        self.type_def_cache
+            .entry(Box::from(namespace))
+            .or_default()
+            .entry(Box::from(name))
+            .or_insert(tok);
+        self.current_type_def = Some(rid);
+        tok
+    }
+
     pub fn add_type_def(
         &mut self,
         namespace: &str,
@@ -695,8 +734,6 @@ impl MetadataBuilder {
         implements: &[Token],
     ) -> Token {
         let name = dotnet_class_name(name);
-        let name_off = self.strings.intern(&name);
-        let namespace_off = self.strings.intern(namespace);
         let extends_coded = extends.map_or(0, encode_type_def_or_ref_token);
         // §II.23.1.15 `TypeAttributes`: 0x1 = Public, 0x0 = NotPublic (private). Sealed
         // (0x100) mirrors `il_exporter`'s `sealed` valuetype rule; layout bits (0x0 = auto,
@@ -713,24 +750,8 @@ impl MetadataBuilder {
         if has_explicit_layout {
             flags |= 0x10; // ExplicitLayout
         }
-        let field_list = u32::try_from(self.field.len() + 1).unwrap();
-        let method_list = u32::try_from(self.method_def.len() + 1).unwrap();
-        self.type_def.push(TypeDefRow {
-            flags,
-            name: name_off,
-            namespace: namespace_off,
-            extends: extends_coded,
-            field_list,
-            method_list,
-        });
-        let rid = u32::try_from(self.type_def.len()).unwrap();
-        let tok = Token::new(Token::TABLE_TYPE_DEF, rid);
-        self.type_def_cache
-            .entry(Box::from(namespace))
-            .or_default()
-            .entry(Box::from(name.as_ref()))
-            .or_insert(tok);
-        self.current_type_def = Some(rid);
+        let tok = self.push_type_def(namespace, &name, flags, extends_coded);
+        let rid = tok.rid();
         if has_explicit_layout {
             self.class_layout.push(ClassLayoutRow {
                 packing_size: pack.unwrap_or(0),
@@ -761,12 +782,7 @@ impl MetadataBuilder {
     /// # Panics
     /// If `tok` is not a `TypeDef` token, or its row index is out of range.
     pub fn set_type_def_field_list(&mut self, tok: Token) {
-        assert_eq!(
-            tok.table(),
-            Token::TABLE_TYPE_DEF,
-            "not a TypeDef token: {tok:?}"
-        );
-        let idx = usize::try_from(tok.rid()).unwrap() - 1;
+        let idx = self.type_def_index(tok);
         self.type_def[idx].field_list = u32::try_from(self.field.len() + 1).unwrap();
         self.current_type_def = Some(tok.rid());
     }
@@ -779,12 +795,7 @@ impl MetadataBuilder {
     /// # Panics
     /// If `tok` is not a `TypeDef` token, or its row index is out of range.
     pub fn set_type_def_method_list(&mut self, tok: Token) {
-        assert_eq!(
-            tok.table(),
-            Token::TABLE_TYPE_DEF,
-            "not a TypeDef token: {tok:?}"
-        );
-        let idx = usize::try_from(tok.rid()).unwrap() - 1;
+        let idx = self.type_def_index(tok);
         self.type_def[idx].method_list = u32::try_from(self.method_def.len() + 1).unwrap();
     }
 
@@ -792,12 +803,20 @@ impl MetadataBuilder {
     /// defaulted every row to public; preserving the Assembly IR's access is required for
     /// implementation-only compatibility types and keeps direct PE aligned with the IL exporter.
     pub fn set_type_def_access(&mut self, tok: Token, access: crate::Access) {
-        assert_eq!(tok.table(), Token::TABLE_TYPE_DEF, "not a TypeDef token");
-        let idx = usize::try_from(tok.rid()).unwrap() - 1;
+        let idx = self.type_def_index(tok);
         self.type_def[idx].flags &= !0x7; // TypeAttributes.VisibilityMask
         if matches!(access, crate::Access::Extern | crate::Access::Public) {
             self.type_def[idx].flags |= 0x1; // Public; otherwise NotPublic (0)
         }
+    }
+
+    fn type_def_index(&self, tok: Token) -> usize {
+        assert_eq!(
+            tok.table(),
+            Token::TABLE_TYPE_DEF,
+            "not a TypeDef token: {tok:?}"
+        );
+        usize::try_from(tok.rid()).unwrap() - 1
     }
 
     /// Adds a `private explicit ansi sealed` `TypeDef` (§II.22.37) sized to exactly `size` bytes
@@ -817,29 +836,11 @@ impl MetadataBuilder {
     pub fn add_blob_sized_valuetype(&mut self, name: &str, extends: Token, size: u32) -> Token {
         let (namespace, name) = split_namespace(name);
         let name = dotnet_class_name(name);
-        let name_off = self.strings.intern(&name);
-        let namespace_off = self.strings.intern(namespace);
         let extends_coded = encode_type_def_or_ref_token(extends);
         // §II.23.1.15 `TypeAttributes`: 0x0 NotPublic (private) | 0x100 Sealed | 0x10 ExplicitLayout.
         let flags: u32 = 0x100 | 0x10;
-        let field_list = u32::try_from(self.field.len() + 1).unwrap();
-        let method_list = u32::try_from(self.method_def.len() + 1).unwrap();
-        self.type_def.push(TypeDefRow {
-            flags,
-            name: name_off,
-            namespace: namespace_off,
-            extends: extends_coded,
-            field_list,
-            method_list,
-        });
-        let rid = u32::try_from(self.type_def.len()).unwrap();
-        let tok = Token::new(Token::TABLE_TYPE_DEF, rid);
-        self.type_def_cache
-            .entry(Box::from(namespace))
-            .or_default()
-            .entry(Box::from(name.as_ref()))
-            .or_insert(tok);
-        self.current_type_def = Some(rid);
+        let tok = self.push_type_def(namespace, &name, flags, extends_coded);
+        let rid = tok.rid();
         self.class_layout.push(ClassLayoutRow {
             packing_size: 1,
             class_size: size,
@@ -870,15 +871,42 @@ impl MetadataBuilder {
         self.blobs.intern(&blob)
     }
 
-    fn register_field_def(&mut self, name: u32, token: Token) {
+    fn register_field_def(&mut self, name: u32, signature: u32, token: Token) {
         let Some(owner) = self.current_type_def else {
             // Low-level metadata-table unit tests may construct isolated Field rows. Real PE
             // population always opens a TypeDef run first.
             return;
         };
         self.field_def_cache
-            .entry((Token::new(Token::TABLE_TYPE_DEF, owner).0, name))
+            .entry((Token::new(Token::TABLE_TYPE_DEF, owner).0, name, signature))
             .or_insert(token);
+    }
+
+    fn push_field(&mut self, flags: u16, name: u32, signature: u32) -> Token {
+        self.field.push(FieldRow {
+            flags,
+            name,
+            signature,
+        });
+        let token = Token::new(Token::TABLE_FIELD, u32::try_from(self.field.len()).unwrap());
+        self.register_field_def(name, signature, token);
+        token
+    }
+
+    fn push_method(&mut self, flags: u16, impl_flags: u16, name: u32, signature: u32) -> Token {
+        let param_list = u32::try_from(self.param.len() + 1).unwrap();
+        self.method_def.push(MethodDefRow {
+            rva: 0,
+            impl_flags,
+            flags,
+            name,
+            signature,
+            param_list,
+        });
+        Token::new(
+            Token::TABLE_METHOD_DEF,
+            u32::try_from(self.method_def.len()).unwrap(),
+        )
     }
 
     /// Adds an instance `Field` row (§II.22.15) to the most recently added `TypeDef`.
@@ -898,17 +926,12 @@ impl MetadataBuilder {
         // safe superset here since this writer never emits cross-class private field coupling.
         let flags: u16 = 0x6;
         let name_off = self.strings.intern(name);
-        self.field.push(FieldRow {
-            flags,
-            name: name_off,
-            signature: signature_blob,
-        });
-        let rid = u32::try_from(self.field.len()).unwrap();
-        let tok = Token::new(Token::TABLE_FIELD, rid);
-        self.register_field_def(name_off, tok);
+        let tok = self.push_field(flags, name_off, signature_blob);
         if let Some(offset) = offset {
-            self.field_layout
-                .push(FieldLayoutRow { offset, field: rid });
+            self.field_layout.push(FieldLayoutRow {
+                offset,
+                field: tok.rid(),
+            });
         }
         tok
     }
@@ -916,15 +939,8 @@ impl MetadataBuilder {
     /// Adds the special instance field every CLR enum must carry.
     pub fn add_enum_value_field(&mut self, signature_blob: u32) -> Token {
         let name = self.strings.intern("value__");
-        self.field.push(FieldRow {
-            // Public | SpecialName | RTSpecialName (§II.23.1.5).
-            flags: 0x6 | 0x0200 | 0x0400,
-            name,
-            signature: signature_blob,
-        });
-        let token = Token::new(Token::TABLE_FIELD, u32::try_from(self.field.len()).unwrap());
-        self.register_field_def(name, token);
-        token
+        // Public | SpecialName | RTSpecialName (§II.23.1.5).
+        self.push_field(0x6 | 0x0200 | 0x0400, name, signature_blob)
     }
 
     /// Adds a public static literal enum member and its metadata Constant row.
@@ -935,13 +951,9 @@ impl MetadataBuilder {
         value: Const,
     ) -> Token {
         let name = self.strings.intern(name);
-        self.field.push(FieldRow {
-            // Public | Static | Literal | HasDefault (§II.23.1.5).
-            flags: 0x6 | 0x0010 | 0x0040 | 0x8000,
-            name,
-            signature: signature_blob,
-        });
-        let rid = u32::try_from(self.field.len()).unwrap();
+        // Public | Static | Literal | HasDefault (§II.23.1.5).
+        let token = self.push_field(0x6 | 0x0010 | 0x0040 | 0x8000, name, signature_blob);
+        let rid = token.rid();
         let (type_code, bytes): (u8, Vec<u8>) = match value {
             Const::I8(v) => (0x04, v.to_le_bytes().to_vec()),
             Const::U8(v) => (0x05, v.to_le_bytes().to_vec()),
@@ -959,8 +971,6 @@ impl MetadataBuilder {
             parent: rid << 2, // HasConstant: Field tag = 0.
             value,
         });
-        let token = Token::new(Token::TABLE_FIELD, rid);
-        self.register_field_def(name, token);
         token
     }
 
@@ -993,18 +1003,14 @@ impl MetadataBuilder {
             flags |= 0x100; // HasFieldRVA
         }
         let name_off = self.strings.intern(name);
-        self.field.push(FieldRow {
-            flags,
-            name: name_off,
-            signature: signature_blob,
-        });
-        let rid = u32::try_from(self.field.len()).unwrap();
-        let tok = Token::new(Token::TABLE_FIELD, rid);
-        self.register_field_def(name_off, tok);
+        let tok = self.push_field(flags, name_off, signature_blob);
         if rva_data.is_some() {
             // Placeholder row; `set_field_rva` overwrites `rva` once the layout pass runs. Keep
             // its row index keyed by Field token so layout patches are constant-time.
-            self.field_rva.push(FieldRvaRow { rva: 0, field: rid });
+            self.field_rva.push(FieldRvaRow {
+                rva: 0,
+                field: tok.rid(),
+            });
             let previous = self.pending_field_rva.insert(tok, self.field_rva.len() - 1);
             debug_assert!(previous.is_none(), "duplicate pending FieldRVA token");
         }
@@ -1127,17 +1133,7 @@ impl MetadataBuilder {
             impl_flags |= 0x100;
         }
         let name_off = self.strings.intern(name);
-        let param_list = u32::try_from(self.param.len() + 1).unwrap();
-        self.method_def.push(MethodDefRow {
-            rva: 0,
-            impl_flags,
-            flags,
-            name: name_off,
-            signature: signature_blob,
-            param_list,
-        });
-        let rid = u32::try_from(self.method_def.len()).unwrap();
-        let tok = Token::new(Token::TABLE_METHOD_DEF, rid);
+        let tok = self.push_method(flags, impl_flags, name_off, signature_blob);
         if let Some(nullability) = nullability {
             assert!(
                 matches!(nullability.context, 1 | 2),
@@ -1209,6 +1205,15 @@ impl MetadataBuilder {
             });
         }
         tok
+    }
+
+    /// Prevent CoreCLR from canonicalizing signaling NaNs in methods that carry a
+    /// `System.BitConverter` float reinterpretation through a managed local. This is the metadata
+    /// equivalent of `MethodImplOptions.NoOptimization | NoInlining` and is a semantic requirement
+    /// for Rust's bit-preserving `from_bits`/`to_bits` contract, not a performance hint.
+    pub fn mark_method_bit_preserving_float(&mut self, tok: Token) {
+        let row = &mut self.method_def[(tok.rid() - 1) as usize];
+        row.impl_flags |= 0x0008 | 0x0040; // NoInlining | NoOptimization
     }
 
     /// Emit compiler-recognized nullable metadata on a method or Param row.
@@ -1880,13 +1885,7 @@ impl MetadataBuilder {
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let sizes = self.row_counts();
-        let widths = Widths::compute(
-            &sizes,
-            &self.strings,
-            &self.blobs,
-            &self.guids,
-            &self.user_strings,
-        );
+        let widths = Widths::compute(&sizes, &self.strings, &self.blobs, &self.guids);
 
         let tables_bytes = self.serialize_tables(&sizes, &widths);
         let strings_bytes = pad4(self.strings.as_bytes());
@@ -1906,7 +1905,7 @@ impl MetadataBuilder {
         const VERSION: &str = "v4.0.30319";
         let mut version_bytes = VERSION.as_bytes().to_vec();
         version_bytes.push(0);
-        while version_bytes.len() % 4 != 0 {
+        while !version_bytes.len().is_multiple_of(4) {
             version_bytes.push(0);
         }
         out.extend_from_slice(&(version_bytes.len() as u32).to_le_bytes()); // Length
@@ -1970,39 +1969,11 @@ impl MetadataBuilder {
     #[must_use]
     pub fn type_system_row_counts(&self) -> Vec<(u32, u32)> {
         let sizes = self.row_counts();
-        [
-            (Token::TABLE_MODULE, sizes.module),
-            (Token::TABLE_TYPE_REF, sizes.type_ref),
-            (Token::TABLE_TYPE_DEF, sizes.type_def),
-            (Token::TABLE_FIELD, sizes.field),
-            (Token::TABLE_METHOD_DEF, sizes.method_def),
-            (Token::TABLE_PARAM, sizes.param),
-            (Token::TABLE_INTERFACE_IMPL, sizes.interface_impl),
-            (Token::TABLE_MEMBER_REF, sizes.member_ref),
-            (Token::TABLE_CONSTANT, sizes.constant),
-            (Token::TABLE_CUSTOM_ATTRIBUTE, sizes.custom_attribute),
-            (Token::TABLE_CLASS_LAYOUT, sizes.class_layout),
-            (Token::TABLE_FIELD_LAYOUT, sizes.field_layout),
-            (Token::TABLE_STAND_ALONE_SIG, sizes.standalone_sig),
-            (Token::TABLE_EVENT_MAP, sizes.event_map),
-            (Token::TABLE_EVENT, sizes.event),
-            (Token::TABLE_PROPERTY_MAP, sizes.property_map),
-            (Token::TABLE_PROPERTY, sizes.property),
-            (Token::TABLE_METHOD_SEMANTICS, sizes.method_semantics),
-            (Token::TABLE_METHOD_IMPL, sizes.method_impl),
-            (Token::TABLE_MODULE_REF, sizes.module_ref),
-            (Token::TABLE_TYPE_SPEC, sizes.type_spec),
-            (Token::TABLE_IMPL_MAP, sizes.impl_map),
-            (Token::TABLE_FIELD_RVA, sizes.field_rva),
-            (Token::TABLE_ASSEMBLY, sizes.assembly),
-            (Token::TABLE_ASSEMBLY_REF, sizes.assembly_ref),
-            (Token::TABLE_GENERIC_PARAM, sizes.generic_param),
-            (Token::TABLE_METHOD_SPEC, sizes.method_spec),
-        ]
-        .into_iter()
-        .filter(|&(_, count)| count > 0)
-        .map(|(table, count)| (table, u32::try_from(count).expect("row count exceeds u32")))
-        .collect()
+        Self::table_rowcounts(&sizes)
+            .into_iter()
+            .filter(|&(_, count)| count > 0)
+            .map(|(table, count)| (table, u32::try_from(count).expect("row count exceeds u32")))
+            .collect()
     }
 
     fn row_counts(&self) -> RowCounts {
@@ -2037,10 +2008,8 @@ impl MetadataBuilder {
         }
     }
 
-    fn serialize_tables(&self, sizes: &RowCounts, widths: &Widths) -> Vec<u8> {
-        // Every table this backend can ever emit, in ascending table-id order (§II.24.2.6
-        // requires tables be written in table-id order regardless of population order).
-        let table_rowcounts: [(u32, usize); 27] = [
+    fn table_rowcounts(sizes: &RowCounts) -> [(u32, usize); 27] {
+        [
             (Token::TABLE_MODULE, sizes.module),
             (Token::TABLE_TYPE_REF, sizes.type_ref),
             (Token::TABLE_TYPE_DEF, sizes.type_def),
@@ -2068,7 +2037,13 @@ impl MetadataBuilder {
             (Token::TABLE_ASSEMBLY_REF, sizes.assembly_ref),
             (Token::TABLE_GENERIC_PARAM, sizes.generic_param),
             (Token::TABLE_METHOD_SPEC, sizes.method_spec),
-        ];
+        ]
+    }
+
+    fn serialize_tables(&self, sizes: &RowCounts, widths: &Widths) -> Vec<u8> {
+        // Every table this backend can ever emit, in ascending table-id order (§II.24.2.6
+        // requires tables be written in table-id order regardless of population order).
+        let table_rowcounts = Self::table_rowcounts(sizes);
 
         let mut valid: u64 = 0;
         let mut sorted: u64 = 0;
@@ -2131,227 +2106,202 @@ impl MetadataBuilder {
     }
 
     fn write_module_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.module {
+        write_rows!(&self.module, row, {
             out.extend_from_slice(&0u16.to_le_bytes()); // Generation
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.mvid, w.guid_wide); // Mvid
             write_heap_idx(out, 0, w.guid_wide); // EncId
             write_heap_idx(out, 0, w.guid_wide); // EncBaseId
-        }
+        });
     }
 
     fn write_type_ref_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.type_ref {
+        write_rows!(&self.type_ref, row, {
             write_coded_idx(out, row.resolution_scope, w.resolution_scope_wide);
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.namespace, w.str_wide);
-        }
+        });
     }
 
     fn write_type_def_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.type_def {
+        write_rows!(&self.type_def, row, {
             out.extend_from_slice(&row.flags.to_le_bytes());
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.namespace, w.str_wide);
             write_coded_idx(out, row.extends, w.type_def_or_ref_wide);
             write_simple_idx(out, row.field_list, w.field_wide);
             write_simple_idx(out, row.method_list, w.method_def_wide);
-        }
+        });
     }
 
     fn write_field_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.field {
+        write_rows!(&self.field, row, {
             out.extend_from_slice(&row.flags.to_le_bytes());
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.signature, w.blob_wide);
-        }
+        });
     }
 
     fn write_method_def_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.method_def {
+        write_rows!(&self.method_def, row, {
             out.extend_from_slice(&row.rva.to_le_bytes());
             out.extend_from_slice(&row.impl_flags.to_le_bytes());
             out.extend_from_slice(&row.flags.to_le_bytes());
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.signature, w.blob_wide);
             write_simple_idx(out, row.param_list, w.param_wide);
-        }
+        });
     }
 
     fn write_param_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.param {
+        write_rows!(&self.param, row, {
             out.extend_from_slice(&row.flags.to_le_bytes());
             out.extend_from_slice(&row.sequence.to_le_bytes());
             write_heap_idx(out, row.name, w.str_wide);
-        }
+        });
     }
 
     fn write_interface_impl_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&InterfaceImplRow> = self.interface_impl.iter().collect();
-        // Sorted by Class (§II.22.23) — a simple TypeDef row index, so a plain numeric sort is
-        // the spec's total order.
-        rows.sort_by_key(|r| r.class);
-        debug_assert!(rows.windows(2).all(|w| w[0].class <= w[1].class));
-        for row in rows {
+        write_sorted_rows!(self.interface_impl, |r| r.class, row, {
             write_simple_idx(out, row.class, w.type_def_wide);
             write_coded_idx(out, row.interface, w.type_def_or_ref_wide);
-        }
+        });
     }
 
     fn write_member_ref_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.member_ref {
+        write_rows!(&self.member_ref, row, {
             write_coded_idx(out, row.class, w.member_ref_parent_wide);
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.signature, w.blob_wide);
-        }
+        });
     }
 
     fn write_constant_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&ConstantRow> = self.constant.iter().collect();
-        rows.sort_by_key(|row| row.parent);
-        for row in rows {
+        write_sorted_rows!(self.constant, |row| row.parent, row, {
             out.push(row.type_code);
             out.push(0); // Padding
             write_coded_idx(out, row.parent, w.has_constant_wide);
             write_heap_idx(out, row.value, w.blob_wide);
-        }
+        });
     }
 
     fn write_event_map_rows(&self, out: &mut Vec<u8>, w: &Widths) {
         // §II.22.12: NOT a sorted table — insertion order (which is class-def iteration order, so
         // Parent is de-facto ascending anyway) is fine.
-        for row in &self.event_map {
+        write_rows!(&self.event_map, row, {
             write_simple_idx(out, row.parent, w.type_def_wide);
             write_simple_idx(out, row.event_list, w.event_wide);
-        }
+        });
     }
 
     fn write_event_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.event {
+        write_rows!(&self.event, row, {
             out.extend_from_slice(&row.event_flags.to_le_bytes());
             write_heap_idx(out, row.name, w.str_wide);
             write_coded_idx(out, row.event_type, w.type_def_or_ref_wide);
-        }
+        });
     }
 
     fn write_property_map_rows(&self, out: &mut Vec<u8>, w: &Widths) {
         // §II.22.35: NOT a sorted table — insertion order (class-def iteration order, so Parent
         // is de-facto ascending anyway), exactly like `write_event_map_rows`.
-        for row in &self.property_map {
+        write_rows!(&self.property_map, row, {
             write_simple_idx(out, row.parent, w.type_def_wide);
             write_simple_idx(out, row.property_list, w.property_wide);
-        }
+        });
     }
 
     fn write_property_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.property {
+        write_rows!(&self.property, row, {
             out.extend_from_slice(&row.flags.to_le_bytes());
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.signature, w.blob_wide);
-        }
+        });
     }
 
     fn write_method_semantics_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&MethodSemanticsRow> = self.method_semantics.iter().collect();
         // Sorted by Association (§II.22.28) — the coded HasSemantics index. `sort_by_key` is
         // stable, so the add-then-remove insertion order is preserved within one event.
-        rows.sort_by_key(|r| r.association);
-        for row in rows {
+        write_sorted_rows!(self.method_semantics, |r| r.association, row, {
             out.extend_from_slice(&row.semantics.to_le_bytes());
             write_simple_idx(out, row.method, w.method_def_wide);
             write_coded_idx(out, row.association, w.has_semantics_wide);
-        }
+        });
     }
 
     fn write_method_impl_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&MethodImplRow> = self.method_impl.iter().collect();
         // Sorted by Class (§II.22.27) — a simple TypeDef row index.
-        rows.sort_by_key(|r| r.class);
-        debug_assert!(rows.windows(2).all(|w| w[0].class <= w[1].class));
-        for row in rows {
+        write_sorted_rows!(self.method_impl, |r| r.class, row, {
             write_simple_idx(out, row.class, w.type_def_wide);
             write_coded_idx(out, row.method_body, w.method_def_or_ref_wide);
             write_coded_idx(out, row.method_declaration, w.method_def_or_ref_wide);
-        }
+        });
     }
 
     fn write_custom_attribute_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&CustomAttributeRow> = self.custom_attribute.iter().collect();
         // Sorted by Parent (§II.22.10) — the coded HasCustomAttribute index.
-        rows.sort_by_key(|r| r.parent);
-        for row in rows {
+        write_sorted_rows!(self.custom_attribute, |r| r.parent, row, {
             write_coded_idx(out, row.parent, w.has_custom_attribute_wide);
             write_coded_idx(out, row.ctor, w.custom_attribute_type_wide);
             write_heap_idx(out, row.value, w.blob_wide);
-        }
+        });
     }
 
     fn write_class_layout_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&ClassLayoutRow> = self.class_layout.iter().collect();
         // Sorted by Parent (§II.22.8).
-        rows.sort_by_key(|r| r.parent);
-        debug_assert!(rows.windows(2).all(|w| w[0].parent <= w[1].parent));
-        for row in rows {
+        write_sorted_rows!(self.class_layout, |r| r.parent, row, {
             out.extend_from_slice(&row.packing_size.to_le_bytes());
             out.extend_from_slice(&row.class_size.to_le_bytes());
             write_simple_idx(out, row.parent, w.type_def_wide);
-        }
+        });
     }
 
     fn write_field_layout_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&FieldLayoutRow> = self.field_layout.iter().collect();
         // Sorted by Field (§II.22.16).
-        rows.sort_by_key(|r| r.field);
-        debug_assert!(rows.windows(2).all(|w| w[0].field <= w[1].field));
-        for row in rows {
+        write_sorted_rows!(self.field_layout, |r| r.field, row, {
             out.extend_from_slice(&row.offset.to_le_bytes());
             write_simple_idx(out, row.field, w.field_wide);
-        }
+        });
     }
 
     fn write_standalone_sig_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.standalone_sig {
+        write_rows!(&self.standalone_sig, row, {
             write_heap_idx(out, row.signature, w.blob_wide);
-        }
+        });
     }
 
     fn write_module_ref_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.module_ref {
+        write_rows!(&self.module_ref, row, {
             write_heap_idx(out, row.name, w.str_wide);
-        }
+        });
     }
 
     fn write_type_spec_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.type_spec {
+        write_rows!(&self.type_spec, row, {
             write_heap_idx(out, row.signature, w.blob_wide);
-        }
+        });
     }
 
     fn write_impl_map_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&ImplMapRow> = self.impl_map.iter().collect();
         // Sorted by MemberForwarded (§II.22.22) — the coded index.
-        rows.sort_by_key(|r| r.member_forwarded);
-        for row in rows {
+        write_sorted_rows!(self.impl_map, |r| r.member_forwarded, row, {
             out.extend_from_slice(&row.mapping_flags.to_le_bytes());
             write_coded_idx(out, row.member_forwarded, w.member_forwarded_wide);
             write_heap_idx(out, row.import_name, w.str_wide);
             write_simple_idx(out, row.import_scope, w.module_ref_wide);
-        }
+        });
     }
 
     fn write_field_rva_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&FieldRvaRow> = self.field_rva.iter().collect();
         // Sorted by Field (§II.22.18).
-        rows.sort_by_key(|r| r.field);
-        debug_assert!(rows.windows(2).all(|w| w[0].field <= w[1].field));
-        for row in rows {
+        write_sorted_rows!(self.field_rva, |r| r.field, row, {
             out.extend_from_slice(&row.rva.to_le_bytes());
             write_simple_idx(out, row.field, w.field_wide);
-        }
+        });
     }
 
     fn write_assembly_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.assembly {
+        write_rows!(&self.assembly, row, {
             out.extend_from_slice(&row.hash_alg_id.to_le_bytes());
             out.extend_from_slice(&row.major.to_le_bytes());
             out.extend_from_slice(&row.minor.to_le_bytes());
@@ -2361,11 +2311,11 @@ impl MetadataBuilder {
             write_heap_idx(out, row.public_key, w.blob_wide);
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.culture, w.str_wide);
-        }
+        });
     }
 
     fn write_assembly_ref_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.assembly_ref {
+        write_rows!(&self.assembly_ref, row, {
             out.extend_from_slice(&row.major.to_le_bytes());
             out.extend_from_slice(&row.minor.to_le_bytes());
             out.extend_from_slice(&row.build.to_le_bytes());
@@ -2375,32 +2325,26 @@ impl MetadataBuilder {
             write_heap_idx(out, row.name, w.str_wide);
             write_heap_idx(out, row.culture, w.str_wide);
             write_heap_idx(out, row.hash_value, w.blob_wide);
-        }
+        });
     }
 
     fn write_generic_param_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        let mut rows: Vec<&GenericParamRow> = self.generic_param.iter().collect();
         // Sorted by Owner (the coded TypeOrMethodDef index) then Number (§II.24.2.6). Pass 1's
-        // natural emission order (ascending TypeDef rid, ascending number) is already sorted —
-        // the sort here is belt-and-braces, the debug_assert the tripwire.
-        rows.sort_by_key(|r| (r.owner, r.number));
-        debug_assert!(
-            rows.windows(2)
-                .all(|w| (w[0].owner, w[0].number) <= (w[1].owner, w[1].number))
-        );
-        for row in rows {
+        // natural emission order (ascending TypeDef rid, ascending number) is already sorted;
+        // sort anyway so callers may populate rows in any order.
+        write_sorted_rows!(self.generic_param, |r| (r.owner, r.number), row, {
             out.extend_from_slice(&row.number.to_le_bytes());
             out.extend_from_slice(&row.flags.to_le_bytes());
             write_coded_idx(out, row.owner, w.type_or_method_def_wide);
             write_heap_idx(out, row.name, w.str_wide);
-        }
+        });
     }
 
     fn write_method_spec_rows(&self, out: &mut Vec<u8>, w: &Widths) {
-        for row in &self.method_spec {
+        write_rows!(&self.method_spec, row, {
             write_coded_idx(out, row.method, w.method_def_or_ref_wide);
             write_heap_idx(out, row.instantiation, w.blob_wide);
-        }
+        });
     }
 
     /// Sets (or replaces) the `Module` table's single row (§II.22.30). Not part of the pinned
@@ -2478,7 +2422,7 @@ fn deterministic_mvid(name: &str) -> [u8; 16] {
 
 fn pad4(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
     out
@@ -2679,9 +2623,6 @@ struct Widths {
     str_wide: bool,
     guid_wide: bool,
     blob_wide: bool,
-    #[allow(dead_code)] // symmetry with the other *_wide fields; #US never appears in a table row
-    us_wide: bool,
-
     type_def_wide: bool,
     field_wide: bool,
     method_def_wide: bool,
@@ -2708,13 +2649,10 @@ impl Widths {
         strings: &StringsHeap,
         blobs: &BlobHeap,
         guids: &GuidHeap,
-        user_strings: &UserStringHeap,
     ) -> Self {
         let str_wide = strings.as_bytes().len() > 0xFFFF;
         let blob_wide = blobs.as_bytes().len() > 0xFFFF;
         let guid_wide = guids.as_bytes().len() > 0xFFFF;
-        let us_wide = user_strings.as_bytes().len() > 0xFFFF;
-
         // §II.24.2.6 `HeapSizes` byte: bit 0 = #Strings wide, bit 1 = #GUID wide, bit 2 = #Blob
         // wide.
         let mut heap_sizes = 0u8;
@@ -2788,7 +2726,6 @@ impl Widths {
             str_wide,
             guid_wide,
             blob_wide,
-            us_wide,
             type_def_wide: simple_wide(sizes.type_def),
             field_wide: simple_wide(sizes.field),
             method_def_wide: simple_wide(sizes.method_def),
@@ -3108,7 +3045,6 @@ fn bcl_assembly_version(runtime: DotnetRuntime, name: &str) -> (u16, u16, u16, u
         return match name {
             "System.Runtime" => (4, 1, 2, 0),
             "netstandard" => (2, 1, 0, 0),
-            "mscorlib" => (4, 0, 0, 0),
             _ => (4, 0, 0, 0),
         };
     }
@@ -3208,6 +3144,13 @@ pub trait TokenSink {
     /// a full signature encoding (generic instantiation, array, pointer — anything
     /// `sig::encode_type` doesn't collapse to a bare class reference).
     fn type_token(&mut self, asm: &mut Assembly, tpe: Type) -> Token;
+
+    /// Resolves the OPEN shape of a class reference to a `TypeDefOrRef` coded index for use
+    /// *inside* a signature's `ELEMENT_TYPE_GENERICINST` wrapper. This is intentionally separate
+    /// from [`Self::type_token`]: instruction operands for a closed generic need a `TypeSpec`,
+    /// while ECMA-335 requires the class token immediately following `GENERICINST` to be a
+    /// `TypeDef`/`TypeRef` (a `TypeSpec` tag is rejected by CoreCLR as malformed metadata).
+    fn type_def_or_ref_token(&mut self, asm: &mut Assembly, cref: Interned<ClassRef>) -> u32;
 }
 
 impl TokenSink for MetadataBuilder {
@@ -3333,20 +3276,7 @@ impl TokenSink for MetadataBuilder {
 
     fn field_token(&mut self, asm: &mut Assembly, field: Interned<FieldDesc>) -> Token {
         let desc = asm[field];
-        let name = asm[desc.name()].to_string();
-        let owner_in_asm = asm.class_ref_to_def(desc.owner()).is_some();
-        if owner_in_asm {
-            let owner = self.class_ref_token(asm, desc.owner());
-            let name_offset = self.strings.intern(&name);
-            if let Some(tok) = self.field_def_token(owner, name_offset) {
-                return tok;
-            }
-        }
-        let class_tok = self.class_ref_token(asm, desc.owner());
-        let mut blob = Vec::new();
-        sig::encode_field_sig(desc.tpe(), asm, self, &mut blob);
-        let sig_off = self.blobs.intern(&blob);
-        self.member_ref(class_tok, &name, sig_off)
+        self.field_like_token(asm, desc.owner(), desc.name(), desc.tpe())
     }
 
     fn static_field_token(
@@ -3355,20 +3285,7 @@ impl TokenSink for MetadataBuilder {
         field: Interned<StaticFieldDesc>,
     ) -> Token {
         let desc = asm[field];
-        let name = asm[desc.name()].to_string();
-        let owner_in_asm = asm.class_ref_to_def(desc.owner()).is_some();
-        if owner_in_asm {
-            let owner = self.class_ref_token(asm, desc.owner());
-            let name_offset = self.strings.intern(&name);
-            if let Some(tok) = self.field_def_token(owner, name_offset) {
-                return tok;
-            }
-        }
-        let class_tok = self.class_ref_token(asm, desc.owner());
-        let mut blob = Vec::new();
-        sig::encode_field_sig(desc.tpe(), asm, self, &mut blob);
-        let sig_off = self.blobs.intern(&blob);
-        self.member_ref(class_tok, &name, sig_off)
+        self.field_like_token(asm, desc.owner(), desc.name(), desc.tpe())
     }
 
     fn user_string_token(&mut self, s: &str) -> Token {
@@ -3418,15 +3335,48 @@ impl TokenSink for MetadataBuilder {
             }
         }
     }
+
+    fn type_def_or_ref_token(&mut self, asm: &mut Assembly, cref: Interned<ClassRef>) -> u32 {
+        TypeDefOrRefResolver::type_def_or_ref(self, cref, asm)
+    }
 }
 
 impl MetadataBuilder {
-    fn field_def_token(&self, owner: Token, name_offset: u32) -> Option<Token> {
+    fn field_like_token(
+        &mut self,
+        asm: &mut Assembly,
+        owner: Interned<ClassRef>,
+        name_idx: Interned<IString>,
+        tpe: Type,
+    ) -> Token {
+        let name = asm[name_idx].to_string();
+        let mut blob = Vec::new();
+        sig::encode_field_sig(tpe, asm, self, &mut blob);
+        let sig_off = self.blobs.intern(&blob);
+        if asm.class_ref_to_def(owner).is_some() {
+            let owner = self.class_ref_token(asm, owner);
+            let name_offset = self.strings.intern(&name);
+            if let Some(tok) = self.field_def_token(owner, name_offset, sig_off) {
+                return tok;
+            }
+        }
+        let class_tok = self.class_ref_token(asm, owner);
+        self.member_ref(class_tok, &name, sig_off)
+    }
+
+    fn field_def_token(
+        &self,
+        owner: Token,
+        name_offset: u32,
+        signature_offset: u32,
+    ) -> Option<Token> {
         #[cfg(test)]
         self.lookup_counts
             .fields
             .set(self.lookup_counts.fields.get() + 1);
-        self.field_def_cache.get(&(owner.0, name_offset)).copied()
+        self.field_def_cache
+            .get(&(owner.0, name_offset, signature_offset))
+            .copied()
     }
 }
 
@@ -3491,7 +3441,10 @@ mod tests {
         let field_name = builder.strings.intern("value");
         builder.lookup_counts.fields.set(0);
         for (owner, expected) in &field_rows {
-            assert_eq!(builder.field_def_token(*owner, field_name), Some(*expected));
+            assert_eq!(
+                builder.field_def_token(*owner, field_name, 0),
+                Some(*expected)
+            );
         }
         assert_eq!(builder.lookup_counts.fields.get(), ROWS);
 
@@ -3542,6 +3495,27 @@ mod tests {
         builder.lookup_counts.params.set(0);
         builder.add_method_custom_attributes(&mut asm, method, &[], &[], &parameter_attributes);
         assert_eq!(builder.lookup_counts.params.get(), ROWS);
+    }
+
+    #[test]
+    fn field_definition_lookup_includes_signature() {
+        let mut builder = MetadataBuilder::new();
+        let owner = builder.add_type_def("", "MainModule", false, None, None, None, &[]);
+        builder.set_type_def_field_list(owner);
+        let u32_signature = builder.blobs.intern(&[sig::SIG_FIELD, 0x09]);
+        let u64_signature = builder.blobs.intern(&[sig::SIG_FIELD, 0x0b]);
+        let u32_field = builder.add_static_field("n_g_4", u32_signature, None, false, false);
+        let u64_field = builder.add_static_field("n_g_4", u64_signature, None, false, false);
+        let name = builder.strings.intern("n_g_4");
+
+        assert_eq!(
+            builder.field_def_token(owner, name, u32_signature),
+            Some(u32_field)
+        );
+        assert_eq!(
+            builder.field_def_token(owner, name, u64_signature),
+            Some(u64_field)
+        );
     }
 
     #[test]
@@ -4310,7 +4284,7 @@ mod tests {
         };
         assert_eq!(
             owner,
-            (2 << 1) | 0,
+            (2 << 1),
             "Owner must be coded TypeOrMethodDef(TypeDef rid 2)"
         );
         let owner_w = if owner_wide { 4 } else { 2 };
@@ -5337,7 +5311,7 @@ mod tests {
                     .unwrap()
                     .to_string();
                 let mut name_len = name_end - name_start + 1;
-                while name_len % 4 != 0 {
+                while !name_len.is_multiple_of(4) {
                     name_len += 1;
                 }
                 cursor = name_start + name_len;
@@ -5392,7 +5366,7 @@ mod tests {
                         + simple_w(count(Token::TABLE_FIELD))
                         + simple_w(count(Token::TABLE_METHOD_DEF))
                 }
-                Token::TABLE_FIELD => 2 + str_w + blob_w,
+                Token::TABLE_FIELD | Token::TABLE_PROPERTY => 2 + str_w + blob_w,
                 Token::TABLE_METHOD_DEF => {
                     4 + 2 + 2 + str_w + blob_w + simple_w(count(Token::TABLE_PARAM))
                 }
@@ -5442,8 +5416,10 @@ mod tests {
                     coded_w(5, hca_max) + coded_w(3, cat_max) + blob_w
                 }
                 Token::TABLE_CLASS_LAYOUT => 2 + 4 + simple_w(count(Token::TABLE_TYPE_DEF)),
-                Token::TABLE_FIELD_LAYOUT => 4 + simple_w(count(Token::TABLE_FIELD)),
-                Token::TABLE_STAND_ALONE_SIG => blob_w,
+                Token::TABLE_FIELD_LAYOUT | Token::TABLE_FIELD_RVA => {
+                    4 + simple_w(count(Token::TABLE_FIELD))
+                }
+                Token::TABLE_STAND_ALONE_SIG | Token::TABLE_TYPE_SPEC => blob_w,
                 Token::TABLE_EVENT_MAP => {
                     simple_w(count(Token::TABLE_TYPE_DEF)) + simple_w(count(Token::TABLE_EVENT))
                 }
@@ -5456,7 +5432,6 @@ mod tests {
                 Token::TABLE_PROPERTY_MAP => {
                     simple_w(count(Token::TABLE_TYPE_DEF)) + simple_w(count(Token::TABLE_PROPERTY))
                 }
-                Token::TABLE_PROPERTY => 2 + str_w + blob_w,
                 Token::TABLE_METHOD_SEMANTICS => {
                     // Association is a `HasSemantics` coded index (Event | Property, 1 tag bit);
                     // the larger of the two target tables bounds the width.
@@ -5472,12 +5447,10 @@ mod tests {
                     simple_w(count(Token::TABLE_TYPE_DEF)) + 2 * coded_w(1, mdor_max)
                 }
                 Token::TABLE_MODULE_REF => str_w,
-                Token::TABLE_TYPE_SPEC => blob_w,
                 Token::TABLE_IMPL_MAP => {
                     let mf_max = count(Token::TABLE_FIELD).max(count(Token::TABLE_METHOD_DEF));
                     2 + coded_w(1, mf_max) + str_w + simple_w(count(Token::TABLE_MODULE_REF))
                 }
-                Token::TABLE_FIELD_RVA => 4 + simple_w(count(Token::TABLE_FIELD)),
                 // HashAlgId(4) + 4×Version(2) + Flags(4) + PublicKey(blob) + Name/Culture(str).
                 // The Flags u32 was MISSING here (a latent reader-only bug: no prior test ever
                 // read a table sorted AFTER Assembly in an image carrying an Assembly row —
@@ -5904,7 +5877,7 @@ mod tests {
 
         // The coded value for the highest-numbered row (rid = max_rows, tag = 0):
         // (rid << tag_bits) | tag == (16384 << 2) | 0 == 0x1_0000 — doesn't fit in u16.
-        let value: u32 = (u32::try_from(max_rows).unwrap() << tag_bits) | 0;
+        let value: u32 = u32::try_from(max_rows).unwrap() << tag_bits;
         assert_eq!(value, 0x1_0000);
 
         let mut out = Vec::new();
@@ -5927,15 +5900,14 @@ mod tests {
         let strings = StringsHeap::default();
         let blobs = BlobHeap::default();
         let guids = GuidHeap::default();
-        let us = UserStringHeap::default();
-        let w_small = Widths::compute(&sizes_small, &strings, &blobs, &guids, &us);
+        let w_small = Widths::compute(&sizes_small, &strings, &blobs, &guids);
         assert!(!w_small.type_def_or_ref_wide);
 
         let sizes_big = RowCounts {
             type_def: (1 << 14) + 1,
             ..Default::default()
         };
-        let w_big = Widths::compute(&sizes_big, &strings, &blobs, &guids, &us);
+        let w_big = Widths::compute(&sizes_big, &strings, &blobs, &guids);
         assert!(w_big.type_def_or_ref_wide);
     }
 
@@ -5948,8 +5920,7 @@ mod tests {
         strings.intern(&big);
         let blobs = BlobHeap::default();
         let guids = GuidHeap::default();
-        let us = UserStringHeap::default();
-        let w = Widths::compute(&sizes, &strings, &blobs, &guids, &us);
+        let w = Widths::compute(&sizes, &strings, &blobs, &guids);
         assert!(w.str_wide);
         assert_eq!(w.heap_sizes & 0x1, 0x1);
         assert_eq!(
@@ -7189,17 +7160,67 @@ mod tests {
     }
 
     #[test]
-    fn f128_type_token_is_not_yet_supported() {
-        // sig::encode_type still todo!()s on f128 (a pre-existing, out-of-scope gap noted in
-        // sig.rs); confirm type_token surfaces the same gap rather than silently mishandling it.
+    fn f128_type_token_uses_a_local_type_spec() {
+        // f128 is represented by the linker's synthetic local valuetype. Register that same
+        // shape before asking the resolver for a token; otherwise this test could pass while the
+        // encoder silently emitted an external TypeRef for an unresolved placeholder.
         let mut mb = MetadataBuilder::new();
         let mut asm = Assembly::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            TokenSink::type_token(&mut mb, &mut asm, Type::Float(Float::F128))
-        }));
-        assert!(
-            result.is_err(),
-            "f128 signature encoding is a known todo!() in sig.rs"
+        let f128_name = asm.alloc_string("f128");
+        let low = asm.alloc_string("low");
+        let high = asm.alloc_string("high");
+        asm.class_def(crate::ir::ClassDef::new(
+            f128_name,
+            true,
+            0,
+            None,
+            vec![
+                (Type::Int(Int::U64), low, Some(0)),
+                (Type::Int(Int::U64), high, Some(8)),
+            ],
+            vec![],
+            Access::Public,
+            std::num::NonZeroU32::new(16),
+            std::num::NonZeroU32::new(16),
+            true,
+        ))
+        .unwrap();
+        let runtime = mb.find_or_create_assembly_ref("System.Runtime");
+        let value_type = mb.type_ref(Some(runtime), "System", "ValueType");
+        let f128_token =
+            mb.add_type_def("", "f128", true, Some(value_type), Some(1), Some(16), &[]);
+        let token = TokenSink::type_token(&mut mb, &mut asm, Type::Float(Float::F128));
+        assert_eq!(token.table(), Token::TABLE_TYPE_SPEC);
+        let signature = mb.type_spec[(token.rid() - 1) as usize].signature;
+        let blob = &mb.blobs.as_bytes()[signature as usize..];
+        let (blob_len, prefix_len) = match blob[0] {
+            length @ 0..=0x7f => (u32::from(length), 1),
+            first @ 0x80..=0xbf => ((u32::from(first & 0x3f) << 8) | u32::from(blob[1]), 2),
+            first @ 0xc0..=0xdf => (
+                (u32::from(first & 0x1f) << 24)
+                    | (u32::from(blob[1]) << 16)
+                    | (u32::from(blob[2]) << 8)
+                    | u32::from(blob[3]),
+                4,
+            ),
+            other => panic!("invalid compressed blob length prefix {other:#x}"),
+        };
+        let payload = &blob[prefix_len..prefix_len + usize::try_from(blob_len).unwrap()];
+        assert_eq!(
+            payload[0], 0x11,
+            "f128 must be encoded as ELEMENT_TYPE_VALUETYPE"
+        );
+        let mut expected_type_def_ref = Vec::new();
+        write_compressed_u32(&mut expected_type_def_ref, f128_token.rid() << 2);
+        assert_eq!(
+            payload.len(),
+            1 + expected_type_def_ref.len(),
+            "f128 type spec payload length"
+        );
+        assert_eq!(
+            &payload[1..],
+            expected_type_def_ref,
+            "f128 signature must reference the local TypeDef, not an external TypeRef"
         );
     }
 

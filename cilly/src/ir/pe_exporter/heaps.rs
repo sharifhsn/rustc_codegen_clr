@@ -37,15 +37,6 @@ pub struct StringsHeap {
     interned: HashMap<Box<str>, u32>,
 }
 
-impl Default for StringsHeap {
-    fn default() -> Self {
-        Self {
-            data: vec![0],
-            interned: HashMap::new(),
-        }
-    }
-}
-
 impl StringsHeap {
     /// Interns `s`, returning its byte offset. The empty string is always offset 0.
     pub fn intern(&mut self, s: &str) -> u32 {
@@ -65,11 +56,6 @@ impl StringsHeap {
         self.interned.insert(s.into(), off);
         off
     }
-
-    /// Final heap bytes (unpadded; the container pads streams to 4-byte alignment).
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.data
-    }
 }
 
 /// The `#Blob` heap: length-prefixed byte blobs (§II.24.2.4). Offset 0 is always the empty blob
@@ -77,15 +63,6 @@ impl StringsHeap {
 pub struct BlobHeap {
     data: Vec<u8>,
     interned: HashMap<Box<[u8]>, u32>,
-}
-
-impl Default for BlobHeap {
-    fn default() -> Self {
-        Self {
-            data: vec![0],
-            interned: HashMap::new(),
-        }
-    }
 }
 
 impl BlobHeap {
@@ -107,10 +84,6 @@ impl BlobHeap {
         self.interned.insert(blob.into(), off);
         off
     }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.data
-    }
 }
 
 /// The `#GUID` heap: raw 16-byte GUIDs, indexed by **1-based ordinal** (§II.24.2.5).
@@ -126,10 +99,6 @@ impl GuidHeap {
         self.data.extend_from_slice(&guid);
         u32::try_from(self.data.len() / 16).expect("#GUID heap exceeded u32 ordinals")
     }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.data
-    }
 }
 
 /// The `#US` (user-string) heap backing `ldstr` (§II.24.2.4): length-prefixed UTF-16LE strings,
@@ -138,15 +107,6 @@ impl GuidHeap {
 pub struct UserStringHeap {
     data: Vec<u8>,
     interned: HashMap<Box<str>, u32>,
-}
-
-impl Default for UserStringHeap {
-    fn default() -> Self {
-        Self {
-            data: vec![0],
-            interned: HashMap::new(),
-        }
-    }
 }
 
 impl UserStringHeap {
@@ -171,11 +131,39 @@ impl UserStringHeap {
         self.interned.insert(s.into(), off);
         off
     }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.data
-    }
 }
+
+macro_rules! impl_empty_heap {
+    ($heap:ty) => {
+        impl Default for $heap {
+            fn default() -> Self {
+                Self {
+                    data: vec![0],
+                    interned: HashMap::new(),
+                }
+            }
+        }
+    };
+}
+
+macro_rules! impl_heap_bytes {
+    ($heap:ty) => {
+        impl $heap {
+            /// Final heap bytes (unpadded; the container pads streams to 4-byte alignment).
+            pub fn as_bytes(&self) -> &[u8] {
+                &self.data
+            }
+        }
+    };
+}
+
+impl_empty_heap!(StringsHeap);
+impl_empty_heap!(BlobHeap);
+impl_empty_heap!(UserStringHeap);
+impl_heap_bytes!(StringsHeap);
+impl_heap_bytes!(BlobHeap);
+impl_heap_bytes!(GuidHeap);
+impl_heap_bytes!(UserStringHeap);
 
 #[cfg(test)]
 mod tests {

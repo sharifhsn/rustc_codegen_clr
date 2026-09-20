@@ -24,12 +24,34 @@ use rustc_middle::{
         BasicBlock, InlineAsmOperand, Operand, Place, SwitchTargets, Terminator, TerminatorKind,
         UnwindTerminateReason,
     },
-    ty::{Instance, InstanceKind, Ty, TyKind},
+    ty::{Instance, InstanceKind, ShimKind, Ty, TyCtxt, TyKind},
 };
 use rustc_span::Spanned;
 
 mod call;
 mod intrinsics;
+
+/// Returns whether invoking this resolved drop glue has no observable work.
+///
+/// rustc still resolves `drop_in_place::<[T]>` to a real slice drop-glue instance even when the
+/// monomorphized element `T` has empty drop glue. Calling that instance leaves a counted slice loop
+/// in MIR. For a maximal ZST slice (the valid `Vec<()>` capacity is `usize::MAX`) that otherwise
+/// turns a semantic no-op into an effectively non-terminating loop. The slice may be skipped only
+/// after asking rustc about the element's drop glue; ZSTs with a `Drop` impl must still run once per
+/// element.
+pub(crate) fn drop_glue_is_noop<'tcx>(instance: Instance<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    match instance.def {
+        InstanceKind::Shim(ShimKind::DropGlue(_, None)) => true,
+        InstanceKind::Shim(ShimKind::DropGlue(_, Some(ty))) => match ty.kind() {
+            TyKind::Slice(element) => matches!(
+                Instance::resolve_drop_glue(tcx, *element).def,
+                InstanceKind::Shim(ShimKind::DropGlue(_, None))
+            ),
+            _ => false,
+        },
+        _ => false,
+    }
+}
 /// Builds an unconditional branch root targeting `target`.
 fn goto(ctx: &mut MethodCompileCtx<'_, '_>, target: u32) -> Root {
     ctx.alloc_root(CILRoot::Branch(Box::new((target, 0, None))))
@@ -138,7 +160,7 @@ pub(crate) fn get_caller_location<'tcx>(
 /// discarded the `len`/`index` operands and called an unbodied `abort`, which crashed the program
 /// with "missing method abort" instead of producing the correct, catchable panic.
 fn call_panic_lang_item<'tcx>(
-    lang: rustc_hir::lang_items::LangItem,
+    lang: rustc_hir::attrs::lang_items::LangItem,
     args: &[Interned<CILNode>],
     source_info: rustc_middle::mir::SourceInfo,
     ctx: &mut MethodCompileCtx<'tcx, '_>,
@@ -225,6 +247,29 @@ enum CpuidTemplate {
     Direct,
     /// stdarch's RBX-preserving form, where this operand is the temporary carrying EBX.
     RbxScratch(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CpuidRegister {
+    Eax,
+    Ebx,
+    Ecx,
+    Edx,
+}
+
+/// Map rustc's canonical x86 register names to CPUID's architectural 32-bit roles. rustc stores
+/// aliases such as `eax` and `rax` in the single `ax` enum variant, and `InlineAsmReg::name()`
+/// therefore normally returns `ax` (likewise `bx`, `cx`, and `dx`) regardless of the spelling in
+/// the source asm operand. Keep the aliases accepted as well so this boundary does not depend on
+/// that rustc-private presentation detail.
+fn cpuid_register(name: &str) -> Option<CpuidRegister> {
+    match name {
+        "ax" | "eax" | "rax" => Some(CpuidRegister::Eax),
+        "bx" | "ebx" | "rbx" => Some(CpuidRegister::Ebx),
+        "cx" | "ecx" | "rcx" => Some(CpuidRegister::Ecx),
+        "dx" | "edx" | "rdx" => Some(CpuidRegister::Edx),
+        _ => None,
+    }
 }
 
 /// Recognize only CPUID itself and stdarch's exact RBX-preserving wrapper. In particular, the mere
@@ -437,9 +482,9 @@ fn clr_owned_stack_probe_exit(
 #[cfg(test)]
 mod inline_asm_template_tests {
     use super::{
-        ClrOwnedStackProbeExit, CpuidTemplate, X86PackedByteAsm, clr_owned_stack_probe_exit,
-        cpuid_template, is_clr_owned_stack_probe, is_x86_locked_not_fence, normalized_asm_template,
-        x86_packed_byte_asm,
+        ClrOwnedStackProbeExit, CpuidRegister, CpuidTemplate, X86PackedByteAsm,
+        clr_owned_stack_probe_exit, cpuid_register, cpuid_template, is_clr_owned_stack_probe,
+        is_x86_locked_not_fence, normalized_asm_template, x86_packed_byte_asm,
     };
     use rustc_ast::InlineAsmTemplatePiece;
     use rustc_span::DUMMY_SP;
@@ -485,6 +530,15 @@ mod inline_asm_template_tests {
             InlineAsmTemplatePiece::String(", ebx".into()),
         ];
         assert_eq!(cpuid_template(&mismatched_rbx_scratch), None);
+    }
+
+    #[test]
+    fn cpuid_registers_accept_rustc_canonical_x86_names() {
+        assert_eq!(cpuid_register("ax"), Some(CpuidRegister::Eax));
+        assert_eq!(cpuid_register("bx"), Some(CpuidRegister::Ebx));
+        assert_eq!(cpuid_register("cx"), Some(CpuidRegister::Ecx));
+        assert_eq!(cpuid_register("dx"), Some(CpuidRegister::Edx));
+        assert_eq!(cpuid_register("si"), None);
     }
 
     #[test]
@@ -771,9 +825,10 @@ fn lower_cpuid<'tcx>(
                 out_place,
                 ..
             } => {
-                let (input_slot, seen, tuple_field) = match explicit_reg(reg)?.as_str() {
-                    "eax" => (&mut leaf, &mut has_eax, 0),
-                    "ecx" => (&mut subleaf, &mut has_ecx, 2),
+                let register = explicit_reg(reg)?;
+                let (input_slot, seen, tuple_field) = match cpuid_register(&register)? {
+                    CpuidRegister::Eax => (&mut leaf, &mut has_eax, 0),
+                    CpuidRegister::Ecx => (&mut subleaf, &mut has_ecx, 2),
                     _ => return None,
                 };
                 if *seen || input_slot.is_some() {
@@ -793,15 +848,15 @@ fn lower_cpuid<'tcx>(
             }
             InlineAsmOperand::Out { reg, place, .. } => {
                 let tuple_field = if let Some(register) = explicit_reg(reg) {
-                    match register.as_str() {
-                        "ebx" if matches!(template, CpuidTemplate::Direct) => {
+                    match cpuid_register(&register)? {
+                        CpuidRegister::Ebx if matches!(template, CpuidTemplate::Direct) => {
                             if has_ebx {
                                 return None;
                             }
                             has_ebx = true;
                             1
                         }
-                        "edx" => {
+                        CpuidRegister::Edx => {
                             if has_edx {
                                 return None;
                             }
@@ -1378,7 +1433,7 @@ pub fn handle_terminator<'tcx>(
             // Otherwise (fall through) call the matching panic lang item. The special-cased kinds
             // take extra operands before the implicit `#[track_caller]` Location; all others take
             // just the Location (supplied inside `call_panic_lang_item`).
-            use rustc_hir::lang_items::LangItem;
+            use rustc_hir::attrs::lang_items::LangItem;
             let (lang_item, extra_args): (LangItem, Vec<Interned<CILNode>>) = match msg.as_ref() {
                 AssertKind::BoundsCheck { len, index } => {
                     // `fn panic_bounds_check(index: usize, len: usize)`
@@ -1462,7 +1517,7 @@ pub fn handle_terminator<'tcx>(
             };
 
             let drop_instance = Instance::resolve_drop_glue(ctx.tcx(), ty);
-            if let InstanceKind::DropGlue(_, None) = drop_instance.def {
+            if drop_glue_is_noop(drop_instance, ctx.tcx()) {
                 //Empty drop, nothing needs to happen.
                 vec![goto(ctx, target.as_u32())]
             } else {
@@ -1649,8 +1704,6 @@ fn handle_switch<'tcx>(
         }
     }
     for (value, target) in switch.iter() {
-        //ops.extend(CILOp::debug_msg("Switchin"));
-
         let const_val = match ty.kind() {
             TyKind::Int(int) => load_const_int(value, *int, ctx),
             TyKind::Uint(uint) => load_const_uint(value, *uint, ctx),
@@ -1658,7 +1711,6 @@ fn handle_switch<'tcx>(
             TyKind::Char => load_const_uint(value, rustc_middle::ty::UintTy::U32, ctx),
             _ => todo!("Unsuported switch discriminant type {ty:?}"),
         };
-        //ops.push(CILOp::LdcI64(value as i64));
         let cond = crate::binop::cmp::eq_unchecked(ty, discr, const_val, ctx);
         trees.push(ctx.alloc_root(CILRoot::Branch(Box::new((
             target.into(),

@@ -1,5 +1,5 @@
 use super::{
-    Access, CILNode, CILRoot, ClassDef, ClassRef, Const, Exporter, FieldDesc, FnSig, Int,
+    Access, CILNode, CILRoot, ClassDef, ClassRef, Const, Exporter, FieldDesc, Float, FnSig, Int,
     IntoAsmIndex, MethodDef, MethodDefIdx, MethodRef, StaticFieldDesc, Type,
     bimap::{BiMap, BiMapIndex, Interned, IntoBiMapIndex},
     cilnode::{BinOp, ExtendKind, IsPure, MethodKind, PtrCastRes, UnOp},
@@ -219,7 +219,19 @@ impl PanicKind {
             | Self::PanicStr2015
             | Self::ConstPanicFormat
             | Self::CannotUnwind
-            | Self::InCleanup => ClassRef::invalid_operation_exception(asm),
+            | Self::InCleanup
+            | Self::CoroutineResumed
+            | Self::AsyncFnResumed
+            | Self::AsyncGenFnResumed
+            | Self::GenFnNone
+            | Self::CoroutineResumedAfterPanic
+            | Self::AsyncFnResumedAfterPanic
+            | Self::AsyncGenFnResumedAfterPanic
+            | Self::GenFnNoneAfterPanic
+            | Self::CoroutineResumedAfterDrop
+            | Self::AsyncFnResumedAfterDrop
+            | Self::AsyncGenFnResumedAfterDrop
+            | Self::GenFnNoneAfterDrop => ClassRef::invalid_operation_exception(asm),
             Self::BoundsCheck => ClassRef::index_out_of_range_exception(asm),
             Self::MisalignedPointerDereference => ClassRef::data_misaligned_exception(asm),
             Self::NullPointerDereference => ClassRef::null_reference_exception(asm),
@@ -233,18 +245,6 @@ impl PanicKind {
             | Self::ShrOverflow
             | Self::ShlOverflow => ClassRef::overflow_exception(asm),
             Self::DivByZero | Self::RemByZero => ClassRef::divide_by_zero_exception(asm),
-            Self::CoroutineResumed
-            | Self::AsyncFnResumed
-            | Self::AsyncGenFnResumed
-            | Self::GenFnNone
-            | Self::CoroutineResumedAfterPanic
-            | Self::AsyncFnResumedAfterPanic
-            | Self::AsyncGenFnResumedAfterPanic
-            | Self::GenFnNoneAfterPanic
-            | Self::CoroutineResumedAfterDrop
-            | Self::AsyncFnResumedAfterDrop
-            | Self::AsyncGenFnResumedAfterDrop
-            | Self::GenFnNoneAfterDrop => ClassRef::invalid_operation_exception(asm),
         }
     }
 
@@ -978,83 +978,29 @@ impl ExportReadyAssembly {
     }
 }
 
-impl Index<Interned<IString>> for Assembly {
-    type Output = str;
+macro_rules! impl_assembly_index {
+    ($key:ty, $value:ty, $field:ident, $index:ident $(, $prefix:tt)*) => {
+        impl Index<$key> for Assembly {
+            type Output = $value;
 
-    fn index(&self, index: Interned<IString>) -> &Self::Output {
-        &self.strings[index]
-    }
+            fn index(&self, $index: $key) -> &Self::Output {
+                &self.$field[$($prefix)* $index]
+            }
+        }
+    };
 }
-impl Index<ClassDefIdx> for Assembly {
-    type Output = ClassDef;
 
-    fn index(&self, index: ClassDefIdx) -> &Self::Output {
-        &self.class_defs[&index]
-    }
-}
-impl Index<Interned<MethodRef>> for Assembly {
-    type Output = MethodRef;
-
-    fn index(&self, index: Interned<MethodRef>) -> &Self::Output {
-        &self.method_refs[index]
-    }
-}
-impl Index<MethodDefIdx> for Assembly {
-    type Output = MethodDef;
-
-    fn index(&self, index: MethodDefIdx) -> &Self::Output {
-        &self.method_defs[&index]
-    }
-}
-impl Index<Interned<ClassRef>> for Assembly {
-    type Output = ClassRef;
-
-    fn index(&self, index: Interned<ClassRef>) -> &Self::Output {
-        &self.class_refs[index]
-    }
-}
-impl Index<Interned<Type>> for Assembly {
-    type Output = Type;
-
-    fn index(&self, index: Interned<Type>) -> &Self::Output {
-        &self.types[index]
-    }
-}
-impl Index<Interned<FnSig>> for Assembly {
-    type Output = FnSig;
-
-    fn index(&self, index: Interned<FnSig>) -> &Self::Output {
-        &self.sigs[index]
-    }
-}
-impl Index<Interned<CILRoot>> for Assembly {
-    type Output = CILRoot;
-
-    fn index(&self, index: Interned<CILRoot>) -> &Self::Output {
-        &self.roots[index]
-    }
-}
-impl Index<Interned<CILNode>> for Assembly {
-    type Output = CILNode;
-
-    fn index(&self, index: Interned<CILNode>) -> &Self::Output {
-        &self.nodes[index]
-    }
-}
-impl Index<Interned<StaticFieldDesc>> for Assembly {
-    type Output = StaticFieldDesc;
-
-    fn index(&self, index: Interned<StaticFieldDesc>) -> &Self::Output {
-        &self.statics[index]
-    }
-}
-impl Index<Interned<FieldDesc>> for Assembly {
-    type Output = FieldDesc;
-
-    fn index(&self, index: Interned<FieldDesc>) -> &Self::Output {
-        &self.fields[index]
-    }
-}
+impl_assembly_index!(Interned<IString>, str, strings, index);
+impl_assembly_index!(ClassDefIdx, ClassDef, class_defs, index, &);
+impl_assembly_index!(Interned<MethodRef>, MethodRef, method_refs, index);
+impl_assembly_index!(MethodDefIdx, MethodDef, method_defs, index, &);
+impl_assembly_index!(Interned<ClassRef>, ClassRef, class_refs, index);
+impl_assembly_index!(Interned<Type>, Type, types, index);
+impl_assembly_index!(Interned<FnSig>, FnSig, sigs, index);
+impl_assembly_index!(Interned<CILRoot>, CILRoot, roots, index);
+impl_assembly_index!(Interned<CILNode>, CILNode, nodes, index);
+impl_assembly_index!(Interned<StaticFieldDesc>, StaticFieldDesc, statics, index);
+impl_assembly_index!(Interned<FieldDesc>, FieldDesc, fields, index);
 impl Assembly {
     /// Records a crate-level native import, rejecting contradictory declarations for one symbol.
     pub fn add_native_import(&mut self, import: NativeImport) {
@@ -1123,6 +1069,26 @@ impl Assembly {
     ) -> Interned<CILNode> {
         let addr = addr.into_idx(self);
         let tpe = tpe.into_idx(self);
+        // `ldind.r4`/`ldind.r8` may canonicalize a signaling NaN while loading it from an
+        // allocation. Rust's float `from_bits`/`to_bits` contract is bit-preserving, so read the
+        // storage through an integer lane and use the same BCL bit-converter path as scalar
+        // constants and explicit transmutes.
+        if let Type::Float(float) = self[tpe]
+            && let Some(int) = match float {
+                Float::F32 => Some(Int::U32),
+                Float::F64 => Some(Int::U64),
+                Float::F16 | Float::F128 => None,
+            }
+        {
+            let integer_addr = self.cast_ptr(addr, Type::Int(int));
+            let integer_type = self.alloc_type(Type::Int(int));
+            let integer = self.alloc_node(CILNode::LdInd {
+                addr: integer_addr,
+                tpe: integer_type,
+                volatile: false,
+            });
+            return self.transmute_on_stack(Type::Int(int), Type::Float(float), integer);
+        }
         self.alloc_node(CILNode::LdInd {
             addr,
             tpe,
@@ -1296,7 +1262,7 @@ impl Assembly {
         let total = self
             .method_defs
             .values()
-            .map(|method| Self::method_optimization_weight(method))
+            .map(Self::method_optimization_weight)
             .sum::<u64>();
         OptFuel::new(u32::try_from(total).unwrap_or(u32::MAX))
     }
@@ -1551,25 +1517,123 @@ impl Assembly {
 
     /// Optimizes every method with a deterministic, preallocated share of `fuel`.
     pub fn opt(&mut self, fuel: &mut OptFuel) {
-        // The CIL optimizer is purely local/intra-method (copy-prop, DCE, peepholes, block
-        // linearization). It does NOT inline calls — Rust's zero-cost abstractions are inlined at the
-        // MIR level by rustc's own inliner (the backend raises `-Zinline-mir-hint-threshold`), which
-        // is correct by construction and runs before codegen. So a fixpoint of local passes suffices;
-        // no soundness snapshot/revert is needed.
+        // Most CIL optimization is local/intra-method (copy-prop, DCE, peepholes, block
+        // linearization). Rust's general zero-cost abstractions are inlined at the MIR level by
+        // rustc's own inliner (the backend raises `-Zinline-mir-hint-threshold`). After local
+        // fixpoints, one deliberately narrow assembly phase summarizes same-class static constant
+        // returns; it is not a general-purpose CIL inliner.
         let initial_fuel = fuel.raw();
         let schedule = self.optimizer_method_schedule();
+        // The linker deliberately invokes this optimizer with a fraction of the default assembly
+        // fuel. If local passes are allowed to claim that entire fraction, large linked assemblies
+        // can leave no fuel for a constant-return callee that only becomes visible after all CGUs
+        // are merged. Reserve one quarter of the caller-supplied budget for that bounded second
+        // phase. Unused local fuel joins the reserve, and both phases together still consume at
+        // most `initial_fuel`.
+        let constant_phase_reserve = initial_fuel / 4 + u32::from(!initial_fuel.is_multiple_of(4));
+        let local_phase_fuel = initial_fuel - constant_phase_reserve;
         let mut consumed = 0_u32;
-        for (method, budget) in Self::optimizer_method_budgets_for_schedule(&schedule, initial_fuel)
+
+        // Fold definitions that are already constant before the local pass. This is the important
+        // linked-assembly path: cross-CGU callees are present now, and exposing their constant
+        // result first lets the ordinary local budget erase any newly empty branch or counted
+        // loop. Only actual rewrites consume the reserved budget; unused units remain available to
+        // the post-fixpoint phase below.
+        let initial_constant_returns = crate::ir::opt::constant_return_map(self);
+        let initial_constant_call_schedule: Vec<_> = schedule
+            .iter()
+            .copied()
+            .filter(|(method, _)| {
+                crate::ir::opt::has_foldable_constant_call(
+                    &self.method_defs[method],
+                    &initial_constant_returns,
+                    self,
+                )
+            })
+            .collect();
+        for (method, budget) in Self::optimizer_method_budgets_for_schedule(
+            &initial_constant_call_schedule,
+            constant_phase_reserve,
+        ) {
+            let mut method_fuel = OptFuel::new(budget);
+            let mut tmp_method = self.borrow_methoddef(method);
+            crate::ir::opt::fold_constant_calls(
+                &mut tmp_method,
+                &initial_constant_returns,
+                self,
+                &mut method_fuel,
+            );
+            consumed = consumed
+                .checked_add(budget - method_fuel.raw())
+                .expect("optimizer fuel consumption overflow");
+            self.return_methoddef(method, tmp_method);
+        }
+
+        for (method, budget) in
+            Self::optimizer_method_budgets_for_schedule(&schedule, local_phase_fuel)
         {
             let mut method_fuel = OptFuel::new(budget);
             let mut cache = EffectInfoCache::default();
             let mut tmp_method = self.borrow_methoddef(method);
             while !method_fuel.exchausted() {
-                let prev = method_fuel.clone();
+                let previous_fuel = method_fuel.clone();
+                // The method shell is cheap to clone because CIL trees are interned. Fuel is only
+                // an admission budget, not a progress signal: several passes intentionally charge
+                // a fixed inspection cost even when they make no rewrite. Compare semantic method
+                // state as well so a settled method does not drain its entire budget by repeating
+                // identical whole-tree scans.
+                let previous_method = tmp_method.clone();
                 tmp_method.optimize(self, &mut cache, &mut method_fuel);
                 tmp_method.remove_dead_blocks(self);
-                if method_fuel == prev {
+                if method_fuel == previous_fuel || tmp_method == previous_method {
                     break;
+                }
+            }
+            consumed = consumed
+                .checked_add(budget - method_fuel.raw())
+                .expect("optimizer fuel consumption overflow");
+            self.return_methoddef(method, tmp_method);
+        }
+
+        // All definitions are now at their local fixpoints, so trivial same-class constant-return
+        // callees can be summarized independently of semantic method order. Run only callers that
+        // actually reference one of those definitions, then re-settle those changed methods. This
+        // is deliberately a narrow second phase rather than another assembly-wide optimizer round:
+        // it preserves argument evaluation and avoids doubling cold build-std scan cost.
+        let remaining_fuel = initial_fuel - consumed;
+        let constant_returns = crate::ir::opt::constant_return_map(self);
+        let constant_call_schedule: Vec<_> = schedule
+            .iter()
+            .copied()
+            .filter(|(method, _)| {
+                crate::ir::opt::has_foldable_constant_call(
+                    &self.method_defs[method],
+                    &constant_returns,
+                    self,
+                )
+            })
+            .collect();
+        for (method, budget) in
+            Self::optimizer_method_budgets_for_schedule(&constant_call_schedule, remaining_fuel)
+        {
+            let mut method_fuel = OptFuel::new(budget);
+            let mut tmp_method = self.borrow_methoddef(method);
+            let changed = crate::ir::opt::fold_constant_calls(
+                &mut tmp_method,
+                &constant_returns,
+                self,
+                &mut method_fuel,
+            );
+            if changed {
+                let mut cache = EffectInfoCache::default();
+                while !method_fuel.exchausted() {
+                    let previous_fuel = method_fuel.clone();
+                    let previous_method = tmp_method.clone();
+                    tmp_method.optimize(self, &mut cache, &mut method_fuel);
+                    tmp_method.remove_dead_blocks(self);
+                    if method_fuel == previous_fuel || tmp_method == previous_method {
+                        break;
+                    }
                 }
             }
             consumed = consumed
@@ -1579,11 +1643,12 @@ impl Assembly {
         }
         *fuel = OptFuel::from_raw(initial_fuel - consumed);
 
-        // Optimization may exhaust the shared fuel immediately after a pass changes or removes
-        // locals. Always finish at the same canonical local-slot boundary: otherwise two
-        // semantically identical assemblies can retain different MIR/intern insertion histories in
-        // their `.locals` order, which changes StandAloneSig rows and every subsequent method-body
-        // token in direct-PE output.
+        // Local-slot compaction is a canonicalization boundary, not a fixpoint pass: no optimizer
+        // consumes the numeric slot order. Running it from `MethodDef::optimize` rebuilt every CIL
+        // tree once per fuel iteration (and then rebuilt it here again), which dominated cold
+        // build-std codegen for large crates. Do it exactly once after the local passes settle.
+        // This also guarantees that fuel exhaustion immediately after a pass changes or removes a
+        // local cannot retain MIR/intern insertion history in the `.locals` StandAloneSig.
         for (method, _) in schedule {
             let mut tmp_method = self.borrow_methoddef(method);
             tmp_method.implementation_mut().realloc_locals(self);
@@ -1601,6 +1666,9 @@ impl Assembly {
             let mut tmp_method = self.borrow_methoddef(method);
             tmp_method.optimize(self, cache, &mut method_fuel);
             tmp_method.remove_dead_blocks(self);
+            // Unlike `opt`, this API has no assembly-wide finalization loop. Preserve its historical
+            // one-pass contract while still keeping local renumbering out of the method fixpoint.
+            tmp_method.implementation_mut().realloc_locals(self);
             self.return_methoddef(method, tmp_method);
             consumed = consumed
                 .checked_add(budget - method_fuel.raw())
@@ -1943,11 +2011,15 @@ impl Assembly {
 
         let sig = self.sig([], Type::Void);
         let tpe = self[node].clone().typecheck(sig, &[], self).unwrap();
-        let name = format!(
-            "n_{}_{}",
-            encode(node.as_bimap_index().get() as u64),
-            encode(self.alloc_type(tpe).as_bimap_index().get() as u64)
-        );
+        // Every rustc mono-item is first lowered into its own Assembly shard. Arena indices start
+        // from zero in each shard, so the old `n_{node-index}_{type-index}` name silently gave
+        // unrelated anonymous constants the same program-wide static identity. Same-typed cases
+        // were especially dangerous: shard linking deduplicated the fields and every `.cctor`
+        // overwrote the same cell, leaving all byte literals/slice promotions pointing at whichever
+        // initializer ran last. Canonical relocation removes shard-local interned ids; hash that
+        // complete value graph plus its physical type so equal values may share, while different
+        // values can never alias merely because they occupied the same local arena slots.
+        let name = self.anonymous_const_name(node, tpe);
         let name_idx = self.alloc_string(name.clone());
         let field = StaticFieldDesc::new(*main_module, name_idx, tpe);
         let field = self.alloc_sfld(field);
@@ -1958,7 +2030,19 @@ impl Assembly {
         let init = self.alloc_root(CILRoot::SetStaticField { field, val: node });
         self.add_cctor(&[init]);
 
-        return field;
+        field
+    }
+
+    fn anonymous_const_name(&self, node: Interned<CILNode>, tpe: Type) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut canonical = Assembly::default();
+        let mut relocation = super::asm_link::RelocateCtx::new(self);
+        let canonical_node = relocation.node(&mut canonical, node);
+        let mut material = postcard::to_stdvec(&(canonical, canonical_node))
+            .expect("canonical anonymous-constant graph must serialize");
+        material.extend_from_slice(&self.type_semantic_key(tpe));
+        format!("n_{:x}", Sha256::digest(material))
     }
     /// Adds a new class definition to this type
     pub fn class_def(&mut self, def: ClassDef) -> Result<ClassDefIdx, LayoutError> {
@@ -2269,12 +2353,11 @@ impl Assembly {
             encoded_stats(&self.nodes),
             encoded_stats(&self.roots),
             encoded_stats(&self.sigs),
-            encoded_stats(&self.types),
             encoded_stats(&self.fields),
             encoded_stats(&self.statics),
             encoded_stats(&self.method_defs),
         ];
-        stats.sort_by(|(_, a), (_, b)| a.cmp(b));
+        stats.sort_by_key(|(_, a)| *a);
         for stat in stats {
             println!("{}:\t{} bytes", stat.0, stat.1);
         }
@@ -2416,24 +2499,17 @@ impl Assembly {
                 };
                 // Get all the ref ids of the methods used in the cil.
                 let refids = cil.filter_map(|elem| match elem {
-                    crate::CILIterElem::Node(CILNode::Call(args)) => Some(args.0),
+                    crate::CILIterElem::Node(CILNode::Call(args))
+                    | crate::CILIterElem::Root(CILRoot::Call(args)) => Some(args.0),
                     crate::CILIterElem::Node(CILNode::LdFtn(mref)) => Some(mref),
-                    crate::CILIterElem::Node(_) => None,
-                    crate::CILIterElem::Root(CILRoot::Call(args)) => Some(args.0),
-                    crate::CILIterElem::Root(_) => None,
+                    crate::CILIterElem::Node(_) | crate::CILIterElem::Root(_) => None,
                 });
                 // Check if this method reference is also a def. If so, map it to a def
                 let defids = refids.filter_map(|refid| {
                     self.method_defs
                         .get(&MethodDefIdx::from_raw(refid))
                         .map(|_| MethodDefIdx::from_raw(refid))
-                        .and_then(|refid| {
-                            if alive.contains(&refid) {
-                                None
-                            } else {
-                                Some(refid)
-                            }
-                        })
+                        .filter(|&refid| !alive.contains(&refid))
                 });
                 next_wave.extend(defids);
             }
@@ -2492,7 +2568,7 @@ impl Assembly {
             let class = self.class_defs.get(&method.class())?;
             let is_main_module = &self[class.name()] == MAIN_MODULE;
             let name = &self[method.name()];
-            (is_main_module && matches!(name.as_ref(), CCTOR | TCCTOR | USER_INIT)).then_some(*id)
+            (is_main_module && matches!(name, CCTOR | TCCTOR | USER_INIT)).then_some(*id)
         }));
         // Comptime-authored CLR types use local `Extern` ClassDefs to distinguish intentional
         // managed API from ordinary compiler-generated Rust layout classes. Their externally
@@ -2574,22 +2650,16 @@ impl Assembly {
         let high_value = self.alloc_node(CILNode::LdArg(2));
         let set_high = self.alloc_root(CILRoot::SetField(Box::new((high_field, this, high_value))));
         let ret = self.alloc_root(CILRoot::VoidRet);
-        self.new_method(MethodDef::new(
+        self.add_single_block_method(
             Access::Assembly,
             class,
             ctor_name,
             ctor_sig,
             MethodKind::Constructor,
-            MethodImpl::MethodBody {
-                blocks: vec![super::BasicBlock::new(
-                    vec![set_low, set_high, ret],
-                    0,
-                    None,
-                )],
-                locals: vec![],
-            },
+            vec![set_low, set_high, ret],
+            vec![],
             vec![None, Some(low), Some(high)],
-        ));
+        );
         class
     }
 
@@ -2634,6 +2704,64 @@ impl Assembly {
         self.call(ctor, &[low, high], IsPure::NOT)
     }
 
+    fn add_single_block_method(
+        &mut self,
+        access: Access,
+        class: ClassDefIdx,
+        name: Interned<IString>,
+        sig: Interned<FnSig>,
+        kind: MethodKind,
+        roots: Vec<Interned<CILRoot>>,
+        locals: Vec<(Option<Interned<IString>>, Interned<Type>)>,
+        arg_names: Vec<Option<Interned<IString>>>,
+    ) {
+        self.new_method(MethodDef::new(
+            access,
+            class,
+            name,
+            sig,
+            kind,
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(roots, 0, None)],
+                locals,
+            },
+            arg_names,
+        ));
+    }
+
+    fn install_unity_128_equality(
+        &mut self,
+        class: ClassDefIdx,
+        low_field: Interned<FieldDesc>,
+        high_field: Interned<FieldDesc>,
+    ) {
+        let class_type = Type::ClassRef(class.0);
+        let a = self.alloc_node(CILNode::LdArg(0));
+        let a_low = self.ld_field(a, low_field);
+        let b = self.alloc_node(CILNode::LdArg(1));
+        let b_low = self.ld_field(b, low_field);
+        let low_eq = self.biop(a_low, b_low, BinOp::Eq);
+        let a = self.alloc_node(CILNode::LdArg(0));
+        let a_high = self.ld_field(a, high_field);
+        let b = self.alloc_node(CILNode::LdArg(1));
+        let b_high = self.ld_field(b, high_field);
+        let high_eq = self.biop(a_high, b_high, BinOp::Eq);
+        let result = self.biop(low_eq, high_eq, BinOp::And);
+        let ret = self.alloc_root(CILRoot::Ret(result));
+        let name = self.alloc_string("op_Equality");
+        let sig = self.sig([class_type, class_type], Type::Bool);
+        self.add_single_block_method(
+            Access::Assembly,
+            class,
+            name,
+            sig,
+            MethodKind::Static,
+            vec![ret],
+            vec![],
+            vec![None, None],
+        );
+    }
+
     fn install_unity_uint128_methods(&mut self, class: ClassDefIdx) {
         let class_type = Type::ClassRef(class.0);
         let zero = self.alloc_node(Const::U64(0));
@@ -2648,47 +2776,20 @@ impl Assembly {
             let ret = self.alloc_root(CILRoot::Ret(result));
             let name = self.alloc_string("op_Implicit");
             let sig = self.sig([Type::Int(input)], class_type);
-            self.new_method(MethodDef::new(
+            self.add_single_block_method(
                 Access::Assembly,
                 class,
                 name,
                 sig,
                 MethodKind::Static,
-                MethodImpl::MethodBody {
-                    blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
-                    locals: vec![],
-                },
+                vec![ret],
+                vec![],
                 vec![None],
-            ));
+            );
         }
 
         let (low_field, high_field) = self.unity_128_fields(class);
-        let equality = self.alloc_string("op_Equality");
-        let sig = self.sig([class_type, class_type], Type::Bool);
-        let a = self.alloc_node(CILNode::LdArg(0));
-        let a_low = self.ld_field(a, low_field);
-        let b = self.alloc_node(CILNode::LdArg(1));
-        let b_low = self.ld_field(b, low_field);
-        let low_eq = self.biop(a_low, b_low, BinOp::Eq);
-        let a = self.alloc_node(CILNode::LdArg(0));
-        let a_high = self.ld_field(a, high_field);
-        let b = self.alloc_node(CILNode::LdArg(1));
-        let b_high = self.ld_field(b, high_field);
-        let high_eq = self.biop(a_high, b_high, BinOp::Eq);
-        let equal = self.biop(low_eq, high_eq, BinOp::And);
-        let ret = self.alloc_root(CILRoot::Ret(equal));
-        self.new_method(MethodDef::new(
-            Access::Assembly,
-            class,
-            equality,
-            sig,
-            MethodKind::Static,
-            MethodImpl::MethodBody {
-                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
-                locals: vec![],
-            },
-            vec![None, None],
-        ));
+        self.install_unity_128_equality(class, low_field, high_field);
 
         let greater = self.alloc_string("op_GreaterThan");
         let sig = self.sig([class_type, class_type], Type::Bool);
@@ -2710,18 +2811,16 @@ impl Assembly {
         let same_high_low_gt = self.biop(high_eq, low_gt, BinOp::And);
         let result = self.biop(high_gt, same_high_low_gt, BinOp::Or);
         let ret = self.alloc_root(CILRoot::Ret(result));
-        self.new_method(MethodDef::new(
+        self.add_single_block_method(
             Access::Assembly,
             class,
             greater,
             sig,
             MethodKind::Static,
-            MethodImpl::MethodBody {
-                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
-                locals: vec![],
-            },
+            vec![ret],
+            vec![],
             vec![None, None],
-        ));
+        );
 
         self.install_unity_uint128_multiply(class, low_field, high_field);
     }
@@ -2773,18 +2872,16 @@ impl Assembly {
         let ret = self.alloc_root(CILRoot::Ret(result));
         let name = self.alloc_string("op_Multiply");
         let sig = self.sig([class_type, class_type], class_type);
-        self.new_method(MethodDef::new(
+        self.add_single_block_method(
             Access::Assembly,
             class,
             name,
             sig,
             MethodKind::Static,
-            MethodImpl::MethodBody {
-                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
-                locals: vec![],
-            },
+            vec![ret],
+            vec![],
             vec![None, None],
-        ));
+        );
     }
 
     fn install_unity_int128_methods(&mut self, class: ClassDefIdx) {
@@ -2799,46 +2896,19 @@ impl Assembly {
         let ret = self.alloc_root(CILRoot::Ret(result));
         let name = self.alloc_string("op_Implicit");
         let sig = self.sig([Type::Int(Int::I32)], class_type);
-        self.new_method(MethodDef::new(
+        self.add_single_block_method(
             Access::Assembly,
             class,
             name,
             sig,
             MethodKind::Static,
-            MethodImpl::MethodBody {
-                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
-                locals: vec![],
-            },
+            vec![ret],
+            vec![],
             vec![None],
-        ));
+        );
 
         let (low_field, high_field) = self.unity_128_fields(class);
-        let a = self.alloc_node(CILNode::LdArg(0));
-        let a_low = self.ld_field(a, low_field);
-        let b = self.alloc_node(CILNode::LdArg(1));
-        let b_low = self.ld_field(b, low_field);
-        let low_eq = self.biop(a_low, b_low, BinOp::Eq);
-        let a = self.alloc_node(CILNode::LdArg(0));
-        let a_high = self.ld_field(a, high_field);
-        let b = self.alloc_node(CILNode::LdArg(1));
-        let b_high = self.ld_field(b, high_field);
-        let high_eq = self.biop(a_high, b_high, BinOp::Eq);
-        let result = self.biop(low_eq, high_eq, BinOp::And);
-        let ret = self.alloc_root(CILRoot::Ret(result));
-        let name = self.alloc_string("op_Equality");
-        let sig = self.sig([class_type, class_type], Type::Bool);
-        self.new_method(MethodDef::new(
-            Access::Assembly,
-            class,
-            name,
-            sig,
-            MethodKind::Static,
-            MethodImpl::MethodBody {
-                blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
-                locals: vec![],
-            },
-            vec![None, None],
-        ));
+        self.install_unity_128_equality(class, low_field, high_field);
     }
     #[cfg(test)]
     pub(crate) fn eliminate_dead_types(&mut self) {
@@ -2890,9 +2960,6 @@ impl Assembly {
             .map(|id| (*id, self.class_defs.remove(id).unwrap()))
             .collect();
     }
-    /*pub fn realloc_nodes(&mut self){
-
-    }*/
     /// Reallocates the roots, freeing all dead ones.
     pub fn realloc_roots(&mut self) {
         self.link_preflight_index = None;
@@ -2923,6 +2990,27 @@ impl Assembly {
             }
         }
         self.roots = new_roots;
+    }
+
+    fn add_public_body(
+        &mut self,
+        owner: ClassDefIdx,
+        mref: &MethodRef,
+        roots: Vec<Interned<CILRoot>>,
+    ) {
+        let arg_names = (0..self[mref.sig()].inputs().len()).map(|_| None).collect();
+        self.new_method(MethodDef::new(
+            Access::Public,
+            owner,
+            mref.name(),
+            mref.sig(),
+            mref.kind(),
+            MethodImpl::MethodBody {
+                blocks: vec![super::BasicBlock::new(roots, 0, None)],
+                locals: vec![],
+            },
+            arg_names,
+        ));
     }
 
     /// Resolves every in-assembly [`MethodRef`] that has no definition, including references
@@ -3077,13 +3165,89 @@ impl Assembly {
             let owner = ClassDefIdx(mref.class());
             let owner_name = self.class_ref(mref.class()).display(self);
             let member_name = self[mref.name()].to_string();
-            let Some(class_def) = self.class_defs.get(&owner) else {
+            // A MemberRef on a closed instantiation of a generic type defined in this assembly
+            // names a TypeSpec (`IBox<int>`), not the open TypeDef (`IBox`1`). Resolve that one
+            // shape back to the registered open definition so the fail-closed interface-member
+            // check below can validate the call instead of treating the TypeSpec as a missing
+            // class. External owners and non-generic local references retain their old behavior.
+            let open_generic_owner = if self.class_defs.contains_key(&owner) {
+                None
+            } else {
+                let class_ref = self.class_ref(mref.class()).clone();
+                if class_ref.asm().is_some() || class_ref.generics().is_empty() {
+                    None
+                } else {
+                    let arity = class_ref.generics().len();
+                    let raw_name = self[class_ref.name()].to_string();
+                    let mut candidates = vec![raw_name.clone()];
+                    if !raw_name.contains('`') {
+                        candidates.push(format!("{raw_name}`{arity}"));
+                    }
+                    candidates.into_iter().find_map(|candidate| {
+                        let name = self.alloc_string(candidate);
+                        let open = ClassRef::new(name, None, class_ref.is_valuetype(), [].into());
+                        let open = self.alloc_class_ref(open);
+                        self.class_ref_to_def(open).filter(|definition| {
+                            let definition = &self[*definition];
+                            definition.is_interface() && definition.generics() as usize == arity
+                        })
+                    })
+                }
+            };
+            let resolved_owner = open_generic_owner.unwrap_or(owner);
+            let Some(class_def) = self.class_defs.get(&resolved_owner) else {
                 return Err(MissingMethodResolutionError::MissingOwner {
                     owner: owner_name,
                     member: member_name,
                 });
             };
             if class_def.is_interface() {
+                if open_generic_owner.is_some()
+                    && class_def.methods().iter().any(|definition| {
+                        let declared = &self[**definition];
+                        let declared_sig = &self[declared.sig()];
+                        let call_sig = &self[mref.sig()];
+                        let receiver_matches =
+                            match (declared_sig.inputs().first(), call_sig.inputs().first()) {
+                                (
+                                    Some(Type::ClassRef(declared_receiver)),
+                                    Some(Type::ClassRef(call_receiver)),
+                                ) if *call_receiver == mref.class() => {
+                                    let declared_receiver = self.class_ref(*declared_receiver);
+                                    let open_owner = self.class_ref(*resolved_owner);
+                                    declared_receiver.name() == open_owner.name()
+                                        && declared_receiver.asm() == open_owner.asm()
+                                        && declared_receiver.is_valuetype()
+                                            == open_owner.is_valuetype()
+                                        && (declared_receiver.generics().is_empty()
+                                            || declared_receiver.generics().iter().enumerate().all(
+                                                |(index, generic)| {
+                                                    *generic
+                                                        == Type::PlatformGeneric(
+                                                            index as u32,
+                                                            super::tpe::GenericKind::TypeGeneric,
+                                                        )
+                                                },
+                                            ))
+                                        && (declared_receiver.generics().is_empty()
+                                            || declared_receiver.generics().len()
+                                                == self.class_ref(*call_receiver).generics().len())
+                                }
+                                _ => false,
+                            };
+                        declared.name() == mref.name()
+                            && declared.kind() == mref.kind()
+                            && declared.generics() == mref.generics()
+                            && receiver_matches
+                            && declared_sig.output() == call_sig.output()
+                            && declared_sig.inputs().get(1..) == call_sig.inputs().get(1..)
+                    })
+                {
+                    // The open interface owns the abstract declaration; this closed MemberRef is
+                    // intentionally emitted against its TypeSpec and needs no synthetic MethodDef.
+                    stats.record(MethodResolution::AlreadyDefined);
+                    continue;
+                }
                 return Err(MissingMethodResolutionError::InterfaceMemberMismatch {
                     interface: owner_name,
                     member: member_name,
@@ -3214,20 +3378,8 @@ impl Assembly {
             }
 
             if service == Some(RuntimeService::NoAllocShim) {
-                let arg_names = (0..self[mref.sig()].inputs().len()).map(|_| None).collect();
                 let ret = self.alloc_root(CILRoot::VoidRet);
-                self.new_method(MethodDef::new(
-                    Access::Public,
-                    owner,
-                    mref.name(),
-                    mref.sig(),
-                    mref.kind(),
-                    MethodImpl::MethodBody {
-                        blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
-                        locals: vec![],
-                    },
-                    arg_names,
-                ));
+                self.add_public_body(owner, &mref, vec![ret]);
                 stats.record(MethodResolution::Resolved {
                     capability: RuntimeCapability::BuiltinNoOp,
                     service,
@@ -3248,7 +3400,6 @@ impl Assembly {
                 // exception is therefore the safe fallback: it preserves never-returning control
                 // flow and is deliberately rethrown by Rust catch_unwind, which accepts only a
                 // genuine RustException. `interop_try_catch` remains the catch-all managed bridge.
-                let arg_names = (0..self[mref.sig()].inputs().len()).map(|_| None).collect();
                 let exception_class = kind.managed_exception(self);
                 let throw = self.throw_exception_msg(exception_class, kind.message());
                 let mut roots = Vec::with_capacity(usize::from(kind.is_nounwind()) + 1);
@@ -3259,18 +3410,7 @@ impl Assembly {
                 // nounwind bodies structurally terminal if FailFast were ever to return, while
                 // the actual nounwind path remains uncatchable.
                 roots.push(throw);
-                self.new_method(MethodDef::new(
-                    Access::Public,
-                    owner,
-                    mref.name(),
-                    mref.sig(),
-                    mref.kind(),
-                    MethodImpl::MethodBody {
-                        blocks: vec![super::BasicBlock::new(roots, 0, None)],
-                        locals: vec![],
-                    },
-                    arg_names,
-                ));
+                self.add_public_body(owner, &mref, roots);
                 stats.record(MethodResolution::Resolved {
                     capability: RuntimeCapability::BuiltinPanic,
                     service,
@@ -3287,20 +3427,8 @@ impl Assembly {
                 // return. Inputs for which the original helper would fail already violate an
                 // unsafe Rust precondition and have undefined behavior. Product `-Zbuild-std`
                 // builds retain the real definition through `AlreadyDefined` above.
-                let arg_names = (0..self[mref.sig()].inputs().len()).map(|_| None).collect();
                 let ret = self.alloc_root(CILRoot::VoidRet);
-                self.new_method(MethodDef::new(
-                    Access::Public,
-                    owner,
-                    mref.name(),
-                    mref.sig(),
-                    mref.kind(),
-                    MethodImpl::MethodBody {
-                        blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
-                        locals: vec![],
-                    },
-                    arg_names,
-                ));
+                self.add_public_body(owner, &mref, vec![ret]);
                 stats.record(MethodResolution::Resolved {
                     capability: RuntimeCapability::BuiltinCoreUbPrecondition,
                     service,
@@ -3570,7 +3698,7 @@ impl Assembly {
                 method.class() == main_module
                     && *method.access() == Access::Extern
                     && !matches!(method.implementation(), MethodImpl::Extern { .. })
-                    && !matches!(name.as_ref(), CCTOR | TCCTOR | USER_INIT)
+                    && !matches!(name, CCTOR | TCCTOR | USER_INIT)
             })
             .map(|(id, method)| (*id, method.clone()))
             .collect();
@@ -3767,8 +3895,14 @@ impl Assembly {
     }
     pub fn alignof_type(&self, tpe: Interned<Type>) -> u64 {
         match self[tpe] {
-            Type::FnPtr(_) | Type::Ptr(_) | Type::Ref(_) => 8, // ASSUMES alignof<*T>() = 8.
-            Type::Int(int) => int.size().unwrap_or(8) as u64,  // ASSUMES alignof<usize>() = 8.
+            Type::FnPtr(_)
+            | Type::Ptr(_)
+            | Type::Ref(_)
+            | Type::PlatformString
+            | Type::PlatformObject
+            | Type::PlatformArray { .. }
+            | Type::PlatformGeneric(_, _) => 8, // ASSUMES managed references and pointers align to 8.
+            Type::Int(int) => int.size().unwrap_or(8) as u64, // ASSUMES alignof<usize>() = 8.
             Type::ClassRef(class_ref_idx) => match self.class_ref_to_def(class_ref_idx) {
                 Some(def) => self[def]
                     .align()
@@ -3777,9 +3911,7 @@ impl Assembly {
                 None => 8,
             },
             Type::Float(float) => float.size() as u64,
-            Type::PlatformString | Type::PlatformObject | Type::PlatformArray { .. } => 8, // ASSUMES alignof<&managed T>() = 8.
             Type::PlatformChar => 2,
-            Type::PlatformGeneric(_, _) => 8,
             Type::Bool => 1,
             Type::Void => 0,
             Type::SIMDVector(simdvector) => match simdvector.elem() {
@@ -3815,7 +3947,12 @@ impl Assembly {
     }
     pub(crate) fn sizeof_type(&self, field_tpe: Type) -> u32 {
         match field_tpe {
-            Type::Ref(_) | Type::Ptr(_) => self.ptr_size(),
+            Type::Ref(_)
+            | Type::Ptr(_)
+            | Type::PlatformString
+            | Type::PlatformGeneric(_, _)
+            | Type::PlatformObject
+            | Type::FnPtr(_) => self.ptr_size(),
             Type::Int(int) => int
                 .size()
                 .unwrap_or(self.ptr_size().try_into().unwrap())
@@ -3834,18 +3971,9 @@ impl Assembly {
                     |sz| sz.get(),
                 ),
             Type::Float(float) => float.size().into(),
-            Type::PlatformString => self.ptr_size(),
-            Type::PlatformChar => 1,
-            // A generic parameter `!N` / `!!N` (WF-9): only ever appears in a methodref's
-            // definition-shape signature, where it is bound to a concrete type at the call site —
-            // it is never materialized as a sized local. Any incidental sizing pass gets a
-            // conservative pointer-sized answer (a generic slot is reference-or-pointer-sized).
-            Type::PlatformGeneric(_, _) => self.ptr_size(),
-            Type::PlatformObject => self.ptr_size(),
-            Type::Bool => 1,
+            Type::PlatformChar | Type::Bool => 1,
             Type::Void => 0,
             Type::PlatformArray { .. } => todo!(),
-            Type::FnPtr(_) => self.ptr_size(),
             Type::SIMDVector(simdvector) => (simdvector.bits() / 8).into(),
         }
     }
@@ -3903,19 +4031,78 @@ impl Assembly {
         // (iterator adapters, Box deref). Guards (single field / offset 0 / type-equal / size-equal)
         // keep it a true bit-reinterpret; anything else falls through to the general helper below.
         let dst_ty = self[dst];
-        if let Type::ClassRef(cref) = self[src] {
-            if let Some(cdef) = self.class_ref_to_def(cref) {
-                let field = {
-                    let flds = self[cdef].fields();
-                    (flds.len() == 1 && flds[0].0 == dst_ty && matches!(flds[0].2, None | Some(0)))
-                        .then_some((flds[0].0, flds[0].1))
-                };
-                if let Some((ftpe, fname)) = field {
-                    if self.sizeof_type(self[src]) == self.sizeof_type(dst_ty) {
-                        let field = self.alloc_field(FieldDesc::new(cref, fname, ftpe));
-                        return self.alloc_node(CILNode::LdField { addr: val, field });
-                    }
-                }
+        // CLR floating-point loads may quiet a signaling NaN. Rust's `to_bits`/`from_bits`
+        // contract is bit-preserving, including signaling NaN payloads, so route scalar
+        // float/integer reinterprets through the BCL's explicitly bit-preserving helpers rather
+        // than a `ldind.r4`/`ldind.r8` reinterpretation. The signed BCL parameter/result types
+        // are adapted with same-width integer casts; those casts preserve every bit.
+        let bit_converter = match (self[src], dst_ty) {
+            (Type::Int(Int::I32 | Int::U32), Type::Float(super::Float::F32)) => Some((
+                "Int32BitsToSingle",
+                Type::Int(Int::I32),
+                Type::Float(super::Float::F32),
+            )),
+            (Type::Int(Int::I64 | Int::U64), Type::Float(super::Float::F64)) => Some((
+                "Int64BitsToDouble",
+                Type::Int(Int::I64),
+                Type::Float(super::Float::F64),
+            )),
+            (Type::Float(super::Float::F32), Type::Int(Int::I32 | Int::U32)) => Some((
+                "SingleToInt32Bits",
+                Type::Float(super::Float::F32),
+                Type::Int(Int::I32),
+            )),
+            (Type::Float(super::Float::F64), Type::Int(Int::I64 | Int::U64)) => Some((
+                "DoubleToInt64Bits",
+                Type::Float(super::Float::F64),
+                Type::Int(Int::I64),
+            )),
+            _ => None,
+        };
+        if let Some((method_name, argument_type, result_type)) = bit_converter {
+            let class = ClassRef::bit_converter(self);
+            let signature = self.sig([argument_type], result_type);
+            let method =
+                self.new_methodref(class, method_name, signature, MethodKind::Static, vec![]);
+            let argument = if self[src] == argument_type {
+                val
+            } else {
+                self.int_cast(
+                    val,
+                    match argument_type {
+                        Type::Int(int) => int,
+                        _ => unreachable!("bit converter integer argument is not an integer"),
+                    },
+                    ExtendKind::SignExtend,
+                )
+            };
+            let converted = self.call(method, &[argument], IsPure::PURE);
+            return if result_type == dst_ty {
+                converted
+            } else {
+                self.int_cast(
+                    converted,
+                    match dst_ty {
+                        Type::Int(int) => int,
+                        _ => unreachable!("bit converter integer result is not an integer"),
+                    },
+                    ExtendKind::ZeroExtend,
+                )
+            };
+        }
+        if let Type::ClassRef(cref) = self[src]
+            && let Some(cdef) = self.class_ref_to_def(cref)
+        {
+            let field = {
+                let flds = self[cdef].fields();
+                (flds.len() == 1 && flds[0].0 == dst_ty && matches!(flds[0].2, None | Some(0)))
+                    .then_some((flds[0].0, flds[0].1))
+            };
+            if let Some((ftpe, fname)) = field
+                && self.sizeof_type(self[src]) == self.sizeof_type(dst_ty)
+            {
+                let field = self.alloc_field(FieldDesc::new(cref, fname, ftpe));
+                return self.alloc_node(CILNode::LdField { addr: val, field });
             }
         }
         let main_module = *self.main_module();
@@ -3961,7 +4148,10 @@ impl Assembly {
                     extend: ExtendKind::ZeroExtend,
                 })
             }
-            (Type::Int(target @ (Int::ISize | Int::USize)), Type::Int(Int::ISize | Int::USize)) => {
+            (
+                Type::Int(target @ (Int::ISize | Int::USize)),
+                Type::Int(Int::ISize | Int::USize) | Type::Ptr(_) | Type::FnPtr(_),
+            ) => {
                 let input = self.alloc_node(CILNode::LdArg(argument));
                 self.alloc_node(CILNode::IntCast {
                     input,
@@ -3982,14 +4172,6 @@ impl Assembly {
             ) => {
                 let input = self.alloc_node(CILNode::LdArg(argument));
                 self.alloc_node(CILNode::PtrCast(input, Box::new(PtrCastRes::FnPtr(target))))
-            }
-            (Type::Int(target @ (Int::ISize | Int::USize)), Type::Ptr(_) | Type::FnPtr(_)) => {
-                let input = self.alloc_node(CILNode::LdArg(argument));
-                self.alloc_node(CILNode::IntCast {
-                    input,
-                    target,
-                    extend: ExtendKind::ZeroExtend,
-                })
             }
             (Type::Int(Int::I64), Type::Int(Int::U64)) => self.alloc_node(CILNode::LdArg(argument)),
             _ => panic!("cannot adapt wrapper argument {argument} from {source:?} to {target:?}"),
@@ -4103,7 +4285,7 @@ impl Assembly {
     ) -> Interned<CILNode> {
         let mref = mref.into_idx(self);
         let args: Vec<Interned<CILNode>> = args
-            .into_iter()
+            .iter()
             .map(|arg| IntoAsmIndex::<Interned<_>>::into_idx(arg.clone(), self))
             .collect();
         self.alloc_node(CILNode::Call(Box::new((mref, args.into(), is_pure))))
@@ -4782,7 +4964,7 @@ impl Assembly {
                 let s = self.alloc_string(pieces[0].to_owned());
                 self.alloc_node(CILNode::Const(Box::new(Const::PlatformString(s))))
             }
-            n @ (2 | 3 | 4) => {
+            n @ (2..=4) => {
                 let string = ClassRef::string(self);
                 let name = self.alloc_string("Concat");
                 let inputs: Vec<Type> = (0..n).map(|_| Type::PlatformString).collect();
@@ -4950,43 +5132,70 @@ pub fn encoded_stats<T: Serialize + for<'a> Deserialize<'a>>(val: &T) -> (&'stat
     (type_name::<T>(), buff.len())
 }
 
-// Only exercised by the `test_chunked_range` unit test; unused in non-test builds.
-#[allow(dead_code)]
-fn chunked_range(top: u32, parts: u32) -> impl Iterator<Item = std::ops::Range<u32>> {
-    let chunk_size = top.div_ceil(parts); // Ceiling of n / m
-
-    assert!(parts < top);
-    (0..top).filter_map(move |i| {
-        let start = i * chunk_size;
-        let end = std::cmp::min(start + chunk_size, top);
-        if start < top { Some(start..end) } else { None }
-    })
-}
-#[test]
-#[cfg(not(miri))]
-fn test_chunked_range() {
-    for count in 1..100 {
-        for parts in 1..count {
-            let range = chunked_range(count, parts);
-            assert_eq!(
-                range.flatten().max().unwrap(),
-                count - 1,
-                "count:{count},parts:{parts},range:"
-            );
-            let range = chunked_range(count, parts);
-            assert_eq!(
-                range.flatten().count(),
-                count.try_into().unwrap(),
-                "count:{count},parts:{parts},range:"
-            );
-        }
-    }
-}
 #[test]
 fn user_init() {
     let mut asm = Assembly::default();
     asm.user_init();
 }
+
+#[test]
+fn anonymous_constant_names_follow_value_semantics_not_shard_arena_indices() {
+    fn shard(value: u8) -> Assembly {
+        let mut asm = Assembly::default();
+        let value = asm.alloc_node(Const::U8(value));
+        asm.annon_const(value);
+        asm
+    }
+
+    fn name_for(value: u8, perturb_indices: bool) -> String {
+        let mut asm = Assembly::default();
+        if perturb_indices {
+            asm.alloc_node(Const::U8(99));
+            asm.alloc_type(Type::Int(Int::U64));
+            asm.alloc_string("unrelated");
+        }
+        let value = asm.alloc_node(Const::U8(value));
+        let field = asm.annon_const(value);
+        asm[asm[field].name()].to_string()
+    }
+
+    let one = name_for(1, false);
+    assert_eq!(one, name_for(1, true));
+    assert_ne!(one, name_for(2, false));
+    assert!(one.starts_with("n_"));
+    assert_eq!(one.len(), 2 + 64);
+
+    let mut linked = shard(1);
+    linked.try_link_in_place(shard(2)).unwrap();
+    let main_module = linked.main_module();
+    let anonymous_fields: Vec<_> = linked[main_module]
+        .static_fields()
+        .iter()
+        .filter(|field| linked[field.name].starts_with("n_"))
+        .collect();
+    assert_eq!(anonymous_fields.len(), 2);
+    assert_ne!(anonymous_fields[0].name, anonymous_fields[1].name);
+
+    let cctor = linked.cctor();
+    let initializer_fields: Vec<_> = linked[cctor]
+        .implementation()
+        .blocks()
+        .unwrap()
+        .iter()
+        .flat_map(|block| block.roots())
+        .filter_map(|root| match linked[*root] {
+            CILRoot::SetStaticField { field, .. } => Some(field),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(initializer_fields.len(), 2);
+    assert_ne!(initializer_fields[0], initializer_fields[1]);
+    assert_ne!(
+        linked[initializer_fields[0]].name(),
+        linked[initializer_fields[1]].name()
+    );
+}
+
 #[test]
 fn add_user_init() {
     let mut asm = Assembly::default();
@@ -5210,6 +5419,181 @@ fn optimizer_fuel_is_preallocated_per_method_and_hash_order_independent() {
     assert_eq!(original.method_defs, reordered.method_defs);
     assert_eq!(original.nodes.values(), reordered.nodes.values());
     assert_eq!(original.roots.values(), reordered.roots.values());
+}
+
+#[test]
+fn optimizer_stops_at_a_semantic_fixpoint_without_exhausting_fuel() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let name = asm.alloc_string("already_settled");
+    let sig = asm.sig([], Type::Void);
+    let ret = asm.alloc_root(CILRoot::VoidRet);
+    asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+
+    let mut fuel = OptFuel::new(10_000);
+    asm.opt(&mut fuel);
+    assert!(
+        fuel.raw() > 0,
+        "an unchanged method must not drain its entire optimizer budget"
+    );
+}
+
+#[test]
+fn optimizer_folds_constant_callee_after_later_method_reaches_its_fixpoint() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Bool);
+
+    // The caller sorts before the callee. Its first local pass therefore cannot rely on the
+    // callee having reached a fixpoint yet.
+    let callee_name = asm.alloc_string("z_constant_after_local_fixpoint");
+    let callee_ref = asm.alloc_methodref(MethodRef::new(
+        owner.0,
+        callee_name,
+        sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+    let call = asm.call(callee_ref, &[] as &[Interned<CILNode>], IsPure::NOT);
+    let caller_ret = asm.alloc_root(CILRoot::Ret(call));
+    let caller_name = asm.alloc_string("a_caller_before_constant_callee");
+    let caller = asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        caller_name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![caller_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+
+    // This becomes `ret false` only after local propagation and dead-store cleanup.
+    let false_node = asm.alloc_node(Const::Bool(false));
+    let store = asm.alloc_root(CILRoot::StLoc(0, false_node));
+    let load = asm.alloc_node(CILNode::LdLoc(0));
+    let callee_ret = asm.alloc_root(CILRoot::Ret(load));
+    let bool_type = asm.alloc_type(Type::Bool);
+    let callee = asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        callee_name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![store, callee_ret], 0, None)],
+            locals: vec![(None, bool_type)],
+        },
+        vec![],
+    ));
+
+    let schedule = asm.optimizer_method_schedule();
+    let caller_position = schedule
+        .iter()
+        .position(|(method, _)| *method == caller)
+        .unwrap();
+    let callee_position = schedule
+        .iter()
+        .position(|(method, _)| *method == callee)
+        .unwrap();
+    assert!(caller_position < callee_position);
+
+    let mut fuel = OptFuel::new(10_000);
+    asm.opt(&mut fuel);
+
+    let MethodImpl::MethodBody { blocks, .. } = asm.method_def(caller).implementation() else {
+        panic!("caller must retain its method body");
+    };
+    let roots: Vec<_> = blocks[0].meaningfull_roots(&asm).collect();
+    let [root] = roots.as_slice() else {
+        panic!("caller must contain exactly one meaningful return root");
+    };
+    let CILRoot::Ret(value) = asm.get_root(*root) else {
+        panic!("caller must return a value");
+    };
+    assert_eq!(
+        asm.get_node(*value),
+        &CILNode::Const(Box::new(Const::Bool(false)))
+    );
+}
+
+#[test]
+fn optimizer_reserves_fuel_for_an_already_constant_cross_method_call() {
+    let mut asm = Assembly::default();
+    let owner = asm.main_module();
+    let sig = asm.sig([], Type::Bool);
+    let callee_name = asm.alloc_string("z_already_constant_callee");
+    let callee_ref = asm.alloc_methodref(MethodRef::new(
+        owner.0,
+        callee_name,
+        sig,
+        MethodKind::Static,
+        [].into(),
+    ));
+    let value = asm.alloc_node(Const::Bool(false));
+    let callee_ret = asm.alloc_root(CILRoot::Ret(value));
+    asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        callee_name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![callee_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+
+    let call = asm.call(callee_ref, &[] as &[Interned<CILNode>], IsPure::NOT);
+    let caller_ret = asm.alloc_root(CILRoot::Ret(call));
+    let caller_name = asm.alloc_string("a_reserved_constant_caller");
+    let caller = asm.new_method(MethodDef::new(
+        Access::Private,
+        owner,
+        caller_name,
+        sig,
+        MethodKind::Static,
+        MethodImpl::MethodBody {
+            blocks: vec![super::BasicBlock::new(vec![caller_ret], 0, None)],
+            locals: vec![],
+        },
+        vec![],
+    ));
+
+    // One unit leaves the local phase with zero; only the explicit cross-method reserve can fold
+    // this call.
+    let mut fuel = OptFuel::new(1);
+    asm.opt(&mut fuel);
+
+    let MethodImpl::MethodBody { blocks, .. } = asm.method_def(caller).implementation() else {
+        panic!("caller must retain its method body");
+    };
+    let roots: Vec<_> = blocks[0].meaningfull_roots(&asm).collect();
+    let [root] = roots.as_slice() else {
+        panic!("caller must contain exactly one meaningful return root");
+    };
+    let CILRoot::Ret(value) = asm.get_root(*root) else {
+        panic!("caller must return a value");
+    };
+    assert_eq!(
+        asm.get_node(*value),
+        &CILNode::Const(Box::new(Const::Bool(false)))
+    );
+    assert_eq!(fuel.raw(), 0);
 }
 
 #[test]
@@ -8152,6 +8536,120 @@ fn missing_method_resolution_rejects_dangling_interface_refs_structurally() {
     assert!(matches!(
         error,
         MissingMethodResolutionError::InterfaceMemberMismatch { .. }
+    ));
+}
+
+#[test]
+fn missing_method_resolution_accepts_declared_member_on_closed_local_generic_interface() {
+    let mut asm = Assembly::default();
+    let interface_name = asm.alloc_string("ITest`1");
+    let type_param_name = asm.alloc_string("T");
+    let interface = asm
+        .class_def(
+            ClassDef::new(
+                interface_name,
+                false,
+                1,
+                None,
+                vec![],
+                vec![],
+                Access::Public,
+                None,
+                None,
+                true,
+            )
+            .with_interface()
+            .with_type_generic_names(vec![type_param_name]),
+        )
+        .unwrap();
+    let marker = Type::PlatformGeneric(0, super::tpe::GenericKind::TypeGeneric);
+    let definition_receiver = asm.alloc_class_ref(ClassRef::new(
+        interface_name,
+        None,
+        false,
+        vec![marker].into(),
+    ));
+    let definition_sig = asm.sig([Type::ClassRef(definition_receiver), marker], marker);
+    let member_name = asm.alloc_string("Transform");
+    asm.new_method(
+        MethodDef::new(
+            Access::Extern,
+            interface,
+            member_name,
+            definition_sig,
+            MethodKind::Virtual,
+            MethodImpl::Missing,
+            vec![None, None],
+        )
+        .with_abstract(),
+    );
+
+    let closed_receiver = asm.alloc_class_ref(ClassRef::new(
+        interface_name,
+        None,
+        false,
+        vec![Type::Int(Int::I32)].into(),
+    ));
+    let call_sig = asm.sig([Type::ClassRef(closed_receiver), marker], marker);
+    let call = asm.new_methodref(
+        closed_receiver,
+        "Transform",
+        call_sig,
+        MethodKind::Virtual,
+        [],
+    );
+
+    let stats = asm
+        .try_resolve_missing_methods(
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &MissingMethodPatcher::default(),
+        )
+        .unwrap();
+    assert!(stats.already_defined >= 2);
+    assert!(asm.method_ref_to_def(call).is_none());
+}
+
+#[test]
+fn missing_method_resolution_does_not_fallback_to_open_generic_class() {
+    let mut asm = Assembly::default();
+    let class_name = asm.alloc_string("GenericClass`1");
+    let type_param_name = asm.alloc_string("T");
+    asm.class_def(
+        ClassDef::new(
+            class_name,
+            false,
+            1,
+            None,
+            vec![],
+            vec![],
+            Access::Public,
+            None,
+            None,
+            true,
+        )
+        .with_type_generic_names(vec![type_param_name]),
+    )
+    .unwrap();
+    let closed = asm.alloc_class_ref(ClassRef::new(
+        class_name,
+        None,
+        false,
+        vec![Type::Int(Int::I32)].into(),
+    ));
+    let sig = asm.sig([Type::ClassRef(closed)], Type::Void);
+    asm.new_methodref(closed, "Missing", sig, MethodKind::Virtual, []);
+
+    let error = asm
+        .try_resolve_missing_methods(
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &MissingMethodPatcher::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MissingMethodResolutionError::MissingOwner { .. }
     ));
 }
 

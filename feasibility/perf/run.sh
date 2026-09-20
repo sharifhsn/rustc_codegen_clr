@@ -22,7 +22,7 @@ case "$DOTNET_VERSION" in
   *) echo "DOTNET_VERSION must be 8, 9, or 10" >&2; exit 2 ;;
 esac
 
-export PATH="$HOME/.rustup/toolchains/nightly-2026-06-17-aarch64-apple-darwin/bin:/opt/homebrew/opt/rustup/bin:$HOME/.dotnet:$PATH"
+export PATH="$HOME/.rustup/toolchains/nightly-2026-09-18-aarch64-apple-darwin/bin:/opt/homebrew/opt/rustup/bin:$HOME/.dotnet:$PATH"
 export DOTNET_ROOT="$HOME/.dotnet"
 export CARGO_DOTNET_BACKEND=native
 export CD_LINKER="$REPO/target/release/linker"

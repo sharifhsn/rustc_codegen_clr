@@ -46,7 +46,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.dotnet:$PATH"
 export DOTNET_ROOT="${DOTNET_ROOT:-$HOME/.dotnet}"
-export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly-2026-06-17}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly-2026-09-18}"
 CD="$REPO/feasibility/cargo-dotnet"
 
 usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }

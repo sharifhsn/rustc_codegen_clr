@@ -18,7 +18,9 @@ use super::{
 };
 use crate::{Assembly, MethodDef};
 pub use opt_fuel::OptFuel;
+pub(crate) use opt_node::{constant_return_map, fold_constant_calls, has_foldable_constant_call};
 pub use side_effect::*;
+mod counted_loop;
 mod hoist;
 mod opt_fuel;
 mod opt_node;
@@ -35,6 +37,39 @@ enum LocalPropagate {
     Arg(u32),
     Field(super::Interned<FieldDesc>, Interned<CILNode>),
 }
+
+fn propagated_load(asm: &Assembly, tpe: Type, new_node: Interned<CILNode>) -> Option<CILNode> {
+    match tpe {
+        Type::Float(_)
+        | Type::Bool
+        | Type::FnPtr(_)
+        | Type::Ptr(_)
+        | Type::ClassRef(_)
+        | Type::Int(
+            Int::I128
+            | Int::U128
+            | Int::USize
+            | Int::ISize
+            | Int::I64
+            | Int::U64
+            | Int::U32
+            | Int::I32,
+        )
+        | Type::Ref(_) => Some(asm.get_node(new_node).clone()),
+        Type::Int(int @ (Int::I8 | Int::U8 | Int::I16 | Int::U16)) => Some(CILNode::IntCast {
+            input: new_node,
+            target: int,
+            // Does not matter, since this does nothing for ints < 32 bits, which this arm handles.
+            extend: if int.is_signed() {
+                super::cilnode::ExtendKind::SignExtend
+            } else {
+                super::cilnode::ExtendKind::ZeroExtend
+            },
+        }),
+        _ => None,
+    }
+}
+
 impl CILNode {
     // The complexity of this function is unavoidable.
     #[allow(clippy::too_many_lines)]
@@ -65,109 +100,19 @@ impl CILNode {
                 if !fuel.consume(1) {
                     return self.clone();
                 }
-                match tpe {
-                    Type::Float(_)
-                    | Type::Bool
-                    | Type::FnPtr(_)
-                    | Type::Ptr(_)
-                    | Type::ClassRef(_)
-                    | Type::Int(
-                        Int::I128
-                        | Int::U128
-                        | Int::USize
-                        | Int::ISize
-                        | Int::I64
-                        | Int::U64
-                        | Int::U32
-                        | Int::I32,
-                    )
-                    | Type::Ref(_) => asm.get_node(new_node).clone(),
-                    Type::Int(int @ (Int::I8 | Int::U8 | Int::I16 | Int::U16)) => {
-                        CILNode::IntCast {
-                            input: new_node,
-                            target: int,
-                            // Does not matter, since this does nothing for ints < 32 bits, which this arm handles.
-                            extend: if int.is_signed() {
-                                super::cilnode::ExtendKind::SignExtend
-                            } else {
-                                super::cilnode::ExtendKind::ZeroExtend
-                            },
-                        }
-                    }
-                    _ => self.clone(),
-                }
+                propagated_load(asm, tpe, new_node).unwrap_or_else(|| self.clone())
             }
             CILNode::LdLoc(loc) if LocalPropagate::Local(*loc) == idx => {
                 if !fuel.consume(1) {
                     return self.clone();
                 }
-                match tpe {
-                    Type::Float(_)
-                    | Type::Bool
-                    | Type::FnPtr(_)
-                    | Type::Ptr(_)
-                    | Type::ClassRef(_)
-                    | Type::Int(
-                        Int::I128
-                        | Int::U128
-                        | Int::USize
-                        | Int::ISize
-                        | Int::I64
-                        | Int::U64
-                        | Int::U32
-                        | Int::I32,
-                    )
-                    | Type::Ref(_) => asm.get_node(new_node).clone(),
-                    Type::Int(int @ (Int::I8 | Int::U8 | Int::I16 | Int::U16)) => {
-                        CILNode::IntCast {
-                            input: new_node,
-                            target: int,
-                            // Does not matter, since this does nothing for ints < 32 bits, which this arm handles.
-                            extend: if int.is_signed() {
-                                super::cilnode::ExtendKind::SignExtend
-                            } else {
-                                super::cilnode::ExtendKind::ZeroExtend
-                            },
-                        }
-                    }
-                    _ => CILNode::LdLoc(*loc),
-                }
+                propagated_load(asm, tpe, new_node).unwrap_or(CILNode::LdLoc(*loc))
             }
             CILNode::LdArg(loc) if LocalPropagate::Arg(*loc) == idx => {
                 if !fuel.consume(1) {
                     return self.clone();
                 }
-                match tpe {
-                    Type::Float(_)
-                    | Type::Bool
-                    | Type::FnPtr(_)
-                    | Type::Ptr(_)
-                    | Type::ClassRef(_)
-                    | Type::Int(
-                        Int::I128
-                        | Int::U128
-                        | Int::USize
-                        | Int::ISize
-                        | Int::I64
-                        | Int::U64
-                        | Int::U32
-                        | Int::I32,
-                    )
-                    | Type::Ref(_) => asm.get_node(new_node).clone(),
-                    Type::Int(int @ (Int::I8 | Int::U8 | Int::I16 | Int::U16)) => {
-                        CILNode::IntCast {
-                            input: new_node,
-                            target: int,
-                            // Does not matter, since this does nothing for ints < 32 bits, which this arm handles.
-                            extend: if int.is_signed() {
-                                super::cilnode::ExtendKind::SignExtend
-                            } else {
-                                super::cilnode::ExtendKind::ZeroExtend
-                            },
-                        }
-                    }
-                    _ => CILNode::LdArg(*loc),
-                }
+                propagated_load(asm, tpe, new_node).unwrap_or(CILNode::LdArg(*loc))
             }
             CILNode::LdLoc(loc) => CILNode::LdLoc(*loc),
             CILNode::LdLocA(loc) => CILNode::LdLocA(*loc), // This takes an address, so we can't propagate it
@@ -627,7 +572,7 @@ impl MethodImpl {
         sig: Interned<FnSig>,
     ) {
         // Optimization only suported for methods with locals
-        let Some((blocks, mut cleanup_blocks, locals)) = self.body_parts_mut() else {
+        let Some((blocks, cleanup_blocks, locals)) = self.body_parts_mut() else {
             return;
         };
 
@@ -635,7 +580,6 @@ impl MethodImpl {
             .iter_mut()
             .chain(
                 cleanup_blocks
-                    .as_deref_mut()
                     .into_iter()
                     .flat_map(|blocks| blocks.iter_mut()),
             )
@@ -649,7 +593,7 @@ impl MethodImpl {
         fuel: &mut OptFuel,
     ) {
         // Optimization only suported for methods with locals
-        let Some((blocks, mut cleanup_blocks, locals)) = self.body_parts_mut() else {
+        let Some((blocks, cleanup_blocks, locals)) = self.body_parts_mut() else {
             return;
         };
         // Check if each local is ever read or its address is taken
@@ -686,7 +630,6 @@ impl MethodImpl {
             .iter_mut()
             .chain(
                 cleanup_blocks
-                    .as_deref_mut()
                     .into_iter()
                     .flat_map(|blocks| blocks.iter_mut()),
             )
@@ -713,14 +656,15 @@ impl MethodImpl {
                     }
                 }
                 CILRoot::SetField(info) => {
-                    if let CILNode::LdLocA(loc) = asm[info.1] {
-                        if !local_reads[loc as usize] && (local_address_of[loc as usize] <= 0) {
-                            // Tree has side effects, so it has to be evalueted, so we replace it with a pop
-                            if !cache.summary(info.2, asm).is_pure_total() {
-                                *root = asm.alloc_root(CILRoot::Pop(info.2));
-                            } else {
-                                *root = asm.alloc_root(CILRoot::Nop);
-                            }
+                    if let CILNode::LdLocA(loc) = asm[info.1]
+                        && !local_reads[loc as usize]
+                        && (local_address_of[loc as usize] <= 0)
+                    {
+                        // Tree has side effects, so it has to be evalueted, so we replace it with a pop
+                        if !cache.summary(info.2, asm).is_pure_total() {
+                            *root = asm.alloc_root(CILRoot::Pop(info.2));
+                        } else {
+                            *root = asm.alloc_root(CILRoot::Nop);
                         }
                     }
                 }
@@ -808,19 +752,22 @@ impl MethodDef {
         // scalar locals, so the copy-prop + dead-store passes below forward and delete them and
         // RyuJIT keeps the live field in a register. The dead discriminant store falls out as a dead
         // write on the next fixpoint iteration.
-        if scalarize::sroa_enabled() {
-            if let MethodImpl::MethodBody { blocks, locals } = self.implementation_mut() {
-                scalarize::scalarize_aggregates(blocks, locals, asm, fuel);
-            }
+        if scalarize::sroa_enabled()
+            && let MethodImpl::MethodBody { blocks, locals } = self.implementation_mut()
+        {
+            scalarize::scalarize_aggregates(blocks, locals, asm, fuel);
         }
         self.implementation_mut()
             .propagate_locals(asm, cache, fuel, sig);
         self.implementation_mut()
             .remove_dead_writes(asm, cache, fuel);
-        if fuel.consume(1) {
-            self.implementation_mut().realloc_locals(asm);
-        }
-
+        counted_loop::eliminate_total_counted_loops(
+            self.implementation_mut(),
+            sig,
+            asm,
+            cache,
+            fuel,
+        );
         if fuel.consume(15) {
             self.dedup_roots(asm);
         }
@@ -830,10 +777,10 @@ impl MethodDef {
         if fuel.consume(1) {
             self.implementation_mut().remove_duplicate_sfi(asm);
         }
-        if let MethodImpl::MethodBody { blocks, .. } = self.implementation_mut() {
-            if let Some(block) = linearize_blocks(blocks, asm) {
-                *blocks = vec![block];
-            }
+        if let MethodImpl::MethodBody { blocks, .. } = self.implementation_mut()
+            && let Some(block) = linearize_blocks(blocks, asm)
+        {
+            *blocks = vec![block];
         }
 
         self.remove_useless_handlers(asm, fuel, cache);
@@ -842,10 +789,10 @@ impl MethodDef {
         // alloc `Layout`) out of loop bodies into a once-evaluated entry-block local — RyuJIT cannot
         // hoist the opaque struct-returning `transmute` call itself. Runs after block linearization so
         // it sees the final block structure.
-        if fuel.consume(2) {
-            if let MethodImpl::MethodBody { blocks, locals } = self.implementation_mut() {
-                hoist::hoist_const_calls(blocks, locals, asm);
-            }
+        if fuel.consume(2)
+            && let MethodImpl::MethodBody { blocks, locals } = self.implementation_mut()
+        {
+            hoist::hoist_const_calls(blocks, locals, asm);
         }
     }
     fn remove_useless_handlers(
@@ -902,7 +849,6 @@ impl MethodDef {
                     continue;
                 };
                 match (asm.get_root(*curr), asm.get_root(**peek)) {
-                    (CILRoot::SourceFileInfo { .. }, CILRoot::SourceFileInfo { .. }) => *curr = nop,
                     // If a rethrow is followed by a rethrow, this is effectively just a single rethrow
                     (CILRoot::ReThrow, CILRoot::ReThrow) => *curr = nop,
                     // If we return var a immeditaly after assigining it, we can just return it.
@@ -918,24 +864,6 @@ impl MethodDef {
                         let curr = peekable.next().unwrap();
                         *curr = asm.alloc_root(CILRoot::Ret(tree));
                     }
-                    // FIXME: **why** does this cause issues?
-                    /*
-                    (CILRoot::Branch(info), CILRoot::Branch(info2))
-                        if is_branch_unconditional(info2) =>
-                    {
-                        let (target, subtarget, cond) = info.as_ref();
-                        let (target2, subtarget2, _) = info2.as_ref();
-                        // If a conditional jump to a target is followed by an unconditonal jump to the same target, we just need to perform the unconditonla jump.
-                        if target == target2 && subtarget == subtarget2 {
-                            match cond {
-                                None => *curr = nop,
-                                Some(BranchCond::True(tr) | BranchCond::False(tr)) => {
-                                    *curr = asm.alloc_root(CILRoot::Pop(*tr));
-                                }
-                                _ => (),
-                            }
-                        }
-                    }*/
                     _ => (),
                 }
             }
@@ -958,6 +886,7 @@ impl MethodDef {
         // across threads here.
         let fuel = std::cell::RefCell::new(&mut *fuel);
         let locals = self.locals().map(|locs| locs.to_vec()).unwrap();
+        let caller_class = self.class();
         let mut cache2 = EffectInfoCache::default();
         self.map_roots(
             asm,
@@ -967,7 +896,7 @@ impl MethodDef {
             },
             &mut |node, asm| {
                 let mut fuel = fuel.borrow_mut();
-                opt_node::opt_node(node, asm, *fuel, &mut cache2)
+                opt_node::opt_node(node, asm, *fuel, &mut cache2, sig, &locals, caller_class)
             },
         );
     }

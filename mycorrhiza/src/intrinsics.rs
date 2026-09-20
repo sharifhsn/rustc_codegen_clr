@@ -1,3 +1,5 @@
+#![allow(unused_variables)]
+
 use crate::{ManagedInteropType, ManagedRootableType, ManagedSafe};
 
 /// A handle to a managed reference type, identified *only* by its `(ASSEMBLY, CLASS_PATH)` const
@@ -40,7 +42,6 @@ pub struct RustcCLRInteropManagedStruct<
 /// typed `ldfld`; the declaration exists only to carry the owner identity, field name, and Rust
 /// return type through MIR.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_get_field<
     const ASSEMBLY: &'static str,
@@ -295,7 +296,6 @@ interop_magic_fn! {
     () -> Ret
 }
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_ld_len<T>(arr: RustcCLRInteropManagedArray<T, 1>) -> i32 {
     core::intrinsics::abort();
@@ -303,14 +303,12 @@ pub fn rustc_clr_interop_managed_ld_len<T>(arr: RustcCLRInteropManagedArray<T, 1
 /// Allocates a new managed (.NET) 1-D array of `T` with `len` elements (`newarr`). The element type
 /// `T` must be a primitive that maps to a .NET primitive (e.g. `i32`/`i64`/`f64`).
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_new_arr<T>(len: i32) -> RustcCLRInteropManagedArray<T, 1> {
     core::intrinsics::abort();
 }
 /// Stores `val` into the managed array `arr` at `idx` (`stelem`).
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_set_elem<T>(
     arr: RustcCLRInteropManagedArray<T, 1>,
@@ -322,7 +320,6 @@ pub fn rustc_clr_interop_managed_set_elem<T>(
 /// Loads `arr[idx]` as `T` (`ldelem T`). Unlike `ldelem.ref`, this supports primitive and managed
 /// value-type arrays without pretending their elements are object references.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_get_elem<T>(
     arr: RustcCLRInteropManagedArray<T, 1>,
@@ -331,7 +328,6 @@ pub fn rustc_clr_interop_managed_get_elem<T>(
     core::intrinsics::abort()
 }
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_ld_elem_ref<
     const ASSEMBLY: &'static str,
@@ -390,7 +386,6 @@ interop_magic_fn! {
     () -> Ret
 }
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_ld_null<T>() -> T {
     core::intrinsics::abort();
@@ -398,7 +393,6 @@ pub fn rustc_clr_interop_managed_ld_null<T>() -> T {
 /// Returns whether a managed reference is null. The backend emits a direct reference comparison;
 /// no type-specific `op_Equality` member is required.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_is_null<T>(value: T) -> bool {
     core::intrinsics::abort();
@@ -407,7 +401,6 @@ pub fn rustc_clr_interop_managed_is_null<T>(value: T) -> bool {
 /// it. This is the C#-catchable error direction — unlike a Rust `panic!`, which goes through the
 /// unwinder and does not propagate cleanly out to a managed frame.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_throw<const MSG: &'static str>() -> ! {
     core::intrinsics::abort();
@@ -421,13 +414,11 @@ pub fn rustc_clr_interop_throw<const MSG: &'static str>() -> ! {
 /// on [`RustcCLRInteropManagedClass`] for when two differently-named handle types need no cast at
 /// all. Reach for this function directly only for downcasts or hierarchy jumps with no `From` impl.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_checked_cast<DST, SRC>(src: SRC) -> DST {
     core::intrinsics::abort();
 }
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_managed_is_inst<DST, SRC>(src: SRC) -> bool {
     core::intrinsics::abort();
@@ -436,7 +427,6 @@ pub fn rustc_clr_interop_managed_is_inst<DST, SRC>(src: SRC) -> bool {
 /// must be a value type (an integer/float/bool primitive or a value-type managed struct); boxing a
 /// reference type is rejected by the CIL typechecker.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_box<T>(
     val: T,
@@ -769,7 +759,6 @@ interop_magic_fn! {
 /// generated concrete handle for a non-generic delegate such as `System.EventHandler`. The backend
 /// returns the actual managed delegate reference, which can be passed to a .NET method or invoked.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_delegate<
     const ASSEMBLY: &'static str,
@@ -792,7 +781,6 @@ pub fn rustc_clr_interop_delegate<
 /// with an extra `EnvTy` before the fn-ptr type; its `Ret` is the exact managed-delegate handle
 /// marker described there.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
-#[allow(unused_variables)]
 #[inline(never)]
 pub fn rustc_clr_interop_delegate_closure<
     const ASSEMBLY: &'static str,
@@ -821,31 +809,36 @@ impl RustcCLRInteropManagedChar {
         }
     }
     pub fn single_codepoint_unchecked(value: char) -> Self {
-        let byte1 = (value as u64) & 0xFF;
-        if (byte1 & 0x80) == 0x00 {
-            //1 byte long char
-            let utf16 = (byte1 & 0x7F) as u16;
-            utf16.into()
-        } else if (byte1 & 0xE0) == 0xC0 {
-            //2 byte long char
-            let byte2 = ((value as u64) & 0x00FF) >> 8;
-            let utf16 = (((byte1 & 0x1F) << 6) | (byte2 & 0x3F)) as u16;
-            utf16.into()
-        } else if (byte1 & 0xF0) == 0xE0 {
-            //3 byte long char
-            let byte2 = ((value as u64) & 0x00FF) >> 8;
-            let byte3 = ((value as u64) & 0x0000FF) >> 16;
-            let utf16 = (((byte1 & 0x0F) << 12) | ((byte2 & 0x3F) << 6) | (byte3 & 0x3F)) as u16;
-            utf16.into()
-        } else if (byte1 & 0xF8) == 0xF0 {
-            //4 byte long char
-            0xFFFD.into()
+        // Rust `char` is already a Unicode scalar value, not a UTF-8 byte sequence.  For the
+        // BMP, its scalar value is exactly the UTF-16 code unit expected by `System.Char`; only
+        // astral scalars need the documented replacement fallback because one `System.Char`
+        // cannot represent their surrogate pair.
+        let value = value as u32;
+        if value <= u16::MAX as u32 {
+            (value as u16).into()
         } else {
-            //Invalid utf8.
             0xFFFD.into()
         }
     }
 }
+
+#[cfg(test)]
+mod managed_char_tests {
+    use super::RustcCLRInteropManagedChar;
+
+    #[test]
+    fn scalar_values_map_to_utf16_code_units() {
+        assert_eq!(
+            RustcCLRInteropManagedChar::single_codepoint_unchecked('ó').as_u16(),
+            'ó' as u16
+        );
+        assert_eq!(
+            RustcCLRInteropManagedChar::single_codepoint_unchecked('😀').as_u16(),
+            0xFFFD
+        );
+    }
+}
+
 impl<T> RustcCLRInteropManagedArray<T, 1> {
     /// Gets the length of this managed array
     pub fn len(self) -> i32 {

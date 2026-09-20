@@ -48,6 +48,20 @@ pub fn assemble_cargo_flags(args: &BuildArgs) -> Vec<String> {
         cargo_flags.push("--exclude".to_string());
         cargo_flags.push(e.clone());
     }
+    if let Some(target) = &args.test_target {
+        cargo_flags.push("--test".to_string());
+        cargo_flags.push(target.clone());
+    }
+    if args.lib {
+        cargo_flags.push("--lib".to_string());
+    }
+    if let Some(target_dir) = &args.target_dir {
+        cargo_flags.push("--target-dir".to_string());
+        cargo_flags.push(target_dir.display().to_string());
+    }
+    if args.locked {
+        cargo_flags.push("--locked".to_string());
+    }
 
     // ---- verbatim extras (--locked/--offline/--frozen/--target-dir/--message-format/…) ----
     cargo_flags.extend(args.extra.iter().cloned());
@@ -72,6 +86,10 @@ mod tests {
             features: clap_cargo::Features::default(),
             manifest: clap_cargo::Manifest::default(),
             workspace: clap_cargo::Workspace::default(),
+            test_target: None,
+            lib: false,
+            target_dir: None,
+            locked: false,
             extra: Vec::new(),
             prog_args: Vec::new(),
         }
@@ -105,5 +123,23 @@ mod tests {
         let cargo = assemble_cargo_flags(&a);
         assert!(cargo.contains(&"--all-features".to_string()));
         assert!(cargo.contains(&"--no-default-features".to_string()));
+    }
+
+    #[test]
+    fn explicit_test_harness_selectors_are_forwarded() {
+        let mut a = base_args();
+        a.test_target = Some("coretests".into());
+        a.target_dir = Some("/tmp/target".into());
+        a.locked = true;
+        assert_eq!(
+            assemble_cargo_flags(&a),
+            vec![
+                "--test",
+                "coretests",
+                "--target-dir",
+                "/tmp/target",
+                "--locked"
+            ]
+        );
     }
 }

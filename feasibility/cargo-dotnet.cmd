@@ -7,7 +7,7 @@ REM work from a normal Windows shell by forwarding to bash with the NATIVE backe
 REM
 REM PREREQS (see docs/CARGO_DOTNET.md "Windows (x86_64), best-effort / UNTESTED"):
 REM   * Git for Windows (provides bash) on PATH, or WSL.
-REM   * rustup nightly-2026-06-17-x86_64-pc-windows-msvc + rust-src + rustc-dev.
+REM   * rustup nightly-2026-09-18-x86_64-pc-windows-msvc + rust-src + rustc-dev.
 REM   * .NET 8 SDK on PATH (dotnet.exe).
 REM   * The CoreCLR ILAsm tool (NuGet runtime.win-x64.Microsoft.NETCore.ILAsm) at
 REM   * The host backend built: librustc_codegen_clr.dll + linker.exe under target\release.

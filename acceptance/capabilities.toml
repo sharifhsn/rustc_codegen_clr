@@ -1,7 +1,7 @@
 schema = 1
 
 [support]
-rust_toolchain = "nightly-2026-06-17"
+rust_toolchain = "nightly-2026-09-18"
 target = "x86_64-unknown-dotnet"
 dotnet_cli_profiles = ["10"]
 default_dotnet = "10"

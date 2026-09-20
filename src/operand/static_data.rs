@@ -677,14 +677,8 @@ pub fn add_allocation(
             let buf = aligned_static_buf(ctx, field_desc, align, over_aligned);
             let ptr = ctx.cast_ptr(buf, Int::U8);
 
-            let initialzer: MethodDefIdx = allocation_initializer_method(
-                const_alloc,
-                &alloc_name,
-                origin,
-                ctx,
-                ptr.into(),
-                true,
-            );
+            let initialzer: MethodDefIdx =
+                allocation_initializer_method(const_alloc, &alloc_name, origin, ctx, ptr, true);
 
             // Calls the static initialzer, and sets the static field to the returned pointer.
             let root = ctx.alloc_root(cilly::CILRoot::call(*initialzer, []));

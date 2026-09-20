@@ -14,34 +14,30 @@ use crate::{ManagedReferenceType, ManagedRootableType, NativeStorageSafe};
 
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[doc(hidden)]
-#[allow(unused_variables)]
 #[inline(never)]
-pub unsafe fn rustc_clr_interop_managed_box_new<T>(value: T) -> *mut u8 {
+pub unsafe fn rustc_clr_interop_managed_box_new<T>(_value: T) -> *mut u8 {
     core::intrinsics::abort()
 }
 
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[doc(hidden)]
-#[allow(unused_variables)]
 #[inline(never)]
-pub unsafe fn rustc_clr_interop_managed_box_get<T>(handle: *mut u8) -> T {
+pub unsafe fn rustc_clr_interop_managed_box_get<T>(_handle: *mut u8) -> T {
     core::intrinsics::abort()
 }
 
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[doc(hidden)]
-#[allow(unused_variables)]
 #[inline(never)]
-pub unsafe fn rustc_clr_interop_managed_box_take<T>(handle: *mut u8) -> T {
+pub unsafe fn rustc_clr_interop_managed_box_take<T>(_handle: *mut u8) -> T {
     core::intrinsics::abort()
 }
 
 /// Release a GCHandle token without materializing or dropping its managed target.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[doc(hidden)]
-#[allow(unused_variables)]
 #[inline(never)]
-pub unsafe fn rustc_clr_interop_managed_box_free(handle: *mut u8) {
+pub unsafe fn rustc_clr_interop_managed_box_free(_handle: *mut u8) {
     core::intrinsics::abort()
 }
 

@@ -35,83 +35,58 @@ pub struct FieldDesc {
     tpe: Type,
 }
 
-impl RelocateValue for FieldDesc {
-    type Output = Self;
-
-    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
-        let Self { owner, name, tpe } = self;
-        Self {
-            owner: ctx.class_ref(destination, owner),
-            name: ctx.string(destination, name),
-            tpe: destination.translate_type(ctx, tpe),
-        }
-    }
-}
-
-impl FieldDesc {
-    #[must_use]
-    pub fn new(owner: Interned<ClassRef>, name: Interned<IString>, tpe: Type) -> Self {
-        Self { owner, name, tpe }
-    }
-
-    #[must_use]
-    pub fn owner(&self) -> Interned<ClassRef> {
-        self.owner
-    }
-
-    #[must_use]
-    pub fn name(&self) -> Interned<IString> {
-        self.name
-    }
-
-    #[must_use]
-    pub fn tpe(&self) -> Type {
-        self.tpe
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
 pub struct StaticFieldDesc {
     owner: Interned<ClassRef>,
     name: Interned<IString>,
     tpe: Type,
 }
-impl RelocateValue for StaticFieldDesc {
-    type Output = Self;
 
-    fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
-        let Self { owner, name, tpe } = self;
-        Self {
-            owner: ctx.class_ref(destination, owner),
-            name: ctx.string(destination, name),
-            tpe: destination.translate_type(ctx, tpe),
+macro_rules! impl_field_desc {
+    ($ty:ident) => {
+        impl RelocateValue for $ty {
+            type Output = Self;
+
+            fn relocate(self, ctx: &mut RelocateCtx<'_>, destination: &mut Assembly) -> Self {
+                let Self { owner, name, tpe } = self;
+                Self {
+                    owner: ctx.class_ref(destination, owner),
+                    name: ctx.string(destination, name),
+                    tpe: destination.translate_type(ctx, tpe),
+                }
+            }
         }
-    }
+
+        impl $ty {
+            #[must_use]
+            pub fn new(owner: Interned<ClassRef>, name: Interned<IString>, tpe: Type) -> Self {
+                Self { owner, name, tpe }
+            }
+
+            #[must_use]
+            pub fn owner(&self) -> Interned<ClassRef> {
+                self.owner
+            }
+
+            #[must_use]
+            pub fn name(&self) -> Interned<IString> {
+                self.name
+            }
+
+            #[must_use]
+            pub fn tpe(&self) -> Type {
+                self.tpe
+            }
+        }
+    };
 }
+
+impl_field_desc!(FieldDesc);
+impl_field_desc!(StaticFieldDesc);
+
 impl IntoAsmIndex<Interned<StaticFieldDesc>> for StaticFieldDesc {
     fn into_idx(self, asm: &mut super::Assembly) -> Interned<StaticFieldDesc> {
         asm.alloc_sfld(self)
-    }
-}
-impl StaticFieldDesc {
-    #[must_use]
-    pub fn new(owner: Interned<ClassRef>, name: Interned<IString>, tpe: Type) -> Self {
-        Self { owner, name, tpe }
-    }
-
-    #[must_use]
-    pub fn owner(&self) -> Interned<ClassRef> {
-        self.owner
-    }
-
-    #[must_use]
-    pub fn name(&self) -> Interned<IString> {
-        self.name
-    }
-
-    #[must_use]
-    pub fn tpe(&self) -> Type {
-        self.tpe
     }
 }
 impl IntoAsmIndex<Interned<FieldDesc>> for FieldDesc {

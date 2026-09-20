@@ -32,6 +32,91 @@ fn negation_cmp_kind(
         .unwrap_or(false);
     if is_float { float_kind } else { int_kind }
 }
+
+fn optimized_branch(
+    target: u32,
+    sub_target: u32,
+    cond: Option<BranchCond>,
+    original: CILRoot,
+    fuel: &mut OptFuel,
+) -> CILRoot {
+    opt_if_fuel(
+        CILRoot::Branch(Box::new((target, sub_target, cond))),
+        original,
+        fuel,
+    )
+}
+
+fn is_zero_const(cst: &Const) -> bool {
+    matches!(
+        cst,
+        Const::Bool(false)
+            | Const::ISize(0)
+            | Const::USize(0)
+            | Const::I64(0)
+            | Const::U64(0)
+            | Const::I32(0)
+            | Const::U32(0)
+            | Const::I16(0)
+            | Const::U16(0)
+            | Const::I8(0)
+            | Const::U8(0)
+    )
+}
+
+fn true_branch_condition(
+    lhs: Interned<CILNode>,
+    rhs: Interned<CILNode>,
+    op: BinOp,
+) -> Option<BranchCond> {
+    Some(match op {
+        BinOp::Eq => BranchCond::Eq(lhs, rhs),
+        BinOp::GtUn => BranchCond::Gt(lhs, rhs, CmpKind::Unordered),
+        BinOp::Gt => BranchCond::Gt(lhs, rhs, CmpKind::Ordered),
+        BinOp::LtUn => BranchCond::Lt(lhs, rhs, CmpKind::Unordered),
+        BinOp::Lt => BranchCond::Lt(lhs, rhs, CmpKind::Ordered),
+        _ => return None,
+    })
+}
+
+fn false_branch_condition(
+    lhs: Interned<CILNode>,
+    rhs: Interned<CILNode>,
+    op: BinOp,
+    sig: Interned<FnSig>,
+    locals: &[LocalDef],
+    asm: &mut Assembly,
+) -> Option<BranchCond> {
+    Some(match op {
+        BinOp::Eq => BranchCond::Ne(lhs, rhs),
+        BinOp::Gt | BinOp::GtUn => {
+            let (int_kind, float_kind) = if op == BinOp::Gt {
+                (CmpKind::Ordered, CmpKind::Unordered)
+            } else {
+                (CmpKind::Unordered, CmpKind::Ordered)
+            };
+            BranchCond::Le(
+                lhs,
+                rhs,
+                negation_cmp_kind(lhs, int_kind, float_kind, sig, locals, asm),
+            )
+        }
+        BinOp::Lt | BinOp::LtUn => {
+            let (int_kind, float_kind) = if op == BinOp::Lt {
+                (CmpKind::Ordered, CmpKind::Unordered)
+            } else {
+                (CmpKind::Unordered, CmpKind::Ordered)
+            };
+            BranchCond::Ge(
+                lhs,
+                rhs,
+                negation_cmp_kind(lhs, int_kind, float_kind, sig, locals, asm),
+            )
+        }
+        _ => return None,
+    })
+}
+
 pub fn root_opt(
     root: CILRoot,
     asm: &mut Assembly,
@@ -51,9 +136,6 @@ pub fn root_opt(
                 }
             }
         },
-        // See `opt_node`: call-site argument evaluation must remain explicit and once-only.
-        CILRoot::Call(_) => root,
-
         // As with the `LdInd`->`LdLoc` fold in `opt_node.rs`: only collapse `stind(ldloca X, v)`
         // to `stloc X, v` when the store is NOT volatile. A `volatile.` store is a release fence
         // (ECMA-335 I.12.6.8) — folding it into a plain `stloc` would silently drop that fence,
@@ -82,269 +164,77 @@ pub fn root_opt(
                     // mutable `asm` to typecheck the operand and pick ordered-vs-unordered.
                     match asm.get_node(*cond).clone() {
                         CILNode::Const(cst) => match cst.as_ref() {
-                            Const::Bool(false) => opt_if_fuel(
-                                CILRoot::Branch(Box::new((*target, *sub_target, None))),
-                                root,
-                                root_fuel,
-                            ),
+                            Const::Bool(false) => {
+                                optimized_branch(*target, *sub_target, None, root, root_fuel)
+                            }
                             Const::Bool(true) => opt_if_fuel(CILRoot::Nop, root, root_fuel),
                             _ => root,
                         },
-                        // a == b is false <=> a != b. `Ne` lowers to `bne.un`, which is the correct
-                        // negation of ordered `ceq` for both ints and floats (NaN ≠ NaN is true), so
-                        // no kind selection is needed here.
-                        CILNode::BinOp(ref lhs, ref rhs, BinOp::Eq) => opt_if_fuel(
-                            {
-                                CILRoot::Branch(Box::new((
+                        CILNode::BinOp(lhs, rhs, op) => {
+                            match false_branch_condition(lhs, rhs, op, sig, locals, asm) {
+                                Some(cond) => optimized_branch(
                                     *target,
                                     *sub_target,
-                                    Some(BranchCond::Ne(*lhs, *rhs)),
-                                )))
-                            },
-                            root,
-                            root_fuel,
-                        ),
-                        // a > b is false <=> a <= b
-                        CILNode::BinOp(ref lhs, ref rhs, BinOp::Gt) => {
-                            let kind = negation_cmp_kind(
-                                *lhs,
-                                CmpKind::Ordered,
-                                CmpKind::Unordered,
-                                sig,
-                                locals,
-                                asm,
-                            );
-                            opt_if_fuel(
-                                CILRoot::Branch(Box::new((
-                                    *target,
-                                    *sub_target,
-                                    Some(BranchCond::Le(*lhs, *rhs, kind)),
-                                ))),
-                                root,
-                                root_fuel,
-                            )
+                                    Some(cond),
+                                    root,
+                                    root_fuel,
+                                ),
+                                None => root,
+                            }
                         }
-                        CILNode::BinOp(ref lhs, ref rhs, BinOp::GtUn) => {
-                            let kind = negation_cmp_kind(
-                                *lhs,
-                                CmpKind::Unordered,
-                                CmpKind::Ordered,
-                                sig,
-                                locals,
-                                asm,
-                            );
-                            opt_if_fuel(
-                                CILRoot::Branch(Box::new((
-                                    *target,
-                                    *sub_target,
-                                    Some(BranchCond::Le(*lhs, *rhs, kind)),
-                                ))),
-                                root,
-                                root_fuel,
-                            )
-                        }
-                        // a < b is false <=> a >= b
-                        CILNode::BinOp(ref lhs, ref rhs, BinOp::Lt) => {
-                            let kind = negation_cmp_kind(
-                                *lhs,
-                                CmpKind::Ordered,
-                                CmpKind::Unordered,
-                                sig,
-                                locals,
-                                asm,
-                            );
-                            opt_if_fuel(
-                                CILRoot::Branch(Box::new((
-                                    *target,
-                                    *sub_target,
-                                    Some(BranchCond::Ge(*lhs, *rhs, kind)),
-                                ))),
-                                root,
-                                root_fuel,
-                            )
-                        }
-                        CILNode::BinOp(ref lhs, ref rhs, BinOp::LtUn) => {
-                            let kind = negation_cmp_kind(
-                                *lhs,
-                                CmpKind::Unordered,
-                                CmpKind::Ordered,
-                                sig,
-                                locals,
-                                asm,
-                            );
-                            opt_if_fuel(
-                                CILRoot::Branch(Box::new((
-                                    *target,
-                                    *sub_target,
-                                    Some(BranchCond::Ge(*lhs, *rhs, kind)),
-                                ))),
-                                root,
-                                root_fuel,
-                            )
-                        }
-                        //CILNode::IntCast { input, target, extend }
                         _ => root,
                     }
                 }
                 Some(BranchCond::True(cond)) => match asm.get_node(*cond) {
-                    // a == b  is true <=> a == b
-                    CILNode::BinOp(lhs, rhs, BinOp::Eq) => opt_if_fuel(
-                        CILRoot::Branch(Box::new((
+                    CILNode::BinOp(lhs, rhs, op) => match true_branch_condition(*lhs, *rhs, *op) {
+                        Some(cond) => {
+                            optimized_branch(*target, *sub_target, Some(cond), root, root_fuel)
+                        }
+                        None => root,
+                    },
+                    _ => root,
+                },
+                Some(BranchCond::Ne(lhs, rhs)) => match (asm.get_node(*lhs), asm.get_node(*rhs)) {
+                    (_, CILNode::Const(cst)) if is_zero_const(cst) => optimized_branch(
+                        *target,
+                        *sub_target,
+                        Some(BranchCond::True(*lhs)),
+                        root,
+                        root_fuel,
+                    ),
+                    (_, CILNode::Const(cst)) if matches!(cst.as_ref(), Const::Bool(true)) => {
+                        optimized_branch(
                             *target,
                             *sub_target,
-                            Some(BranchCond::Eq(*lhs, *rhs)),
-                        ))),
-                        root,
-                        root_fuel,
-                    ),
-                    CILNode::BinOp(lhs, rhs, BinOp::GtUn) => opt_if_fuel(
-                        {
-                            CILRoot::Branch(Box::new((
-                                *target,
-                                *sub_target,
-                                Some(BranchCond::Gt(*lhs, *rhs, CmpKind::Unordered)),
-                            )))
-                        },
-                        root,
-                        root_fuel,
-                    ),
-                    CILNode::BinOp(lhs, rhs, BinOp::Gt) => opt_if_fuel(
-                        CILRoot::Branch(Box::new((
-                            *target,
-                            *sub_target,
-                            Some(BranchCond::Gt(*lhs, *rhs, CmpKind::Ordered)),
-                        ))),
-                        root,
-                        root_fuel,
-                    ),
-                    CILNode::BinOp(lhs, rhs, BinOp::LtUn) => opt_if_fuel(
-                        {
-                            CILRoot::Branch(Box::new((
-                                *target,
-                                *sub_target,
-                                Some(BranchCond::Lt(*lhs, *rhs, CmpKind::Unordered)),
-                            )))
-                        },
-                        root,
-                        root_fuel,
-                    ),
-                    CILNode::BinOp(lhs, rhs, BinOp::Lt) => opt_if_fuel(
-                        CILRoot::Branch(Box::new((
-                            *target,
-                            *sub_target,
-                            Some(BranchCond::Lt(*lhs, *rhs, CmpKind::Ordered)),
-                        ))),
+                            Some(BranchCond::False(*lhs)),
+                            root,
+                            root_fuel,
+                        )
+                    }
+                    (CILNode::Const(cst), _) if is_zero_const(cst) => optimized_branch(
+                        *target,
+                        *sub_target,
+                        Some(BranchCond::True(*rhs)),
                         root,
                         root_fuel,
                     ),
                     _ => root,
                 },
-                Some(BranchCond::Ne(lhs, rhs)) => {
-                    match (asm.get_node(*lhs), asm.get_node(*rhs)) {
-                        (_, CILNode::Const(cst)) => match cst.as_ref() {
-                            // val != false <=> val is true
-                            Const::Bool(false)
-                            | Const::ISize(0)
-                            | Const::USize(0)
-                            | Const::I64(0)
-                            | Const::U64(0)
-                            | Const::I32(0)
-                            | Const::U32(0)
-                            | Const::I16(0)
-                            | Const::U16(0)
-                            | Const::I8(0)
-                            | Const::U8(0) => opt_if_fuel(
-                                CILRoot::Branch(Box::new((
-                                    *target,
-                                    *sub_target,
-                                    Some(BranchCond::True(*lhs)),
-                                ))),
-                                root,
-                                root_fuel,
-                            ),
-                            // val != true <=> val is false
-                            Const::Bool(true) => opt_if_fuel(
-                                CILRoot::Branch(Box::new((
-                                    *target,
-                                    *sub_target,
-                                    Some(BranchCond::False(*lhs)),
-                                ))),
-                                root,
-                                root_fuel,
-                            ),
-                            _ => root,
-                        },
-                        (CILNode::Const(cst), _) => match cst.as_ref() {
-                            // val != false <=> val is true
-                            Const::Bool(false)
-                            | Const::ISize(0)
-                            | Const::USize(0)
-                            | Const::I64(0)
-                            | Const::U64(0)
-                            | Const::I32(0)
-                            | Const::U32(0)
-                            | Const::I16(0)
-                            | Const::U16(0)
-                            | Const::I8(0)
-                            | Const::U8(0) => opt_if_fuel(
-                                CILRoot::Branch(Box::new((
-                                    *target,
-                                    *sub_target,
-                                    Some(BranchCond::True(*rhs)),
-                                ))),
-                                root,
-                                root_fuel,
-                            ),
-                            _ => root,
-                        },
-                        _ => root,
-                    }
-                }
                 Some(BranchCond::Eq(lhs, rhs)) => match (asm.get_node(*lhs), asm.get_node(*rhs)) {
-                    (_, CILNode::Const(cst)) => match cst.as_ref() {
-                        Const::Bool(false)
-                        | Const::ISize(0)
-                        | Const::USize(0)
-                        | Const::I64(0)
-                        | Const::U64(0)
-                        | Const::I32(0)
-                        | Const::U32(0)
-                        | Const::I16(0)
-                        | Const::U16(0)
-                        | Const::I8(0)
-                        | Const::U8(0) => opt_if_fuel(
-                            CILRoot::Branch(Box::new((
-                                *target,
-                                *sub_target,
-                                Some(BranchCond::False(*lhs)),
-                            ))),
-                            root,
-                            root_fuel,
-                        ),
-                        _ => root,
-                    },
-                    (CILNode::Const(cst), _) => match cst.as_ref() {
-                        Const::Bool(false)
-                        | Const::ISize(0)
-                        | Const::USize(0)
-                        | Const::I64(0)
-                        | Const::U64(0)
-                        | Const::I32(0)
-                        | Const::U32(0)
-                        | Const::I16(0)
-                        | Const::U16(0)
-                        | Const::I8(0)
-                        | Const::U8(0) => opt_if_fuel(
-                            CILRoot::Branch(Box::new((
-                                *target,
-                                *sub_target,
-                                Some(BranchCond::False(*rhs)),
-                            ))),
-                            root,
-                            root_fuel,
-                        ),
-                        _ => root,
-                    },
+                    (_, CILNode::Const(cst)) if is_zero_const(cst) => optimized_branch(
+                        *target,
+                        *sub_target,
+                        Some(BranchCond::False(*lhs)),
+                        root,
+                        root_fuel,
+                    ),
+                    (CILNode::Const(cst), _) if is_zero_const(cst) => optimized_branch(
+                        *target,
+                        *sub_target,
+                        Some(BranchCond::False(*rhs)),
+                        root,
+                        root_fuel,
+                    ),
                     _ => root,
                 },
                 Some(_) | None => root,
@@ -352,8 +242,6 @@ pub fn root_opt(
         }
         CILRoot::StLoc(loc, val) if asm[val] == CILNode::LdLoc(loc) => CILRoot::Nop,
         CILRoot::StArg(loc, val) if asm[val] == CILNode::LdArg(loc) => CILRoot::Nop,
-        // A managed-array element store is meaningful and is left untouched by the optimizer.
-        CILRoot::StElem { .. } => root,
         _ => root,
     }
 }
@@ -364,10 +252,10 @@ fn opt_init_obj(
     fuel: &mut OptFuel,
 ) -> CILRoot {
     // 1. Check if the addr is RefToPtr. If so, remove that.
-    if let CILNode::RefToPtr(inner) = asm[addr] {
-        if fuel.consume(1) {
-            addr = inner;
-        }
+    if let CILNode::RefToPtr(inner) = asm[addr]
+        && fuel.consume(1)
+    {
+        addr = inner;
     }
     // 2. Check if the type is a small primitive - if so, replace this with StObj to allow for more optimizations.
     match asm[tpe] {

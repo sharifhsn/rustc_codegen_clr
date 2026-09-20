@@ -116,10 +116,10 @@ pub fn hoist_const_calls(
     for block in blocks.iter().skip(1) {
         for root in block.iter_roots() {
             for elem in CILIter::new(asm.get_root(root).clone(), asm) {
-                if let CILIterElem::Node(n) = elem {
-                    if is_const_transmute(asm, &n, transmute_name).is_some() {
-                        targets.insert(n);
-                    }
+                if let CILIterElem::Node(n) = elem
+                    && is_const_transmute(asm, &n, transmute_name).is_some()
+                {
+                    targets.insert(n);
                 }
             }
         }

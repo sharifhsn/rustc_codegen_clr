@@ -5,7 +5,6 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dotnet_version="${DOTNET_VERSION:-10}"
-unity_bin="${UNITY_BIN:-}"
 
 if [[ "${1:-}" == "--list" ]]; then
     printf '%s\n' \
@@ -13,12 +12,10 @@ if [[ "${1:-}" == "--list" ]]; then
         "P/Invoke synchronous" \
         "P/Invoke asynchronous callbacks" \
         "P/Invoke policy diagnostics"
-    [[ -n "$unity_bin" ]] && echo "Unity clean project"
-    [[ -n "$unity_bin" ]] || echo "Unity clean project (set UNITY_BIN to enable)"
     exit 0
 fi
 if [[ "${1:-}" != "" ]]; then
-    echo "usage: DOTNET_VERSION=10 [UNITY_BIN=/path/to/Unity] $0 [--list]" >&2
+    echo "usage: DOTNET_VERSION=10 $0 [--list]" >&2
     exit 2
 fi
 
@@ -33,7 +30,4 @@ run_step "e2e managed/native matrix" feasibility/e2e_matrix.sh
 run_step "P/Invoke synchronous" feasibility/pinvoke_acceptance.sh
 run_step "P/Invoke asynchronous callbacks" feasibility/pinvoke_async_callback_acceptance.sh
 run_step "P/Invoke policy diagnostics" feasibility/pinvoke_policy_diagnostics_acceptance.sh
-if [[ -n "$unity_bin" ]]; then
-    run_step "Unity clean project" feasibility/unity_clean_acceptance.sh "$unity_bin"
-fi
-echo "== primetime acceptance passed (Net10 managed, P/Invoke, and optional Unity) =="
+echo "== primetime acceptance passed (.NET 10 managed and P/Invoke) =="

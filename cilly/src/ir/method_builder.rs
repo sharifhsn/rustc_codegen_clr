@@ -44,12 +44,13 @@ impl MethodBuilder<'_> {
     ) -> LocalId {
         let name = name.map(|inner| inner.into_idx(self));
         let tpe = tpe.into_idx(self);
-        let locals = match self.def.implementation_mut() {
-            MethodImpl::MethodBody { locals, .. } | MethodImpl::RegionBody { locals, .. } => locals,
-            _ => panic!(
+        let (MethodImpl::MethodBody { locals, .. } | MethodImpl::RegionBody { locals, .. }) =
+            self.def.implementation_mut()
+        else {
+            panic!(
                 "Attempted to add a local variable a method with an invalid or unresolved body:{:?},",
                 self.def.implementation()
-            ),
+            )
         };
         let new_local = locals.len();
         locals.push((name, tpe));

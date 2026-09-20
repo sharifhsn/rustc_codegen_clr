@@ -72,7 +72,6 @@ impl Exporter for CillyIRExpoter {
                 is_valuetype = def.is_valuetype(),
                 generics = def.generics(),
             )?;
-            // let mut class = crate::class::ClassDef::new();
             writeln!(il_out, "}}")?;
         }
         writeln!(il_out, "}}")?;

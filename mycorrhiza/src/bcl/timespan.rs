@@ -34,7 +34,6 @@
 
 use crate::NativeStorageSafe;
 use crate::intrinsics::RustcCLRInteropManagedStruct;
-use crate::system::MString;
 
 // `System.TimeSpan` physically lives in `System.Private.CoreLib` (it is only type-*forwarded* from
 // `System.Runtime`), so — like `System.String` — method/ctor refs must name the defining assembly,
@@ -216,39 +215,5 @@ impl Default for DotNetTimeSpan {
     }
 }
 
-impl core::fmt::Display for DotNetTimeSpan {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // `TimeSpan.ToString()` yields the invariant `[-][d.]hh:mm:ss[.fffffff]` form.
-        let s =
-            crate::system::DotNetString::from_handle(self.0.vt_instance0::<"ToString", MString>());
-        core::fmt::Display::fmt(&s, f)
-    }
-}
-
-impl core::fmt::Debug for DotNetTimeSpan {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Display::fmt(self, f)
-    }
-}
-
-impl PartialEq for DotNetTimeSpan {
-    #[inline(always)]
-    fn eq(&self, other: &Self) -> bool {
-        self.compare_to(*other) == 0
-    }
-}
-impl Eq for DotNetTimeSpan {}
-
-impl PartialOrd for DotNetTimeSpan {
-    #[inline(always)]
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for DotNetTimeSpan {
-    #[inline(always)]
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        // `CompareTo` already returns the total-order sign, so map it straight onto `Ordering`.
-        self.compare_to(*other).cmp(&0)
-    }
-}
+impl_managed_display_field!(DotNetTimeSpan, 0);
+impl_managed_ordering!(DotNetTimeSpan, compare_to);

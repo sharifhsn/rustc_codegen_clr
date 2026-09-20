@@ -1,3 +1,4 @@
+use super::indirect_binop;
 use crate::{
     Assembly, BasicBlock, BinOp, BranchCond, CILNode, CILRoot, ClassRef, Const, FieldDesc, Int,
     Interned, MethodImpl, MethodRef, Type, asm::MissingMethodPatcher, cilnode::ExtendKind,
@@ -19,25 +20,17 @@ fn op_indirect(
         op = op.name(),
         lhs_type = lhs_type.name()
     ));
-    let generator = move |_, asm: &mut Assembly| {
-        let lhs = asm.alloc_node(CILNode::LdArg(0));
-        let rhs = asm.alloc_node(CILNode::LdArg(1));
-        let class = lhs_type.class(asm);
-        let class = asm[class].clone();
-        let call_op = class.static_mref(
-            &[Type::Int(lhs_type), Type::Int(rhs_type)],
-            ret_type,
-            asm.alloc_string(op.dotnet_name()),
-            asm,
-        );
-        let call = asm.alloc_node(CILNode::call(call_op, [lhs, rhs]));
-        let ret = asm.alloc_root(CILRoot::Ret(call));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
-        }
-    };
-    patcher.insert(name, Box::new(generator));
+    let class = lhs_type.class(asm);
+    let class = asm[class].clone();
+    indirect_binop(
+        patcher,
+        name,
+        class,
+        Type::Int(lhs_type),
+        Type::Int(rhs_type),
+        op,
+        ret_type,
+    );
 }
 pub fn generate_int128_ops(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     const OPS: [BinOp; 8] = [
@@ -76,6 +69,7 @@ pub fn i128_mul_ovf_check(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let rhs = asm.alloc_node(CILNode::LdArg(1));
         let i128_class = ClassRef::int_128(asm);
         let get_zero = asm.alloc_string("get_Zero");
+        let get_min = asm.alloc_string("get_MinValue");
         let op_equality = asm.alloc_string("eq_i128");
         let op_mul = asm.alloc_string("mul_i128");
         let op_div = asm.alloc_string("div_i128");
@@ -84,6 +78,9 @@ pub fn i128_mul_ovf_check(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         let main_module = asm[main_module].clone();
         let const_zero = i128_classref.static_mref(&[], Type::Int(Int::I128), get_zero, asm);
         let const_zero = asm.alloc_node(CILNode::call(const_zero, []));
+        let const_min = i128_classref.static_mref(&[], Type::Int(Int::I128), get_min, asm);
+        let const_min = asm.alloc_node(CILNode::call(const_min, []));
+        let const_neg_one = asm.alloc_node(Const::I128(-1));
         let i128_eq = main_module.static_mref(
             &[Type::Int(Int::I128), Type::Int(Int::I128)],
             Type::Bool,
@@ -112,6 +109,14 @@ pub fn i128_mul_ovf_check(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         // so the rhs==0 fast path must return TRUE (was `Bool(false)` = spuriously "overflow").
         let ret_safe = asm.alloc_node(Const::Bool(true));
         let ret_safe = asm.alloc_root(CILRoot::Ret(ret_safe));
+        // Rust's overflowing multiply must report `(i128::MIN, true)` for MIN * -1.  The
+        // otherwise convenient `(lhs * rhs) / rhs` check cannot represent this case on .NET:
+        // System.Int128 deliberately throws OverflowException for MIN / -1.  Short-circuit the
+        // one exceptional divisor before constructing the division node.
+        let lhs_is_min = asm.alloc_node(CILNode::call(i128_eq, [lhs, const_min]));
+        let rhs_is_neg_one = asm.alloc_node(CILNode::call(i128_eq, [rhs, const_neg_one]));
+        let ret_overflow = asm.alloc_node(Const::Bool(false));
+        let ret_overflow = asm.alloc_root(CILRoot::Ret(ret_overflow));
         let lhs_mul_rhs = asm.alloc_node(CILNode::call(i128_mul, [lhs, rhs]));
         // `(lhs*rhs)/rhs == LHS` iff the multiply did not overflow — compare the div-back to the
         // multiplicand `lhs`, NOT `rhs` (the previous `== rhs` reported overflow for nearly every
@@ -123,7 +128,24 @@ pub fn i128_mul_ovf_check(asm: &mut Assembly, patcher: &mut MissingMethodPatcher
         MethodImpl::MethodBody {
             blocks: vec![
                 BasicBlock::new(vec![jmp_nz, ret_safe], 0, None),
-                BasicBlock::new(vec![ret_ovf], 1, None),
+                BasicBlock::new(
+                    vec![
+                        asm.alloc_root(CILRoot::Branch(Box::new((
+                            1,
+                            2,
+                            Some(BranchCond::False(lhs_is_min)),
+                        )))),
+                        asm.alloc_root(CILRoot::Branch(Box::new((
+                            1,
+                            2,
+                            Some(BranchCond::False(rhs_is_neg_one)),
+                        )))),
+                        ret_overflow,
+                    ],
+                    1,
+                    None,
+                ),
+                BasicBlock::new(vec![ret_ovf], 2, None),
             ],
             locals: vec![],
         }

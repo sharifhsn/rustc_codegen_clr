@@ -35,7 +35,7 @@
 #               under cargo_tests/ OR any external path.
 #   --release   release profile (DEFAULT, per project convention).
 #   --debug     debug profile.
-#   --clean     `cargo clean` first (rebuilds std; bulletproof but slow).
+#   --clean     `cargo clean` first (rebuilds std).
 #   -v          verbose: unfiltered build log.
 #   -- ARGS     (run only) args forwarded to the .NET program; its exit code
 #               propagates back out of this command.
@@ -85,7 +85,7 @@ IMAGE="${RCC_IMAGE:-rcc-dev}"
 # exports this as RUSTUP_TOOLCHAIN so an EXTERNAL crate (which has no rustup
 # dir-override) builds under the right toolchain. Read from the VERSION manifest in
 # CARGO_DOTNET_HOME when installed; fall back to the literal pin.
-CD_TOOLCHAIN_DEFAULT="nightly-2026-06-17"
+CD_TOOLCHAIN_DEFAULT="nightly-2026-09-18"
 
 die(){ echo "cargo dotnet: $*" >&2; exit 1; }
 

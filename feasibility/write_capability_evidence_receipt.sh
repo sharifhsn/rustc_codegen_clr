@@ -158,7 +158,7 @@ jq -n \
     --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg sha "$sha" \
     --argjson dirty "$dirty" \
-    --arg rustc "$(rustc +nightly-2026-06-17 --version 2>&1 || true)" \
+    --arg rustc "$(rustc +nightly-2026-09-18 --version 2>&1 || true)" \
     --arg dotnet "$(dotnet --version 2>&1 || true)" \
     --arg host_os "$(uname -s)" \
     --arg host_arch "$(uname -m)" \

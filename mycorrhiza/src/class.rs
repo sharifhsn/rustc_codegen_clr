@@ -119,7 +119,6 @@ impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str> Class<ASSEMBL
                 .instance2::<NAME, Arg, Arg2, SigRet>(arg.into_managed(), arg2.into_managed()),
         )
     }
-    //pub fn to_mstring(&self)->
 }
 impl<const ASSEMBLY: &'static str, const CLASS_PATH: &'static str> Drop
     for Class<ASSEMBLY, CLASS_PATH>

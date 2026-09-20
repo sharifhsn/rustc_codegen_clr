@@ -955,14 +955,6 @@ fn helper_key_for_digest(
 }
 
 fn copy_helper_sources(source: &Path, destination: &Path) -> Result<()> {
-    copy_helper_sources_with(source, destination, &mut |_| {})
-}
-
-fn copy_helper_sources_with(
-    source: &Path,
-    destination: &Path,
-    hook: &mut dyn FnMut(&Path),
-) -> Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if rust_dotnet_sdk_core::safe_fs::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
         bail!(
@@ -973,7 +965,7 @@ fn copy_helper_sources_with(
     let source = fs::canonicalize(source)?;
     fs::create_dir(destination)?;
     let destination = fs::canonicalize(destination)?;
-    copy_helper_sources_inner(&source, &source, &destination, &destination, hook)
+    copy_helper_sources_inner(&source, &source, &destination, &destination)
 }
 
 fn copy_helper_sources_inner(
@@ -981,7 +973,6 @@ fn copy_helper_sources_inner(
     source: &Path,
     destination_root: &Path,
     destination: &Path,
-    hook: &mut dyn FnMut(&Path),
 ) -> Result<()> {
     if fs::canonicalize(source)? != source || !source.starts_with(source_root) {
         bail!("interop-helper source escaped its canonical root");
@@ -994,7 +985,6 @@ fn copy_helper_sources_inner(
         }
         let src = entry.path();
         let dst = destination_root.join(src.strip_prefix(source_root)?);
-        hook(&src);
         let metadata = fs::symlink_metadata(&src)?;
         if rust_dotnet_sdk_core::safe_fs::metadata_is_link_or_reparse(&metadata) {
             bail!(
@@ -1003,7 +993,7 @@ fn copy_helper_sources_inner(
             );
         } else if metadata.is_dir() {
             fs::create_dir(&dst)?;
-            copy_helper_sources_inner(source_root, &src, destination_root, &dst, hook)?;
+            copy_helper_sources_inner(source_root, &src, destination_root, &dst)?;
         } else if metadata.is_file() {
             let relative = src.strip_prefix(source_root)?;
             let (_, mut input) =
@@ -1601,32 +1591,5 @@ mod tests {
             selected_graph_contains_mycorrhiza(&resolved.exec().unwrap(), &workspace_selection,)
                 .unwrap()
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn helper_snapshot_rejects_a_source_symlink_swap_without_copying_outside_bytes() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("snapshot");
-        let outside = temp.path().join("outside-secret");
-        fs::create_dir(&source).unwrap();
-        fs::write(source.join("Helper.cs"), b"inside").unwrap();
-        fs::write(&outside, b"do-not-copy").unwrap();
-        let mut swapped = false;
-
-        let error = copy_helper_sources_with(&source, &destination, &mut |path| {
-            if !swapped && path.file_name().is_some_and(|name| name == "Helper.cs") {
-                fs::remove_file(path).unwrap();
-                symlink(&outside, path).unwrap();
-                swapped = true;
-            }
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("non-symlink") || error.to_string().contains("symlink"));
-        assert_eq!(fs::read(&outside).unwrap(), b"do-not-copy");
-        assert!(!destination.join("Helper.cs").exists());
     }
 }

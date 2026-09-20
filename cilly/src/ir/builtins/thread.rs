@@ -158,25 +158,15 @@ fn insert_pthread_attr_init(asm: &mut Assembly, patcher: &mut MissingMethodPatch
     patcher.insert(name, Box::new(generator));
 }
 
-fn insert_pthread_self(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("pthread_self");
+fn insert_pthread_success_stub(
+    asm: &mut Assembly,
+    patcher: &mut MissingMethodPatcher,
+    fn_name: &str,
+) {
+    let name = asm.alloc_string(fn_name);
     let generator = move |_, asm: &mut Assembly| {
-        // This is incorrect. pthread_self ought to return the thread id.
-        let const_0 = asm.alloc_node(Const::I32(0));
-        let ret = asm.alloc_root(CILRoot::Ret(const_0));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
-        }
-    };
-    patcher.insert(name, Box::new(generator));
-}
-fn insert_pthread_setname_np(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("pthread_setname_np");
-    let generator = move |_, asm: &mut Assembly| {
-        // This is incorrect. pthread_setname_np should set the thread name.
-        let const_0 = asm.alloc_node(Const::I32(0));
-        let ret = asm.alloc_root(CILRoot::Ret(const_0));
+        let zero = asm.alloc_node(Const::I32(0));
+        let ret = asm.alloc_root(CILRoot::Ret(zero));
         MethodImpl::MethodBody {
             blocks: vec![BasicBlock::new(vec![ret], 0, None)],
             locals: vec![],
@@ -185,32 +175,7 @@ fn insert_pthread_setname_np(asm: &mut Assembly, patcher: &mut MissingMethodPatc
     patcher.insert(name, Box::new(generator));
 }
 
-fn insert_pthread_attr_destroy(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("pthread_attr_destroy");
-    let generator = move |_, asm: &mut Assembly| {
-        let const_0 = asm.alloc_node(Const::I32(0));
-        let ret = asm.alloc_root(CILRoot::Ret(const_0));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
-            locals: vec![],
-        }
-    };
-    patcher.insert(name, Box::new(generator));
-}
 // TODO: impl detach
-fn insert_pthread_detach(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let fn_name = asm.alloc_string("pthread_detach");
-    let generator = move |_, asm: &mut Assembly| {
-        // Return 0 to signal success.
-        let const_0 = asm.alloc_node(Const::I32(0));
-        let ret_0 = asm.alloc_root(CILRoot::Ret(const_0));
-        MethodImpl::MethodBody {
-            blocks: vec![BasicBlock::new(vec![ret_0], 0, None)],
-            locals: vec![],
-        }
-    };
-    patcher.insert(fn_name, Box::new(generator));
-}
 fn insert_pthread_join(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let fn_name = asm.alloc_string("pthread_join");
     let generator = move |_, asm: &mut Assembly| {
@@ -426,10 +391,10 @@ pub fn instert_threading(asm: &mut Assembly, patcher: &mut MissingMethodPatcher)
     insert_pthread_attr_setstacksize(asm, patcher);
     insert_pthread_create(asm, patcher);
     insert_pthread_join(asm, patcher);
-    insert_pthread_detach(asm, patcher);
-    insert_pthread_self(asm, patcher);
-    insert_pthread_attr_destroy(asm, patcher);
-    insert_pthread_setname_np(asm, patcher);
+    insert_pthread_success_stub(asm, patcher, "pthread_detach");
+    insert_pthread_success_stub(asm, patcher, "pthread_self");
+    insert_pthread_success_stub(asm, patcher, "pthread_attr_destroy");
+    insert_pthread_success_stub(asm, patcher, "pthread_setname_np");
     insert_pthread_key_delete(asm, patcher);
     let main_mod = asm.main_module();
     asm.add_static(
@@ -631,22 +596,26 @@ const PTHREAD_KEY_T: Int = Int::I32;
 fn thread_key_dict(asm: &mut Assembly) -> Interned<ClassRef> {
     ClassRef::dictionary(Type::Int(PTHREAD_KEY_T), Type::Int(Int::ISize), asm)
 }
+fn pthread_keys(asm: &mut Assembly) -> Interned<CILNode> {
+    let main_mod = *asm.main_module();
+    let thread_key_dict = thread_key_dict(asm);
+    let name = asm.alloc_string("pthread_keys");
+    let field = asm.alloc_sfld(StaticFieldDesc::new(
+        main_mod,
+        name,
+        Type::ClassRef(thread_key_dict),
+    ));
+    asm.alloc_node(CILNode::LdStaticField(field))
+}
 fn insert_pthread_setspecific(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("pthread_setspecific");
     let generator = move |_, asm: &mut Assembly| {
-        let main_mod = *asm.main_module();
         let const_0 = asm.alloc_node(Const::I32(0));
         let ret = asm.alloc_root(CILRoot::Ret(const_0));
 
         // Insert a new key into the dict.
         let thread_key_dict = thread_key_dict(asm);
-        let pthread_keys = asm.alloc_string("pthread_keys");
-        let pthread_keys_static = asm.alloc_sfld(StaticFieldDesc::new(
-            main_mod,
-            pthread_keys,
-            Type::ClassRef(thread_key_dict),
-        ));
-        let pthread_keys = asm.alloc_node(CILNode::LdStaticField(pthread_keys_static));
+        let pthread_keys = pthread_keys(asm);
 
         let set_item = asm.alloc_string("set_Item");
         let dict_add = asm[thread_key_dict].clone().virtual_mref(
@@ -673,9 +642,9 @@ fn insert_pthread_setspecific(asm: &mut Assembly, patcher: &mut MissingMethodPat
 fn insert_pthread_key_create(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("pthread_key_create");
     let generator = move |_, asm: &mut Assembly| {
-        let main_mod = *asm.main_module();
         let const_0 = asm.alloc_node(Const::I32(0));
         let ret = asm.alloc_root(CILRoot::Ret(const_0));
+        let main_mod = *asm.main_module();
         let last_val = asm.alloc_string("last_val");
         let last_val_static = StaticFieldDesc::new(main_mod, last_val, Type::Int(PTHREAD_KEY_T));
         let last_val_static = asm.alloc_sfld(last_val_static);
@@ -688,13 +657,7 @@ fn insert_pthread_key_create(asm: &mut Assembly, patcher: &mut MissingMethodPatc
         let increment_val = asm.alloc_root(CILRoot::StLoc(0, incremented));
         // Insert a new key into the dict.
         let thread_key_dict = thread_key_dict(asm);
-        let pthread_keys = asm.alloc_string("pthread_keys");
-        let pthread_keys_static = asm.alloc_sfld(StaticFieldDesc::new(
-            main_mod,
-            pthread_keys,
-            Type::ClassRef(thread_key_dict),
-        ));
-        let pthread_keys = asm.alloc_node(CILNode::LdStaticField(pthread_keys_static));
+        let pthread_keys = pthread_keys(asm);
         let zero_isize = asm.alloc_node(Const::ISize(0));
         let loc_0 = asm.alloc_node(CILNode::LdLoc(0));
         let add_name = asm.alloc_string("set_Item");
@@ -732,17 +695,10 @@ fn insert_pthread_key_create(asm: &mut Assembly, patcher: &mut MissingMethodPatc
 fn insert_pthread_key_delete(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
     let name = asm.alloc_string("pthread_key_delete");
     let generator = move |_, asm: &mut Assembly| {
-        let main_mod = *asm.main_module();
         let const_0 = asm.alloc_node(Const::I32(0));
         let ret = asm.alloc_root(CILRoot::Ret(const_0));
         let thread_key_dict = thread_key_dict(asm);
-        let pthread_keys = asm.alloc_string("pthread_keys");
-        let pthread_keys_static = asm.alloc_sfld(StaticFieldDesc::new(
-            main_mod,
-            pthread_keys,
-            Type::ClassRef(thread_key_dict),
-        ));
-        let pthread_keys = asm.alloc_node(CILNode::LdStaticField(pthread_keys_static));
+        let pthread_keys = pthread_keys(asm);
         let arg_0 = asm.alloc_node(CILNode::LdArg(0));
         let add_name = asm.alloc_string("Remove");
         let dict_rem = asm[thread_key_dict].clone().virtual_mref(

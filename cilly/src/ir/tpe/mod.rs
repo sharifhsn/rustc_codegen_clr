@@ -41,8 +41,10 @@ impl Type {
         match self {
             Type::ClassRef(c) => !asm[*c].is_valuetype(),
             // Conservatively assume all C# generic. *could* be GC refs.
-            Type::PlatformGeneric(_, _) => true,
-            Type::PlatformArray { .. } | Type::PlatformObject | Type::PlatformString => true,
+            Type::PlatformGeneric(_, _)
+            | Type::PlatformArray { .. }
+            | Type::PlatformObject
+            | Type::PlatformString => true,
             Type::Int(_)
             | Type::Float(_)
             | Type::Bool
@@ -259,8 +261,6 @@ impl Type {
             return true;
         }
         match (*self, to) {
-            (Type::PlatformString, Type::PlatformObject) => true,
-            (Type::PlatformArray { .. }, Type::PlatformObject) => true,
             (Type::ClassRef(cref), Type::PlatformObject) => {
                 let cref = asm.class_ref(cref);
                 !cref.is_valuetype()
@@ -305,7 +305,6 @@ impl Type {
             | (Type::ClassRef(cref), Type::SIMDVector(vector)) => {
                 Self::simd_class_eq(vector, cref, asm)
             }
-            (Type::Int(Int::U16 | Int::I16), Type::PlatformChar) => true,
             // A pointer/byref whose pointee is a generic marker `!N` is mutually assignable with a
             // pointer/byref of the concrete type `!N` binds to — e.g. `Span<T>.get_Item(int)` returns
             // `!0&`, produced into a Rust `*mut T` local. ONLY a *marker* pointee is loosened here (a
@@ -364,7 +363,12 @@ impl Type {
             // codegen unless every `!N` provably resolves (via the concrete class generics) to exactly
             // the runtime type it is paired with. So a `!N` value here is *guaranteed* to equal its
             // concrete binding; accepting the pair cannot mask a real mismatch.
-            (_, Type::PlatformGeneric(_, _)) | (Type::PlatformGeneric(_, _), _) => true,
+            // Unconditional representation bridges: managed references and generic markers can
+            // cross these boundaries after the caller has validated the concrete shape.
+            (Type::PlatformString | Type::PlatformArray { .. }, Type::PlatformObject)
+            | (Type::Int(Int::U16 | Int::I16), Type::PlatformChar)
+            | (_, Type::PlatformGeneric(_, _))
+            | (Type::PlatformGeneric(_, _), _) => true,
             // Two instantiations of the SAME open generic type are mutually assignable when their
             // type arguments are pairwise assignable. This is what lets a *definition-shape*
             // nested-generic methodref signature — `Dictionary<K,V>.KeyCollection<!0,!1>`,

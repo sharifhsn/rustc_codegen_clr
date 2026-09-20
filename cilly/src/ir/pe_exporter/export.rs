@@ -9,8 +9,9 @@
 //! assembly this milestone exercises.
 //!
 //! The exporter fails before emission when an unsupported structural boundary is reached,
-//! including the `MainModule` method-count limit and invalid generic metadata. This keeps
-//! malformed images out of the linker and gives callers an actionable error.
+//! including invalid generic metadata. Oversized synthetic `MainModule` definitions are split
+//! into private carrier types before method bodies are assembled, so the CLR method-table limit
+//! does not become a workload-dependent failure.
 use super::body::{self, AssembledBody};
 use super::pe::{self, PeOptions};
 use super::sig;
@@ -255,6 +256,15 @@ pub(crate) fn export_pe_with_source_link(
     // in the PE and must be stable for byte-reproducible NuGet packages.
     let mut class_def_ids: Vec<_> = asm.iter_class_def_ids().copied().collect();
     class_def_ids.sort_unstable_by_key(|id| asm[asm[*id].name()].to_string());
+    let main_module_id = asm.main_module();
+    let main_module_method_count = asm[main_module_id].methods().len();
+    let main_module_partition_count = main_module_method_count
+        .max(1)
+        .div_ceil(super::MAIN_MODULE_METHOD_PARTITION_SIZE);
+    // The first owner is the real MainModule TypeDef. Additional owners are
+    // metadata-only implementation carriers inserted immediately after it so
+    // MethodList run-start ranges remain contiguous and deterministic.
+    let mut main_module_partition_tokens = Vec::with_capacity(main_module_partition_count);
 
     // Rust layout lowering occasionally addresses an explicit-layout storage wrapper through a
     // typed alias at offset zero. CoreCLR/Mono resolve that MemberRef by its explicit offset, but
@@ -400,7 +410,7 @@ pub(crate) fn export_pe_with_source_link(
         } else {
             &raw_name
         };
-        let (namespace, name) = super::tables::split_namespace(&raw_name);
+        let (namespace, name) = super::tables::split_namespace(raw_name);
         let tok = mb.add_type_def(
             namespace,
             name,
@@ -431,6 +441,26 @@ pub(crate) fn export_pe_with_source_link(
             );
         }
         type_def_token_of.insert(class_def_id, tok);
+        if class_def_id == main_module_id {
+            main_module_partition_tokens.push(tok);
+            if main_module_partition_count > 1 {
+                let raw_name = asm[class_def.name()].to_string();
+                let raw_name = options
+                    .public_module_full_name
+                    .as_deref()
+                    .unwrap_or(&raw_name);
+                for partition in 1..main_module_partition_count {
+                    let partition_name =
+                        format!("{raw_name}.__rcl_main_module_partition_{partition}");
+                    let (namespace, name) = super::tables::split_namespace(&partition_name);
+                    let extends = system_runtime_type_ref(&mut mb, "System.Object");
+                    let partition_tok =
+                        mb.add_type_def(namespace, name, false, Some(extends), None, None, &[]);
+                    mb.set_type_def_access(partition_tok, crate::Access::Private);
+                    main_module_partition_tokens.push(partition_tok);
+                }
+            }
+        }
     }
 
     // --- Pass 1.5: `implements I1, I2, …` (§II.22.23 `InterfaceImpl`) for every class def,
@@ -519,15 +549,6 @@ pub(crate) fn export_pe_with_source_link(
     // for method bodies.
     let mut pending_field_rva: Vec<(Token, Vec<u8>)> = Vec::new();
 
-    // `asm.main_module()` is idempotent (returns the existing class def if one was already
-    // registered — which it always is by this point, since `body.rs::const_blob_field_token` can
-    // only have been reachable from a method body Pass 3/4 below will assemble, and every such
-    // body lives in a class def already walked by Pass 1); this just re-fetches the same
-    // `ClassDefIdx` `il_exporter`'s equivalent lookup finds via `asm[cd.name()] ==
-    // *super::asm::MAIN_MODULE` (mod.rs:135). Computed once, outside the loop below, so the
-    // per-class-def comparison inside it is cheap.
-    let main_module_id = asm.main_module();
-
     // --- Pass 2: fields (instance + static), matching `il_exporter`'s per-class field loop
     // (§II.22.15/§II.22.18). Const-data `FieldRVA` static fields (`c_{encode(idx)}`, typed to the
     // `__rcl_const_blob_N` carrier TypeDefs Pass 0 already added) are threaded into THIS SAME
@@ -548,29 +569,18 @@ pub(crate) fn export_pe_with_source_link(
         // with zero fields — the run-start still marks the correct boundary for its neighbors.
         mb.set_type_def_field_list(type_def_token_of[&class_def_id]);
         if let Some(enum_def) = class_def.enum_def() {
-            let mut underlying_sig = Vec::new();
-            sig::encode_field_sig(
-                Type::Int(enum_def.underlying()),
-                asm,
-                &mut mb,
-                &mut underlying_sig,
-            );
-            let underlying_sig = mb.blobs.intern(&underlying_sig);
+            let underlying_sig = field_signature(asm, &mut mb, Type::Int(enum_def.underlying()));
             mb.add_enum_value_field(underlying_sig);
 
             let enum_cref = asm.alloc_class_ref(class_def.ref_to());
-            let mut enum_sig = Vec::new();
-            sig::encode_field_sig(Type::ClassRef(enum_cref), asm, &mut mb, &mut enum_sig);
-            let enum_sig = mb.blobs.intern(&enum_sig);
+            let enum_sig = field_signature(asm, &mut mb, Type::ClassRef(enum_cref));
             for (name, value) in enum_def.variants() {
                 mb.add_enum_literal_field(&asm[*name], enum_sig, *value);
             }
         }
         for &(tpe, name, offset) in class_def.fields() {
             let name_str = asm[name].to_string();
-            let mut blob = Vec::new();
-            sig::encode_field_sig(tpe, asm, &mut mb, &mut blob);
-            let sig_off = mb.blobs.intern(&blob);
+            let sig_off = field_signature(asm, &mut mb, tpe);
             let field = mb.add_field(&name_str, sig_off, offset);
             for attribute in class_def.field_custom_attributes(name, false) {
                 mb.add_custom_attribute(asm, field, attribute);
@@ -578,9 +588,7 @@ pub(crate) fn export_pe_with_source_link(
         }
         if let Some(aliases) = unity_field_aliases.get(&class_def_id) {
             for &(tpe, name) in aliases {
-                let mut blob = Vec::new();
-                sig::encode_field_sig(tpe, asm, &mut mb, &mut blob);
-                let sig_off = mb.blobs.intern(&blob);
+                let sig_off = field_signature(asm, &mut mb, tpe);
                 mb.add_field(&asm[name], sig_off, Some(0));
             }
         }
@@ -593,9 +601,7 @@ pub(crate) fn export_pe_with_source_link(
         } in class_def.static_fields()
         {
             let name_str = asm[*name].to_string();
-            let mut blob = Vec::new();
-            sig::encode_field_sig(*tpe, asm, &mut mb, &mut blob);
-            let sig_off = mb.blobs.intern(&blob);
+            let sig_off = field_signature(asm, &mut mb, *tpe);
             let field = match default_value {
                 // No RVA data needed — the common case (`static mut`-shaped fields with no
                 // compile-time initializer).
@@ -684,13 +690,23 @@ pub(crate) fn export_pe_with_source_link(
                 pending_field_rva.push((tok, bytes));
             }
         }
+        // Partition carrier types are inserted immediately after MainModule in
+        // the TypeDef table but have no fields of their own. Stamp their empty
+        // FieldList ranges after MainModule's fields so the next real class's
+        // fields are not attributed to a synthetic carrier (or to an invalid
+        // row before MainModule's own fields).
+        if class_def_id == main_module_id && main_module_partition_tokens.len() > 1 {
+            for &partition_token in main_module_partition_tokens.iter().skip(1) {
+                mb.set_type_def_field_list(partition_token);
+            }
+        }
     }
 
     // --- Pass 3: methods. Every class def's methods, in insertion order, matching
-    // `il_exporter::export_to_write`'s per-class method loop (the unpartitioned path only — the
-    // `MainModule`-overflow partition split is a documented, deliberately-deferred gap, see the
-    // module doc's "Phase 1b additions" section). `validate_for_pe` rejects an over-large module
-    // before this byte writer is entered.
+    // `il_exporter::export_to_write`'s per-class method loop. An oversized
+    // synthetic `MainModule` is split into deterministic internal carrier
+    // TypeDefs; MethodDef identity stays keyed by the original IR index, so
+    // all in-assembly call/ldftn tokens remain valid without rewriting bodies.
     let ordered_methods: std::collections::HashMap<_, Vec<_>> = class_def_ids
         .iter()
         .map(|&class_id| {
@@ -701,261 +717,290 @@ pub(crate) fn export_pe_with_source_link(
         .collect();
     let mut entry_point_token: Option<Token> = None;
     for &class_def_id in &class_def_ids {
-        // Same run-start re-stamp as Pass 2's `set_type_def_field_list`, for `MethodList`
-        // instead of `FieldList` — see Pass 1's doc comment; `add_method`'s own doc documents
-        // the identical "most recently added TypeDef" assumption this call satisfies.
-        mb.set_type_def_method_list(type_def_token_of[&class_def_id]);
-        for &method_id in &ordered_methods[&class_def_id] {
-            let method = asm[method_id].clone();
-            let name = asm[method.name()].to_string();
-            let sig = asm[method.sig()].clone();
-            let is_static = method.kind() == crate::ir::cilnode::MethodKind::Static;
-            let is_virtual = method.kind() == crate::ir::cilnode::MethodKind::Virtual;
-            // `SpecialName | RTSpecialName` (§II.22.26, §II.10.5.3) is what makes the CLR loader
-            // recognize a type initializer and run it automatically before first access to any of
-            // the type's static members. `MethodKind::Constructor` (instance `.ctor`) is the usual
-            // source, but the assembly-wide static initializer built by `Assembly::cctor()`
-            // (cilly/src/ir/asm.rs) is a *`MethodKind::Static`* method literally named `.cctor` —
-            // `il_exporter`'s emitted `.il` text for it has NO `specialname`/`rtspecialname`
-            // keywords either (verified against the actual `.il` ilasm consumes), yet the ilasm-built
-            // assembly's `.cctor` carries those flags in its metadata: MS ilasm auto-recognizes the
-            // reserved name `.cctor` (and `.ctor`) and stamps the flags in regardless of what the
-            // source text asked for (ECMA-335 §II.10.5.3 requires this at the class-file-format
-            // level: a type initializer method MUST be `.cctor`/rtspecialname to be auto-invoked; it
-            // is one of the two runtime-reserved names, `.ctor`/`.cctor`). A hand-rolled writer gets
-            // no such assembler-side auto-detection, so it must special-case the reserved name here.
-            // Without this, the CLR never runs `.cctor` (it just looks like an ordinary unreferenced
-            // static method) and every static/const-data/vtable initializer inside it is skipped —
-            // every static field (including `dyn Trait` vtable slots, which are populated by
-            // `ldftn`/`StInd` writes INSIDE `.cctor`, not `FieldRVA` data) stays zeroed, and the
-            // first virtual dispatch through such a vtable calls a null function pointer (SIGSEGV,
-            // no managed exception — this is exactly the residual cd_collections crash: a `blr` to
-            // a zeroed vtable slot loaded from an uninitialized `dyn Trait` fat-pointer vtable
-            // static).
-            let is_ctor = method.kind() == crate::ir::cilnode::MethodKind::Constructor
-                || name == crate::ir::asm::CCTOR;
-            // An explicit ECMA-335 `.override` (`MethodDef::with_override`, e.g. via
-            // `#[dotnet_override]`) is emitted as a `MethodImpl` row (§II.22.27) after this
-            // method's own `MethodDef` token exists — captured here, added below once `add_method`
-            // has returned the overriding method's token. Distinct from ordinary name+signature
-            // virtual binding: it lands the body in the base's exact vtable slot.
-            let override_base = method.overrides();
-            // An abstract member (`MethodDef::is_abstract`, e.g. an interface method) is emitted
-            // with the `Abstract` flag (0x400) and RVA=0 (no body), applied below after
-            // `add_method`. Its `implementation()` is only an inert `MethodImpl::Missing`
-            // placeholder (see that field's doc) which Pass 4 must NEVER assemble a body from.
-            let is_abstract = method.is_abstract();
-            // Resolve `MethodImpl::AliasFor` chains before deciding P/Invoke-ness — mirrors
-            // `il_exporter`'s `method.resolved_implementation(asm_mut)` (mod.rs:477) and
-            // `body.rs`'s own `resolved_implementation` call (the single source of truth for
-            // whether a method has a real body). Using the RAW, unresolved `method.implementation()`
-            // here was a real bug: for a method whose OWN `MethodImpl` is `AliasFor(target)`, the
-            // raw match falls through to `_ => None` regardless of what `target` resolves to, so a
-            // method aliasing an unpatched `MethodImpl::Extern` stub got emitted with NORMAL
-            // (non-abstract, non-PInvoke) `MethodDef` flags — while `body.rs` correctly resolved the
-            // alias, found no body to assemble, and left `RVA = 0`. §II.22.26 requires RVA == 0 ONLY
-            // for abstract/PInvoke/runtime-supplied methods; a "normal" method with RVA == 0 is
-            // exactly the malformed shape CoreCLR's native type loader rejects as `TypeLoadException:
-            // Abstract method with non-zero RVA` (the message is misleading — the real defect is a
-            // *zero*-RVA method not flagged abstract/PInvoke, not a nonzero-RVA abstract method;
-            // reproduced by the `pal_threads`/`cd_interop`-adjacent `rcl_dotnet_thread_spawn` P/Invoke
-            // hook, whose aliasing wrapper hit this exact path with `codegen-units = 1`, which changes
-            // whether the alias or its target gets visited first by `patch_missing_methods`).
-            let pinvoke_owned = match method.resolved_implementation(asm) {
-                crate::ir::MethodImpl::Extern {
-                    lib,
-                    entry_point,
-                    call_conv,
-                    preserve_errno,
-                } => Some((
-                    asm[*lib].to_string(),
-                    entry_point.map(|name| asm[name].to_string()),
-                    *call_conv,
-                    *preserve_errno,
-                )),
-                _ => None,
-            };
-            let mut blob = Vec::new();
-            // Generic method DEFINITION (`MethodDef::generic_params`, e.g. `T Echo<T>(T value)`
-            // on a `#[dotnet_interface]`): the declared type-parameter names. Non-empty means
-            // (a) the signature blob carries `SIG_GENERIC` + a compressed `GenParamCount`
-            // (§II.23.2.1 — `encode_method_sig`'s own debug_assert ties the two), and (b) one
-            // method-owned `GenericParam` row per name is emitted after `add_method` returns the
-            // owner token below. A different axis from a call SITE's instantiation
-            // (`MethodRef::generics` -> `MethodSpec`, handled in `method_token`).
-            let generic_names = method.generic_params();
-            let generic_count =
-                u32::try_from(generic_names.len()).expect("generic-method arity over u32");
-            let mut convention = if is_static {
-                sig::SIG_DEFAULT
-            } else {
-                sig::SIG_HASTHIS
-            };
-            if generic_count > 0 {
-                convention |= sig::SIG_GENERIC;
-            }
-            // `sig.inputs()` carries the IMPLICIT receiver (`this`) at index 0 for every
-            // non-static kind (Instance/Virtual/Constructor) — matches `method.arg_names()`'s
-            // "parallel to the FULL sig.inputs()" contract documented just below, and
-            // `il_exporter`'s own `&sig.inputs()[1..]` skip at every one of its instance-method
-            // signature-rendering sites (mod.rs:436/796/1068/1337 — the semantic oracle). A
-            // `HASTHIS` `MethodDefSig`/`MethodRefSig` (§II.23.2.1) encodes the receiver
-            // IMPLICITLY via the calling-convention byte alone — writing it out AGAIN as
-            // parameter #0 doubles it, producing a `Method not found` at every call site
-            // (regression caught wiring `DIRECT_PE=1`: a generic ctor's `MemberRef` signature
-            // came out as `.ctor(Dictionary\`2<…>)` instead of `.ctor()`, the receiver type
-            // itself masquerading as a real argument).
-            let encode_sig = if is_static {
-                sig.clone()
-            } else {
-                crate::ir::FnSig::new(sig.inputs()[1..].to_vec(), *sig.output())
-            };
-            // `SignatureOnlyResolver`, not `&mut mb` directly: this is the method's OWN declared
-            // signature (C#-visible metadata a separately-compiled consumer resolves a call
-            // against), the exact analog of `il_exporter`'s `type_il_signature` split at its
-            // `.method` header line — see that resolver's doc for why every other
-            // `TypeDefOrRefResolver` call site in this exporter (bodies, `extends`, `calli`,
-            // fields) must stay on the shared, impl-assembly-qualified `MetadataBuilder` path.
-            // `validate_for_pe` has already checked every nested `!N`/`!!N` against this
-            // method/type's owning generic arity, including non-generic methods on generic types.
-            sig::encode_method_sig(
-                convention,
-                generic_count,
-                &encode_sig,
-                asm,
-                &mut SignatureOnlyResolver { mb: &mut mb },
-                &mut blob,
-            );
-            let sig_off = mb.blobs.intern(&blob);
-            // Named `Param` rows: `method.arg_names()` is parallel to the FULL `sig.inputs()`
-            // (including the implicit `this` slot at index 0 for instance/virtual/ctor kinds), but
-            // `Param` rows are only emitted for the ARGUMENTS a caller actually writes — mirrors
-            // `il_exporter::export_to_write`'s `inputs.iter().zip(method.arg_names())` (mod.rs:439-441),
-            // where `inputs` is already sliced to `&sig.inputs()[1..]` for non-static kinds and
-            // `.zip()` silently truncates `arg_names` to match. No tables.rs change needed —
-            // `add_method` already accepts `&[Option<&str>]` and pushes one Param row per entry.
-            let skip = usize::from(!is_static);
-            let arg_names = method.arg_names();
-            debug_assert_eq!(
-                arg_names.len(),
-                sig.inputs().len(),
-                "arg_names must be parallel to sig.inputs()"
-            );
-            let param_names: Vec<Option<&str>> = arg_names[skip.min(arg_names.len())..]
-                .iter()
-                .map(|n| n.map(|interned| &asm[interned]))
-                .collect();
-            let pinvoke_ref =
-                pinvoke_owned
-                    .as_ref()
-                    .map(|(lib, entry_point, call_conv, preserve)| {
-                        (lib.as_str(), entry_point.as_deref(), *call_conv, *preserve)
-                    });
-            // Mirrors `il_exporter`'s `aggressiveinlining` JIT hint (mod.rs:455-469): small leaf
-            // bodies (e.g. the `cast_f64_u32`-style saturating float->int cast helpers
-            // `cilly::ir::builtins::casts` synthesizes, or monomorphized closure/iterator-adapter
-            // wrappers) get `MethodImplAttributes.AggressiveInlining` so RyuJIT inlines the
-            // per-call overhead out of hot callers. Heuristic shared with `il_exporter` via
-            // `MethodImpl::should_hint_aggressive_inline` (see that method's doc — this is the
-            // exact call-free/block-count/root-count shape empirically confirmed to get RyuJIT to
-            // inline a small branchy leaf) so the two exporters can't drift out of parity on this
-            // again. `PDB_FRAMES=1` suppresses it, same as `il_exporter`, so debug/PDB runs keep
-            // these frames visible. Pure JIT hint — cannot affect correctness (verified: no
-            // typecheck/codegen semantics change).
-            let aggressive_inline = !*crate::PDB_FRAMES
-                && method
-                    .resolved_implementation(asm)
-                    .should_hint_aggressive_inline(asm);
-            // `[out]` Param flags (`MethodDef::out_params`, from `#[dotnet_out]`): 1-based
-            // Sequence numbers among the receiver-stripped `param_names`, exactly the numbering
-            // `add_method`'s Param-row loop uses — no re-indexing needed.
-            // Unity 6's netstandard2.1 profile does not expose the compiler-only
-            // Nullable{Context}Attribute types to its bundled Mono loader. The annotations carry
-            // no runtime semantics, so omit them for this profile while preserving the actual
-            // reference/Nullable<T> signatures. Emitting them makes Unity reject the entire
-            // assembly before any game code runs.
-            let nullability = (options.runtime != DotnetRuntime::UnityNetStandard21)
-                .then(|| method.nullable_context())
-                .flatten()
-                .map(|context| {
-                    debug_assert_eq!(
-                        method.param_nullability().len(),
-                        param_names.len(),
-                        "nullable flags must be parallel to receiver-stripped Param rows"
-                    );
-                    MethodNullability {
-                        context,
-                        return_flag: method.return_nullability(),
-                        parameter_flags: method.param_nullability(),
-                    }
-                });
-            let tok = mb.add_method_with_access(
-                &name,
-                *method.access(),
-                sig_off,
-                &param_names,
-                method.out_params(),
-                is_static,
-                is_virtual,
-                is_ctor,
-                pinvoke_ref,
-                aggressive_inline,
-                nullability,
-            );
-            mb.add_method_custom_attributes(
-                asm,
-                tok,
-                method.custom_attributes(),
-                method.return_custom_attributes(),
-                method.param_custom_attributes(),
-            );
-            mb.register_method_def(method_id, tok);
-            // One method-owned `GenericParam` row (§II.22.20, coded `TypeOrMethodDef` owner tag
-            // 1 = MethodDef) per declared parameter name, in declaration order — the METHOD
-            // analogue of Pass 1's type-owned rows for `ClassDef::generic_names`. Deterministic:
-            // `generic_params` is a `Vec` iterated inside the `class_def_ids` loop;
-            // `write_generic_param_rows` re-sorts by (coded Owner, Number) at serialize time as
-            // §II.24.2.6 requires.
-            for (i, name_id) in generic_names.iter().enumerate() {
-                mb.add_generic_param(
-                    tok,
-                    u16::try_from(i).expect("generic-method arity over u16"),
-                    &asm[*name_id],
-                );
-            }
-            // Abstract interface member (§II.22.26): stamp `Abstract`, leave RVA=0 (Pass 4 skips
-            // its body). An INSTANCE abstract: `add_method` already set `Virtual | NewSlot` since
-            // `is_virtual` is true. A STATIC abstract (.NET 7+ static virtual interface member,
-            // `MethodKind::Static` + `is_abstract`): `add_method` set `Public | Static` only, and
-            // `mark_method_static_abstract` adds `Virtual | HideBySig | Abstract` WITHOUT
-            // `NewSlot` — byte-matching Roslyn's own `0x4D6` emission (see that fn's doc).
-            if is_abstract {
-                if is_static {
-                    mb.mark_method_static_abstract(tok);
+        let method_groups: Vec<(Token, Vec<MethodDefIdx>)> = if class_def_id == main_module_id {
+            ordered_methods[&class_def_id]
+                .chunks(super::MAIN_MODULE_METHOD_PARTITION_SIZE)
+                .enumerate()
+                .map(|(partition, methods)| {
+                    (main_module_partition_tokens[partition], methods.to_vec())
+                })
+                .collect()
+        } else {
+            vec![(
+                type_def_token_of[&class_def_id],
+                ordered_methods[&class_def_id].clone(),
+            )]
+        };
+        for (method_owner_token, methods) in method_groups {
+            // Same run-start re-stamp as Pass 2's `set_type_def_field_list`, for `MethodList`
+            // instead of `FieldList` — see Pass 1's doc comment; `add_method`'s own doc documents
+            // the identical "most recently added TypeDef" assumption this call satisfies.
+            mb.set_type_def_method_list(method_owner_token);
+            for method_id in methods {
+                let method = asm[method_id].clone();
+                let name = asm[method.name()].to_string();
+                let sig = asm[method.sig()].clone();
+                let is_static = method.kind() == crate::ir::cilnode::MethodKind::Static;
+                let is_virtual = method.kind() == crate::ir::cilnode::MethodKind::Virtual;
+                // `SpecialName | RTSpecialName` (§II.22.26, §II.10.5.3) is what makes the CLR loader
+                // recognize a type initializer and run it automatically before first access to any of
+                // the type's static members. `MethodKind::Constructor` (instance `.ctor`) is the usual
+                // source, but the assembly-wide static initializer built by `Assembly::cctor()`
+                // (cilly/src/ir/asm.rs) is a *`MethodKind::Static`* method literally named `.cctor` —
+                // `il_exporter`'s emitted `.il` text for it has NO `specialname`/`rtspecialname`
+                // keywords either (verified against the actual `.il` ilasm consumes), yet the ilasm-built
+                // assembly's `.cctor` carries those flags in its metadata: MS ilasm auto-recognizes the
+                // reserved name `.cctor` (and `.ctor`) and stamps the flags in regardless of what the
+                // source text asked for (ECMA-335 §II.10.5.3 requires this at the class-file-format
+                // level: a type initializer method MUST be `.cctor`/rtspecialname to be auto-invoked; it
+                // is one of the two runtime-reserved names, `.ctor`/`.cctor`). A hand-rolled writer gets
+                // no such assembler-side auto-detection, so it must special-case the reserved name here.
+                // Without this, the CLR never runs `.cctor` (it just looks like an ordinary unreferenced
+                // static method) and every static/const-data/vtable initializer inside it is skipped —
+                // every static field (including `dyn Trait` vtable slots, which are populated by
+                // `ldftn`/`StInd` writes INSIDE `.cctor`, not `FieldRVA` data) stays zeroed, and the
+                // first virtual dispatch through such a vtable calls a null function pointer (SIGSEGV,
+                // no managed exception — this is exactly the residual cd_collections crash: a `blr` to
+                // a zeroed vtable slot loaded from an uninitialized `dyn Trait` fat-pointer vtable
+                // static).
+                let is_ctor = method.kind() == crate::ir::cilnode::MethodKind::Constructor
+                    || name == crate::ir::asm::CCTOR;
+                // An explicit ECMA-335 `.override` (`MethodDef::with_override`, e.g. via
+                // `#[dotnet_override]`) is emitted as a `MethodImpl` row (§II.22.27) after this
+                // method's own `MethodDef` token exists — captured here, added below once `add_method`
+                // has returned the overriding method's token. Distinct from ordinary name+signature
+                // virtual binding: it lands the body in the base's exact vtable slot.
+                let override_base = method.overrides();
+                // An abstract member (`MethodDef::is_abstract`, e.g. an interface method) is emitted
+                // with the `Abstract` flag (0x400) and RVA=0 (no body), applied below after
+                // `add_method`. Its `implementation()` is only an inert `MethodImpl::Missing`
+                // placeholder (see that field's doc) which Pass 4 must NEVER assemble a body from.
+                let is_abstract = method.is_abstract();
+                // Resolve `MethodImpl::AliasFor` chains before deciding P/Invoke-ness — mirrors
+                // `il_exporter`'s `method.resolved_implementation(asm_mut)` (mod.rs:477) and
+                // `body.rs`'s own `resolved_implementation` call (the single source of truth for
+                // whether a method has a real body). Using the RAW, unresolved `method.implementation()`
+                // here was a real bug: for a method whose OWN `MethodImpl` is `AliasFor(target)`, the
+                // raw match falls through to `_ => None` regardless of what `target` resolves to, so a
+                // method aliasing an unpatched `MethodImpl::Extern` stub got emitted with NORMAL
+                // (non-abstract, non-PInvoke) `MethodDef` flags — while `body.rs` correctly resolved the
+                // alias, found no body to assemble, and left `RVA = 0`. §II.22.26 requires RVA == 0 ONLY
+                // for abstract/PInvoke/runtime-supplied methods; a "normal" method with RVA == 0 is
+                // exactly the malformed shape CoreCLR's native type loader rejects as `TypeLoadException:
+                // Abstract method with non-zero RVA` (the message is misleading — the real defect is a
+                // *zero*-RVA method not flagged abstract/PInvoke, not a nonzero-RVA abstract method;
+                // reproduced by the `pal_threads`/`cd_interop`-adjacent `rcl_dotnet_thread_spawn` P/Invoke
+                // hook, whose aliasing wrapper hit this exact path with `codegen-units = 1`, which changes
+                // whether the alias or its target gets visited first by `patch_missing_methods`).
+                let pinvoke_owned = match method.resolved_implementation(asm) {
+                    crate::ir::MethodImpl::Extern {
+                        lib,
+                        entry_point,
+                        call_conv,
+                        preserve_errno,
+                    } => Some((
+                        asm[*lib].to_string(),
+                        entry_point.map(|name| asm[name].to_string()),
+                        *call_conv,
+                        *preserve_errno,
+                    )),
+                    _ => None,
+                };
+                let mut blob = Vec::new();
+                // Generic method DEFINITION (`MethodDef::generic_params`, e.g. `T Echo<T>(T value)`
+                // on a `#[dotnet_interface]`): the declared type-parameter names. Non-empty means
+                // (a) the signature blob carries `SIG_GENERIC` + a compressed `GenParamCount`
+                // (§II.23.2.1 — `encode_method_sig`'s own debug_assert ties the two), and (b) one
+                // method-owned `GenericParam` row per name is emitted after `add_method` returns the
+                // owner token below. A different axis from a call SITE's instantiation
+                // (`MethodRef::generics` -> `MethodSpec`, handled in `method_token`).
+                let generic_names = method.generic_params();
+                let generic_count =
+                    u32::try_from(generic_names.len()).expect("generic-method arity over u32");
+                let mut convention = if is_static {
+                    sig::SIG_DEFAULT
                 } else {
-                    mb.mark_method_abstract(tok);
+                    sig::SIG_HASTHIS
+                };
+                if generic_count > 0 {
+                    convention |= sig::SIG_GENERIC;
                 }
-            }
-            // Explicit `.override` (`MethodDef::with_override`): reuse the base's vtable slot (drop
-            // `NewSlot`, matching `il_exporter`'s `virtual instance` with no `newslot`) and bind
-            // this body to the base declaration via a `MethodImpl` row (§II.22.27).
-            if let Some(base_mref) = override_base {
-                mb.mark_method_reuse_slot(tok);
-                let class_tok = type_def_token_of[&class_def_id];
-                let generics = asm[base_mref].generics().to_vec();
-                let decl_tok = mb.method_token(asm, MethodDefIdx::from_raw(base_mref), &generics);
-                mb.add_method_impl(class_tok, tok, decl_tok);
-            }
-            // `MethodDef::is_special_name` (e.g. a CLR operator-overload method like
-            // `op_Addition`, set by `#[dotnet_methods]`'s name-based detection): reuses the same
-            // `SpecialName` (0x0800) mechanism `add_event`/`add_property` already stamp on their
-            // own accessors, just applied here to an ordinary Pass-1 method instead of one those
-            // two helpers create themselves.
-            if method.is_special_name() {
-                mb.mark_method_special_name(tok);
-            }
-            if name == "entrypoint" {
-                entry_point_token = Some(tok);
+                // `sig.inputs()` carries the IMPLICIT receiver (`this`) at index 0 for every
+                // non-static kind (Instance/Virtual/Constructor) — matches `method.arg_names()`'s
+                // "parallel to the FULL sig.inputs()" contract documented just below, and
+                // `il_exporter`'s own `&sig.inputs()[1..]` skip at every one of its instance-method
+                // signature-rendering sites (mod.rs:436/796/1068/1337 — the semantic oracle). A
+                // `HASTHIS` `MethodDefSig`/`MethodRefSig` (§II.23.2.1) encodes the receiver
+                // IMPLICITLY via the calling-convention byte alone — writing it out AGAIN as
+                // parameter #0 doubles it, producing a `Method not found` at every call site
+                // (regression caught wiring `DIRECT_PE=1`: a generic ctor's `MemberRef` signature
+                // came out as `.ctor(Dictionary\`2<…>)` instead of `.ctor()`, the receiver type
+                // itself masquerading as a real argument).
+                let encode_sig = if is_static {
+                    sig.clone()
+                } else {
+                    crate::ir::FnSig::new(sig.inputs()[1..].to_vec(), *sig.output())
+                };
+                // `SignatureOnlyResolver`, not `&mut mb` directly: this is the method's OWN declared
+                // signature (C#-visible metadata a separately-compiled consumer resolves a call
+                // against), the exact analog of `il_exporter`'s `type_il_signature` split at its
+                // `.method` header line — see that resolver's doc for why every other
+                // `TypeDefOrRefResolver` call site in this exporter (bodies, `extends`, `calli`,
+                // fields) must stay on the shared, impl-assembly-qualified `MetadataBuilder` path.
+                // `validate_for_pe` has already checked every nested `!N`/`!!N` against this
+                // method/type's owning generic arity, including non-generic methods on generic types.
+                sig::encode_method_sig(
+                    convention,
+                    generic_count,
+                    &encode_sig,
+                    asm,
+                    &mut SignatureOnlyResolver { mb: &mut mb },
+                    &mut blob,
+                );
+                let sig_off = mb.blobs.intern(&blob);
+                // Named `Param` rows: `method.arg_names()` is parallel to the FULL `sig.inputs()`
+                // (including the implicit `this` slot at index 0 for instance/virtual/ctor kinds), but
+                // `Param` rows are only emitted for the ARGUMENTS a caller actually writes — mirrors
+                // `il_exporter::export_to_write`'s `inputs.iter().zip(method.arg_names())` (mod.rs:439-441),
+                // where `inputs` is already sliced to `&sig.inputs()[1..]` for non-static kinds and
+                // `.zip()` silently truncates `arg_names` to match. No tables.rs change needed —
+                // `add_method` already accepts `&[Option<&str>]` and pushes one Param row per entry.
+                let skip = usize::from(!is_static);
+                let arg_names = method.arg_names();
+                debug_assert_eq!(
+                    arg_names.len(),
+                    sig.inputs().len(),
+                    "arg_names must be parallel to sig.inputs()"
+                );
+                let param_names: Vec<Option<&str>> = arg_names[skip.min(arg_names.len())..]
+                    .iter()
+                    .map(|n| n.map(|interned| &asm[interned]))
+                    .collect();
+                let pinvoke_ref =
+                    pinvoke_owned
+                        .as_ref()
+                        .map(|(lib, entry_point, call_conv, preserve)| {
+                            (lib.as_str(), entry_point.as_deref(), *call_conv, *preserve)
+                        });
+                // Mirrors `il_exporter`'s `aggressiveinlining` JIT hint (mod.rs:455-469): small leaf
+                // bodies (e.g. the `cast_f64_u32`-style saturating float->int cast helpers
+                // `cilly::ir::builtins::casts` synthesizes, or monomorphized closure/iterator-adapter
+                // wrappers) get `MethodImplAttributes.AggressiveInlining` so RyuJIT inlines the
+                // per-call overhead out of hot callers. Heuristic shared with `il_exporter` via
+                // `MethodImpl::should_hint_aggressive_inline` (see that method's doc — this is the
+                // exact call-free/block-count/root-count shape empirically confirmed to get RyuJIT to
+                // inline a small branchy leaf) so the two exporters can't drift out of parity on this
+                // again. `PDB_FRAMES=1` suppresses it, same as `il_exporter`, so debug/PDB runs keep
+                // these frames visible. Pure JIT hint — cannot affect correctness (verified: no
+                // typecheck/codegen semantics change).
+                let aggressive_inline = !*crate::PDB_FRAMES
+                    && method
+                        .resolved_implementation(asm)
+                        .should_hint_aggressive_inline(asm);
+                // `[out]` Param flags (`MethodDef::out_params`, from `#[dotnet_out]`): 1-based
+                // Sequence numbers among the receiver-stripped `param_names`, exactly the numbering
+                // `add_method`'s Param-row loop uses — no re-indexing needed.
+                // Unity 6's netstandard2.1 profile does not expose the compiler-only
+                // Nullable{Context}Attribute types to its bundled Mono loader. The annotations carry
+                // no runtime semantics, so omit them for this profile while preserving the actual
+                // reference/Nullable<T> signatures. Emitting them makes Unity reject the entire
+                // assembly before any game code runs.
+                let nullability = (options.runtime != DotnetRuntime::UnityNetStandard21)
+                    .then(|| method.nullable_context())
+                    .flatten()
+                    .map(|context| {
+                        debug_assert_eq!(
+                            method.param_nullability().len(),
+                            param_names.len(),
+                            "nullable flags must be parallel to receiver-stripped Param rows"
+                        );
+                        MethodNullability {
+                            context,
+                            return_flag: method.return_nullability(),
+                            parameter_flags: method.param_nullability(),
+                        }
+                    });
+                // Only methods moved onto a carrier become sibling-type members. Widen their
+                // private visibility so calls from the real MainModule (especially `.cctor`)
+                // remain legal, but preserve the first partition's private methods and every
+                // explicitly public/exported method access level. Public API reachability still
+                // comes from the linker-owned facade projection; the carrier itself is private.
+                // In particular, changing `Extern` to `Assembly` here would silently alter the
+                // method metadata before that projection has a chance to classify the export.
+                let moved_to_carrier = class_def_id == main_module_id
+                    && method_owner_token != main_module_partition_tokens[0];
+                let tok = mb.add_method_with_access(
+                    &name,
+                    access_for_main_module_partition(*method.access(), moved_to_carrier),
+                    sig_off,
+                    &param_names,
+                    method.out_params(),
+                    is_static,
+                    is_virtual,
+                    is_ctor,
+                    pinvoke_ref,
+                    aggressive_inline,
+                    nullability,
+                );
+                if method.uses_bit_preserving_float_reinterpretation(asm) {
+                    mb.mark_method_bit_preserving_float(tok);
+                }
+                mb.add_method_custom_attributes(
+                    asm,
+                    tok,
+                    method.custom_attributes(),
+                    method.return_custom_attributes(),
+                    method.param_custom_attributes(),
+                );
+                mb.register_method_def(method_id, tok);
+                // One method-owned `GenericParam` row (§II.22.20, coded `TypeOrMethodDef` owner tag
+                // 1 = MethodDef) per declared parameter name, in declaration order — the METHOD
+                // analogue of Pass 1's type-owned rows for `ClassDef::generic_names`. Deterministic:
+                // `generic_params` is a `Vec` iterated inside the `class_def_ids` loop;
+                // `write_generic_param_rows` re-sorts by (coded Owner, Number) at serialize time as
+                // §II.24.2.6 requires.
+                for (i, name_id) in generic_names.iter().enumerate() {
+                    mb.add_generic_param(
+                        tok,
+                        u16::try_from(i).expect("generic-method arity over u16"),
+                        &asm[*name_id],
+                    );
+                }
+                // Abstract interface member (§II.22.26): stamp `Abstract`, leave RVA=0 (Pass 4 skips
+                // its body). An INSTANCE abstract: `add_method` already set `Virtual | NewSlot` since
+                // `is_virtual` is true. A STATIC abstract (.NET 7+ static virtual interface member,
+                // `MethodKind::Static` + `is_abstract`): `add_method` set `Public | Static` only, and
+                // `mark_method_static_abstract` adds `Virtual | HideBySig | Abstract` WITHOUT
+                // `NewSlot` — byte-matching Roslyn's own `0x4D6` emission (see that fn's doc).
+                if is_abstract {
+                    if is_static {
+                        mb.mark_method_static_abstract(tok);
+                    } else {
+                        mb.mark_method_abstract(tok);
+                    }
+                }
+                // Explicit `.override` (`MethodDef::with_override`): reuse the base's vtable slot (drop
+                // `NewSlot`, matching `il_exporter`'s `virtual instance` with no `newslot`) and bind
+                // this body to the base declaration via a `MethodImpl` row (§II.22.27).
+                if let Some(base_mref) = override_base {
+                    mb.mark_method_reuse_slot(tok);
+                    let class_tok = method_owner_token;
+                    let generics = asm[base_mref].generics().to_vec();
+                    let decl_tok =
+                        mb.method_token(asm, MethodDefIdx::from_raw(base_mref), &generics);
+                    mb.add_method_impl(class_tok, tok, decl_tok);
+                }
+                // `MethodDef::is_special_name` (e.g. a CLR operator-overload method like
+                // `op_Addition`, set by `#[dotnet_methods]`'s name-based detection): reuses the same
+                // `SpecialName` (0x0800) mechanism `add_event`/`add_property` already stamp on their
+                // own accessors, just applied here to an ordinary Pass-1 method instead of one those
+                // two helpers create themselves.
+                if method.is_special_name() {
+                    mb.mark_method_special_name(tok);
+                }
+                if name == "entrypoint" {
+                    entry_point_token = Some(tok);
+                }
             }
         }
     }
@@ -1054,20 +1099,29 @@ pub(crate) fn export_pe_with_source_link(
     // row a `TokenSink` query could need).
     let mut bodies: Vec<(Token, AssembledBody)> = Vec::new();
     for &class_def_id in &class_def_ids {
-        for &method_id in &ordered_methods[&class_def_id] {
-            // An abstract member (interface method) has RVA=0 and NO body — its
-            // `implementation()` is only an inert `MethodImpl::Missing` placeholder (Pass 3 already
-            // stamped the `Abstract` flag). Assembling a body here would give it a nonzero RVA,
-            // the exact `TypeLoadException: Abstract method with non-zero RVA` shape §II.22.26
-            // forbids. Skip it — its `MethodDef.RVA` stays the 0 `add_method` initialized.
-            if asm[method_id].is_abstract() {
-                continue;
+        let method_groups: Vec<&[MethodDefIdx]> = if class_def_id == main_module_id {
+            ordered_methods[&class_def_id]
+                .chunks(super::MAIN_MODULE_METHOD_PARTITION_SIZE)
+                .collect()
+        } else {
+            vec![ordered_methods[&class_def_id].as_slice()]
+        };
+        for methods in method_groups {
+            for &method_id in methods {
+                // An abstract member (interface method) has RVA=0 and NO body — its
+                // `implementation()` is only an inert `MethodImpl::Missing` placeholder (Pass 3 already
+                // stamped the `Abstract` flag). Assembling a body here would give it a nonzero RVA,
+                // the exact `TypeLoadException: Abstract method with non-zero RVA` shape §II.22.26
+                // forbids. Skip it — its `MethodDef.RVA` stays the 0 `add_method` initialized.
+                if asm[method_id].is_abstract() {
+                    continue;
+                }
+                let tok = mb
+                    .method_def_token(method_id)
+                    .expect("every method was registered in pass 3");
+                let assembled = body::assemble_method(asm, method_id, &mut mb);
+                bodies.push((tok, assembled));
             }
-            let tok = mb
-                .method_def_token(method_id)
-                .expect("every method was registered in pass 3");
-            let assembled = body::assemble_method(asm, method_id, &mut mb);
-            bodies.push((tok, assembled));
         }
     }
 
@@ -1122,7 +1176,7 @@ pub(crate) fn export_pe_with_source_link(
         if assembled.bytes.is_empty() {
             continue;
         }
-        while cursor % 4 != 0 {
+        while !cursor.is_multiple_of(4) {
             cursor += 1;
             method_bodies_bytes.push(0);
         }
@@ -1199,7 +1253,7 @@ pub(crate) fn export_pe_with_source_link(
     let mut field_rva_bytes: Vec<u8> = Vec::new();
     let mut field_cursor = sdata_start_rva;
     for (tok, bytes) in &pending_field_rva {
-        while field_cursor % 4 != 0 {
+        while !field_cursor.is_multiple_of(4) {
             field_cursor += 1;
             field_rva_bytes.push(0);
         }
@@ -1250,10 +1304,8 @@ fn bytes_for_scalar_const(cst: &Const) -> Vec<u8> {
         Const::U16(b) => b.to_le_bytes().to_vec(),
         Const::I32(b) => b.to_le_bytes().to_vec(),
         Const::U32(b) => b.to_le_bytes().to_vec(),
-        Const::I64(b) => b.to_le_bytes().to_vec(),
-        Const::U64(b) => b.to_le_bytes().to_vec(),
-        Const::ISize(b) => b.to_le_bytes().to_vec(),
-        Const::USize(b) => b.to_le_bytes().to_vec(),
+        Const::I64(b) | Const::ISize(b) => b.to_le_bytes().to_vec(),
+        Const::U64(b) | Const::USize(b) => b.to_le_bytes().to_vec(),
         Const::I128(b) => b.to_le_bytes().to_vec(),
         Const::U128(b) => b.to_le_bytes().to_vec(),
         Const::F32(b) => b.0.to_le_bytes().to_vec(),
@@ -1262,6 +1314,12 @@ fn bytes_for_scalar_const(cst: &Const) -> Vec<u8> {
             panic!("static-field default value of kind {other:?} is unsupported on the .NET target")
         }
     }
+}
+
+fn field_signature(asm: &mut Assembly, mb: &mut MetadataBuilder, tpe: Type) -> u32 {
+    let mut blob = Vec::new();
+    sig::encode_field_sig(tpe, asm, mb, &mut blob);
+    mb.blobs.intern(&blob)
 }
 
 /// Finds-or-creates a `TypeRef` to `System.Runtime`-scoped `type_name` (`System.Object` /
@@ -1404,6 +1462,22 @@ fn encode_type_def_or_ref_token(token: Token) -> u32 {
     (token.rid() << 2) | tag
 }
 
+/// Returns the managed visibility needed when a `MainModule` method is physically moved onto a
+/// private carrier type. A carrier is a sibling type, so its private methods cannot be called by
+/// the real `MainModule`; assembly visibility is the narrowest widening that fixes that call path.
+/// Other visibility levels are part of the method metadata contract and must survive
+/// partitioning.
+fn access_for_main_module_partition(
+    access: crate::Access,
+    moved_to_carrier: bool,
+) -> crate::Access {
+    if moved_to_carrier && access == crate::Access::Private {
+        crate::Access::Assembly
+    } else {
+        access
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1464,6 +1538,68 @@ mod tests {
         assert!(
             image.len() > 0x200,
             "must be at least one FileAlignment block"
+        );
+    }
+
+    #[test]
+    fn export_pe_partitions_an_oversized_main_module() {
+        // The retained-definition preflight is intentionally cheap, but it is not enough to
+        // prove that the writer actually creates carrier TypeDefs. Exercise the real PE path at
+        // the first boundary crossing and look for the deterministic carrier name in #Strings.
+        let mut asm = Assembly::default();
+        let main = asm.main_module();
+        asm.add_abstract_methods_bulk_for_test(
+            main,
+            super::super::MAIN_MODULE_METHOD_PARTITION_SIZE + 1,
+        );
+        let options = ExportOptions {
+            runtime: DotnetRuntime::Net10,
+            is_dll: true,
+            assembly_name: "export_pe_partitioning".to_string(),
+            public_module_full_name: None,
+            module_name: "export_pe_partitioning.exe".to_string(),
+            pdb_file_name: String::new(),
+        };
+        let (image, _pdb) = asm
+            .verify_for_export()
+            .expect("abstract methods are valid metadata declarations")
+            .try_render_pe(&options)
+            .expect("oversized MainModule must render through carrier types");
+        assert_eq!(&image[0..2], b"MZ");
+        let carrier_name = b"__rcl_main_module_partition_1";
+        assert!(
+            image
+                .windows(carrier_name.len())
+                .any(|window| window == carrier_name),
+            "partition carrier TypeDef name must be present in the emitted metadata"
+        );
+    }
+
+    #[test]
+    fn main_module_partition_preserves_method_access_levels() {
+        assert_eq!(
+            access_for_main_module_partition(Access::Private, true),
+            Access::Assembly
+        );
+        assert_eq!(
+            access_for_main_module_partition(Access::Private, false),
+            Access::Private
+        );
+        assert_eq!(
+            access_for_main_module_partition(Access::Assembly, true),
+            Access::Assembly
+        );
+        assert_eq!(
+            access_for_main_module_partition(Access::Public, true),
+            Access::Public
+        );
+        assert_eq!(
+            access_for_main_module_partition(Access::Extern, true),
+            Access::Extern
+        );
+        assert_eq!(
+            access_for_main_module_partition(Access::InternalExtern, true),
+            Access::InternalExtern
         );
     }
 
@@ -1791,7 +1927,7 @@ mod tests {
                 let name_end = pdb[name_start..].iter().position(|&b| b == 0).unwrap() + name_start;
                 let name = std::str::from_utf8(&pdb[name_start..name_end]).unwrap();
                 let mut name_len = name_end - name_start + 1;
-                while name_len % 4 != 0 {
+                while !name_len.is_multiple_of(4) {
                     name_len += 1;
                 }
                 cursor = name_start + name_len;
@@ -2441,7 +2577,7 @@ mod tests {
             let name_end = image[name_start..].iter().position(|&b| b == 0).unwrap() + name_start;
             let name = std::str::from_utf8(&image[name_start..name_end]).unwrap();
             let mut name_len = name_end - name_start + 1;
-            while name_len % 4 != 0 {
+            while !name_len.is_multiple_of(4) {
                 name_len += 1;
             }
             p = name_start + name_len;

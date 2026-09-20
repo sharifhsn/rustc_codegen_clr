@@ -73,7 +73,6 @@ pub fn restore(
     tfm: &str,
     sources: &[String],
 ) -> Result<ResolvedAssets> {
-    fs::create_dir_all(cache_root)?;
     restore_with_config_bytes(
         id,
         version,

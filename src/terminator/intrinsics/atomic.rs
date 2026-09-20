@@ -121,7 +121,7 @@ pub fn xchg<'tcx>(
         // the 1-byte fallback would truncate it (a miscompile), so refuse loudly.
         // Unreachable from safe-stable Rust (there is no `AtomicChar`; the only producer is the
         // interop `dotnet::char` type) — kept as a documented wall per the I3 invariant.
-        Type::Bool | Type::PlatformChar => rustc_middle::span_bug!(
+        Type::Bool | Type::PlatformChar => rustc_span::span_bug!(
             ctx.span(),
             "atomic exchange (`atomic_xchg`) of `{src_type:?}` is unsupported on this .NET target: \
              there is no native sub-word `Interlocked.Exchange` overload in the legacy Unity ABI and no \

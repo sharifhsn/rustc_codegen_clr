@@ -122,7 +122,8 @@ pub fn ptr_set_op<'tcx>(
             | TyKind::Tuple(_)
             | TyKind::Array(_, _)
             | TyKind::Closure(_, _)
-            | TyKind::Coroutine(_, _) => {
+            | TyKind::Coroutine(_, _)
+            | TyKind::FnPtr(..) => {
                 let pointed_type = ctx.type_from_cache(pointed_type);
                 ctx.st_ind(addr_calc, value_calc, pointed_type, false)
             }
@@ -145,10 +146,6 @@ pub fn ptr_set_op<'tcx>(
                     let ptr = ctx.nptr(inner);
                     ctx.st_ind(addr_calc, value_calc, ptr, false)
                 }
-            }
-            TyKind::FnPtr(..) => {
-                let pointed_type = ctx.type_from_cache(pointed_type);
-                ctx.st_ind(addr_calc, value_calc, pointed_type, false)
             }
             _ => todo!("cannot store through pointer to {pointed_type:?}"),
         }

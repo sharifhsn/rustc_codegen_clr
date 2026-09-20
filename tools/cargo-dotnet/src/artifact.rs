@@ -35,6 +35,8 @@ pub enum Artifact {
 struct Message {
     reason: String,
     #[serde(default)]
+    package_id: Option<String>,
+    #[serde(default)]
     executable: Option<String>,
     #[serde(default)]
     target: Option<Target>,
@@ -45,7 +47,40 @@ struct Message {
 #[derive(Deserialize)]
 struct Target {
     #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: Vec<String>,
+    #[serde(default)]
     crate_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TestTargetIdentity {
+    pub package_id: String,
+    pub name: String,
+    pub kind: Vec<String>,
+}
+
+pub fn executable_test_targets(json: &str) -> Vec<(PathBuf, TestTargetIdentity)> {
+    json.lines()
+        .filter_map(|line| serde_json::from_str::<Message>(line).ok())
+        .filter(|message| message.reason == "compiler-artifact")
+        .filter_map(|message| {
+            let executable = message.executable?;
+            let package_id = message.package_id?;
+            let target = message.target?;
+            (!executable.is_empty() && executable != "null").then(|| {
+                (
+                    PathBuf::from(executable),
+                    TestTargetIdentity {
+                        package_id,
+                        name: target.name,
+                        kind: target.kind,
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 /// Locate the produced artifact from cargo's JSON message stream (one message per line).
@@ -261,5 +296,23 @@ mod tests {
 
         copy_library_image(&dll, &dll).unwrap();
         assert_eq!(fs::read(&dll).unwrap(), b"pe");
+    }
+
+    #[test]
+    fn test_target_discovery_preserves_every_cargo_executable_identity() {
+        let json = r#"
+{"reason":"compiler-artifact","package_id":"path+file:///tmp/crate#0.0.0","target":{"name":"crate_name","kind":["lib"],"crate_types":["lib"]},"executable":"/tmp/crate-lib"}
+{"reason":"compiler-artifact","package_id":"path+file:///tmp/crate#0.0.0","target":{"name":"integration","kind":["test"],"crate_types":["bin"]},"executable":"/tmp/integration"}
+{"reason":"build-finished","success":true}
+"#;
+        let targets = executable_test_targets(json);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].0, PathBuf::from("/tmp/crate-lib"));
+        assert_eq!(targets[0].1.name, "crate_name");
+        assert_eq!(targets[0].1.kind, ["lib"]);
+        assert_eq!(targets[0].1.package_id, "path+file:///tmp/crate#0.0.0");
+        assert_eq!(targets[1].0, PathBuf::from("/tmp/integration"));
+        assert_eq!(targets[1].1.name, "integration");
+        assert_eq!(targets[1].1.kind, ["test"]);
     }
 }

@@ -1,10 +1,9 @@
-//! Direct ECMA-335 PE emission — writes the final `.dll`/`.exe` (and, later, the Portable PDB)
+//! Direct ECMA-335 PE emission — writes the final `.dll`/`.exe` (and Portable PDB)
 //! straight from the interned IR, with no textual `.il` and no external `ilasm`.
 //!
 //! Design, construct inventory, phasing, and validation strategy: `docs/PE_EMISSION_PLAN.md`.
-//! The [`il_exporter`](super::il_exporter) remains the default until this path survives the full
-//! `::stable` gate under the `DIRECT_PE=1` A/B differential; the emitted subset of ECMA-335 is
-//! exactly the subset `il_exporter` emits today — nothing more.
+//! The direct writer is the product path. The [`il_exporter`](super::il_exporter) remains a
+//! compatibility/debug fallback; both paths share the same interned IR and verifier.
 //!
 //! Layout of the writer (each stage is independently unit-tested):
 //! * [`crate::ir::pe_exporter::heaps`] — the four metadata heaps (`#Strings`, `#Blob`, `#GUID`, `#US`), interned + deduped.
@@ -20,12 +19,8 @@
 //!   unit-tested)*
 //! * [`crate::ir::pe_exporter::export`] — `export_pe`: the top-level driver wiring `tables::MetadataBuilder` +
 //!   `body::assemble_method` + the RVA layout pass + `pe::write_pe` into one entry point.
-//!   *(Phase 1a MILESTONE PROVEN 2026-07-02: a hand-built static-entrypoint-calling-
-//!   `Console.WriteLine` `Assembly`, exported with no `ilasm` anywhere, loads and runs under a
-//!   real `dotnet` host — `export::tests::e2e_hand_built_assembly_runs_under_dotnet`. Only the
-//!   inventory subset that test exercises is wired; const-data `FieldRVA` blobs, non-`ByteBuffer`
-//!   static-field defaults, and `MainModule` method-count partitioning are loud `todo!()`s left
-//!   for Phase 1b — see `export`'s module doc.)*
+//!   *(The direct writer covers the product acceptance matrix, including const-data `FieldRVA`
+//!   blobs, static-field defaults, and deterministic `MainModule` method partitioning.)*
 //! * [`crate::ir::pe_exporter::pdb`] — Portable PDB (dotnet/runtime `PortablePdb-Metadata.md`): `#Pdb` stream +
 //!   `Document`/`MethodDebugInformation` tables from `CILRoot::SourceFileInfo` sequence points,
 //!   plus the PE-side Debug Directory (CodeView/RSDS) hook. *(Phase 2: interface-pinning stub —
@@ -45,7 +40,11 @@ use super::{
     Assembly, CILNode, CILRoot, ClassRef, Const, Float, FnSig, Int, Type, bimap::Interned,
 };
 
-const MAIN_MODULE_METHOD_LIMIT: usize = 60_000;
+// CoreCLR's runtime method-table slots are 16-bit even though ECMA-335's
+// MethodDef table is much larger. Keep each generated carrier type below that
+// ceiling; `export_pe` transparently partitions an oversized synthetic
+// `MainModule` into multiple internal types while preserving MethodDef tokens.
+pub(super) const MAIN_MODULE_METHOD_PARTITION_SIZE: usize = 60_000;
 
 /// A retained IR construct which the direct-PE writer cannot encode yet.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,10 +98,22 @@ impl<'a> PeCapabilityValidator<'a> {
 
     fn check_type(&mut self, tpe: Type) -> Result<(), PeTargetError> {
         match tpe {
-            Type::Float(Float::F128) => Err(PeTargetError::unsupported(
-                "f128 type",
-                "the PE signature encoder has no f128 TypeDef/signature representation",
-            )),
+            Type::Float(Float::F128) => {
+                let class = self
+                    .asm
+                    .class_defs()
+                    .iter()
+                    .find_map(|(id, definition)| {
+                        (&self.asm[definition.name()] == "f128").then_some(**id)
+                    })
+                    .ok_or_else(|| {
+                        PeTargetError::unsupported(
+                            "f128 type",
+                            "the link stage did not materialize the synthetic f128 valuetype",
+                        )
+                    })?;
+                self.check_class_id(class)
+            }
             Type::Ptr(inner) | Type::Ref(inner) | Type::PlatformArray { elem: inner, .. } => {
                 self.check_type_id(inner)
             }
@@ -276,16 +287,6 @@ impl<'a> PeCapabilityValidator<'a> {
 
     fn check_class(&mut self, class: &super::ClassDef) -> Result<(), PeTargetError> {
         let class_name = &self.asm[class.name()];
-        if class_name == super::asm::MAIN_MODULE && class.methods().len() > MAIN_MODULE_METHOD_LIMIT
-        {
-            return Err(PeTargetError::unsupported(
-                "MainModule method count",
-                format!(
-                    "MainModule has {} methods (limit {MAIN_MODULE_METHOD_LIMIT}); direct PE does not yet implement method partitioning",
-                    class.methods().len()
-                ),
-            ));
-        }
         for &method_id in class.methods() {
             let method = self.asm.method_defs().get(&method_id).ok_or_else(|| {
                 PeTargetError::unsupported(
@@ -395,8 +396,9 @@ pub fn validate_for_pe(asm: &Assembly) -> Result<(), PeTargetError> {
 
 /// Checks definition-owned target constraints without walking intern arenas. This is safe before
 /// compaction because class definitions are themselves retained roots, and lets obviously
-/// unsupported shapes (notably an unpartitioned 60k-method MainModule) fail without first copying
-/// the entire graph.
+/// unsupported shapes fail without first copying the entire graph. Oversized
+/// `MainModule` definitions are handled by the PE exporter by partitioning
+/// their MethodDef rows across internal carrier types.
 pub(crate) fn validate_retained_definitions_for_pe(asm: &Assembly) -> Result<(), PeTargetError> {
     let mut validator = PeCapabilityValidator::new(asm);
     for class in asm.class_defs().values() {
@@ -409,7 +411,7 @@ pub(crate) fn validate_retained_definitions_for_pe(asm: &Assembly) -> Result<(),
 mod capability_tests {
     use super::*;
     use crate::{
-        Access, Const, MethodDef, MethodImpl, VerificationFailure,
+        Access, ClassDef, Const, MethodDef, MethodImpl, VerificationFailure,
         cilnode::{ExtendKind, MethodKind},
         tpe::GenericKind,
     };
@@ -426,7 +428,7 @@ mod capability_tests {
     }
 
     #[test]
-    fn rejects_every_direct_pe_todo_family_before_emission() {
+    fn preflight_rejects_unsupported_ops_but_accepts_materialized_f128_types() {
         let mut asm = Assembly::default();
         let value = asm.alloc_node(Const::I32(1));
         asm.alloc_node(CILNode::IntCast {
@@ -447,16 +449,36 @@ mod capability_tests {
         let error = validate_for_pe(&asm).unwrap_err();
         assert_eq!(error.construct(), "extended-precision float cast");
 
+        // A bare f128 signature is still invalid until the linker materializes the synthetic
+        // valuetype. Keeping this rejection prevents the signature encoder from accidentally
+        // turning an unresolved placeholder into a public PE contract.
         let mut asm = Assembly::default();
         asm.sig([], Type::Float(Float::F128));
         let error = validate_for_pe(&asm).unwrap_err();
         assert_eq!(error.construct(), "f128 type");
 
         let mut asm = Assembly::default();
-        let vector = crate::tpe::simd::SIMDVector::new(Float::F128.into(), 1);
-        asm.sig([], Type::SIMDVector(vector));
-        let error = validate_for_pe(&asm).unwrap_err();
-        assert_eq!(error.construct(), "f128 type");
+        let f128 = asm.alloc_string("f128");
+        let low = asm.alloc_string("low");
+        let high = asm.alloc_string("high");
+        asm.class_def(ClassDef::new(
+            f128,
+            true,
+            0,
+            None,
+            vec![
+                (Type::Int(Int::U64), low, Some(0)),
+                (Type::Int(Int::U64), high, Some(8)),
+            ],
+            vec![],
+            Access::Public,
+            std::num::NonZeroU32::new(16),
+            std::num::NonZeroU32::new(16),
+            true,
+        ))
+        .unwrap();
+        asm.sig([], Type::Float(Float::F128));
+        assert!(validate_for_pe(&asm).is_ok());
 
         let mut asm = Assembly::default();
         let i32_tpe = asm.alloc_type(Type::Int(Int::I32));
@@ -540,17 +562,11 @@ mod capability_tests {
     }
 
     #[test]
-    fn render_preflight_rejects_main_module_before_the_partition_limit_panics() {
+    fn retained_preflight_allows_main_module_partitioning() {
         let mut asm = Assembly::default();
         let main = asm.main_module();
-        asm.add_abstract_methods_bulk_for_test(main, MAIN_MODULE_METHOD_LIMIT + 1);
-
-        let ready = asm.verify_for_export().unwrap();
-        let error = ready.try_render_pe(&options()).unwrap_err();
-        let crate::PeEmissionError::Target(error) = error else {
-            panic!("MainModule overflow must fail during PE target preflight")
-        };
-        assert_eq!(error.construct(), "MainModule method count");
+        asm.add_abstract_methods_bulk_for_test(main, MAIN_MODULE_METHOD_PARTITION_SIZE + 1);
+        assert!(validate_retained_definitions_for_pe(&asm).is_ok());
     }
 
     #[test]

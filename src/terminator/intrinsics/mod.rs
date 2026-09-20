@@ -352,15 +352,13 @@ pub fn handle_intrinsic<'tcx>(
             vec![ctx.call_root(fence, EMPTY_ARGS, IsPure::NOT)]
         }
         "atomic_xadd" => call_atomic(args, destination, ctx, atomic_add),
-        "atomic_umin" => call_atomic(args, destination, ctx, atomic_min),
-        "atomic_umax" => call_atomic(args, destination, ctx, atomic_max),
         // Signed `atomic_max`/`atomic_min` (`AtomicI*::fetch_max`/`fetch_min`) previously `span_bug!`-ICE'd
         // (seam-audit gap #7). The `atomic_min`/`atomic_max` helpers are sign-aware via the operand type:
         // `call_atomic` reads `args[1].node.ty(..)`, so an `i32` arg mangles to `atomic_min_i32` (signed
         // compare) while a `u32` arg gives `atomic_min_u32` — so the SIGNED arms wire to the same helpers
         // as `atomic_umin`/`atomic_umax`, and signedness is carried correctly by the argument's type.
-        "atomic_min" => call_atomic(args, destination, ctx, atomic_min),
-        "atomic_max" => call_atomic(args, destination, ctx, atomic_max),
+        "atomic_umin" | "atomic_min" => call_atomic(args, destination, ctx, atomic_min),
+        "atomic_umax" | "atomic_max" => call_atomic(args, destination, ctx, atomic_max),
         "atomic_xchg" => vec![atomic::xchg(args, destination, ctx)],
         // TODO: ensure those intrinsics are sound in C. perhaps time for a new cillyIR node?
         "ptr_offset_from_unsigned" => {
@@ -643,8 +641,8 @@ pub fn handle_intrinsic<'tcx>(
         "log10f64" => float_unop(args, destination, ctx, Float::F64, "Log10"),
         "powf32" => vec![powf32(args, destination, ctx)],
         "powf64" => vec![powf64(args, destination, ctx)],
-        "copysignf32" => float_binop(args, destination, ctx, Float::F32, "CopySign"),
-        "copysignf64" => float_binop(args, destination, ctx, Float::F64, "CopySign"),
+        "copysignf32" => float_unop(args, destination, ctx, Float::F32, "CopySign"),
+        "copysignf64" => float_unop(args, destination, ctx, Float::F64, "CopySign"),
         "copysignf128" => {
             let log = ctx.static_mref(
                 "copysignf128",
@@ -705,14 +703,10 @@ pub fn handle_intrinsic<'tcx>(
         "truncf16" => float_unop(args, destination, ctx, Float::F16, "Truncate"),
         "sqrtf16" => float_unop(args, destination, ctx, Float::F16, "Sqrt"),
         "fabsf16" => float_unop(args, destination, ctx, Float::F16, "Abs"),
-        "copysignf16" => float_binop(args, destination, ctx, Float::F16, "CopySign"),
-        "maxnumf16" => float_binop(args, destination, ctx, Float::F16, "MaxNumber"),
-        "minnumf16" => float_binop(args, destination, ctx, Float::F16, "MinNumber"),
+        "copysignf16" => float_unop(args, destination, ctx, Float::F16, "CopySign"),
+        "maxnumf16" => float_unop(args, destination, ctx, Float::F16, "MaxNumber"),
+        "minnumf16" => float_unop(args, destination, ctx, Float::F16, "MinNumber"),
         "fmaf16" => vec![fmaf16(args, destination, ctx)],
-        "maxnumf64" => float_binop(args, destination, ctx, Float::F64, "MaxNumber"),
-        "maxnumf32" => float_binop(args, destination, ctx, Float::F32, "MaxNumber"),
-        "minnumf64" => float_binop(args, destination, ctx, Float::F64, "MinNumber"),
-        "minnumf32" => float_binop(args, destination, ctx, Float::F32, "MinNumber"),
         // The `*_algebraic` float intrinsics permit the optimizer to reassociate/contract the
         // operation. .NET/RyuJIT does neither across these boundaries, so the faithful lowering is
         // the plain IEEE-754 op (never less precise than the source program). Generic over f32/f64
@@ -726,16 +720,24 @@ pub fn handle_intrinsic<'tcx>(
         // verified Rust<->.NET truth table). Two distinct families now exist:
         //  * IEEE 754-2019 maximum/minimum (`f32::maximum`/`minimum`): propagate NaN, order -0<+0.
         //    .NET `Single/Double::Max/Min` implement exactly this.
-        "maximumf32" => float_binop(args, destination, ctx, Float::F32, "Max"),
-        "maximumf64" => float_binop(args, destination, ctx, Float::F64, "Max"),
-        "minimumf32" => float_binop(args, destination, ctx, Float::F32, "Min"),
-        "minimumf64" => float_binop(args, destination, ctx, Float::F64, "Min"),
+        "maximumf32" => float_unop(args, destination, ctx, Float::F32, "Max"),
+        "maximumf64" => float_unop(args, destination, ctx, Float::F64, "Max"),
+        "minimumf32" => float_unop(args, destination, ctx, Float::F32, "Min"),
+        "minimumf64" => float_unop(args, destination, ctx, Float::F64, "Min"),
         //  * maxNum/minNum, no-signed-zero (`f32::max`/`min`): ignore NaN (return the number).
         //    .NET `::MaxNumber/::MinNumber` match; the nsz freedom on the zero sign is satisfied.
-        "maximum_number_nsz_f32" => float_binop(args, destination, ctx, Float::F32, "MaxNumber"),
-        "maximum_number_nsz_f64" => float_binop(args, destination, ctx, Float::F64, "MaxNumber"),
-        "minimum_number_nsz_f32" => float_binop(args, destination, ctx, Float::F32, "MinNumber"),
-        "minimum_number_nsz_f64" => float_binop(args, destination, ctx, Float::F64, "MinNumber"),
+        "maxnumf64" | "maximum_number_nsz_f64" => {
+            float_unop(args, destination, ctx, Float::F64, "MaxNumber")
+        }
+        "maxnumf32" | "maximum_number_nsz_f32" => {
+            float_unop(args, destination, ctx, Float::F32, "MaxNumber")
+        }
+        "minnumf64" | "minimum_number_nsz_f64" => {
+            float_unop(args, destination, ctx, Float::F64, "MinNumber")
+        }
+        "minnumf32" | "minimum_number_nsz_f32" => {
+            float_unop(args, destination, ctx, Float::F32, "MinNumber")
+        }
         // `fabs` is now a single generic intrinsic (replaces `fabsf32`/`fabsf64`); dispatch on the
         // argument's float width and call `<FloatClass>::Abs`.
         "fabs" => {
@@ -880,6 +882,60 @@ pub fn handle_intrinsic<'tcx>(
             let val = handle_operand(&args[0].node, ctx);
             simd_passthrough_call(ctx, destination, &[src], dst, "simd_cast", &[val])
         }
+        "simd_cast_ptr" => {
+            // `simd_cast_ptr<T, U>(ptr: T) -> U`: representation-preserving pointer relabel for
+            // each lane. Pointer vectors use the fixed-array fallback, so the dedicated builtin
+            // performs the lane walk rather than trying to instantiate a CLR Vector<T> method.
+            let src = simd_ty(ctx, call_instance, 0);
+            let dst = simd_ty(ctx, call_instance, 1);
+            let val = handle_operand(&args[0].node, ctx);
+            simd_passthrough_call(ctx, destination, &[src], dst, "simd_cast_ptr", &[val])
+        }
+        "simd_arith_offset" => {
+            // `simd_arith_offset<T, U>(ptr: T, offset: U) -> T`: wrapping pointer arithmetic per
+            // lane. The pointer and offset vectors can both be fixed-array fallbacks.
+            let ptr = simd_ty(ctx, call_instance, 0);
+            let offset = simd_ty(ctx, call_instance, 1);
+            let value = handle_operand(&args[0].node, ctx);
+            let delta = handle_operand(&args[1].node, ctx);
+            simd_passthrough_call(
+                ctx,
+                destination,
+                &[ptr, offset],
+                ptr,
+                "simd_arith_offset",
+                &[value, delta],
+            )
+        }
+        "simd_expose_provenance" => {
+            // `simd_expose_provenance<T, U>(ptr: T) -> U`: erase each pointer lane to `usize`.
+            let ptr = simd_ty(ctx, call_instance, 0);
+            let addr = simd_ty(ctx, call_instance, 1);
+            let value = handle_operand(&args[0].node, ctx);
+            simd_passthrough_call(
+                ctx,
+                destination,
+                &[ptr],
+                addr,
+                "simd_expose_provenance",
+                &[value],
+            )
+        }
+        "simd_with_exposed_provenance" => {
+            // `simd_with_exposed_provenance<T, U>(addr: T) -> U`: reconstruct pointer lanes from
+            // native integer addresses.
+            let addr = simd_ty(ctx, call_instance, 0);
+            let ptr = simd_ty(ctx, call_instance, 1);
+            let value = handle_operand(&args[0].node, ctx);
+            simd_passthrough_call(
+                ctx,
+                destination,
+                &[addr],
+                ptr,
+                "simd_with_exposed_provenance",
+                &[value],
+            )
+        }
         "simd_fabs" => {
             // `simd_fabs<T>(x: T) -> T`: per-lane absolute value, served by the `simd_abs` builtin.
             let vec = simd_ty(ctx, call_instance, 0);
@@ -918,6 +974,13 @@ pub fn handle_intrinsic<'tcx>(
         | "simd_bswap"
         | "simd_bitreverse"
         | "simd_fsqrt"
+        | "simd_fsin"
+        | "simd_fcos"
+        | "simd_fexp"
+        | "simd_fexp2"
+        | "simd_flog"
+        | "simd_flog2"
+        | "simd_flog10"
         | "simd_floor"
         | "simd_ceil"
         | "simd_trunc"
@@ -996,21 +1059,7 @@ pub fn handle_intrinsic<'tcx>(
                 &[value],
             )
         }
-        "simd_reduce_any" => {
-            // Special case: `x` is "any lane set?" iff it is NOT equal to the all-clear vector, so
-            // this folds against `simd_allset` + `simd_eq_any` (two builtins), not a plain reduce.
-            let vec = simd_ty(ctx, call_instance, 0);
-            let x = handle_operand(&args[0].node, ctx);
-            let simd_eq = ctx.alloc_string("simd_eq_any");
-            let allset = ctx.alloc_string("simd_allset");
-            let main_module = ctx.main_module();
-            let main_module = ctx[*main_module].clone();
-            let eq = main_module.static_mref(&[vec, vec], Type::Bool, simd_eq, ctx);
-            let allset = main_module.static_mref(&[], vec, allset, ctx);
-            let allset = ctx.call(allset, EMPTY_ARGS, IsPure::NOT);
-            let value = ctx.call(eq, &[x, allset], IsPure::NOT);
-            vec![place_set(destination, value, ctx)]
-        }
+        "simd_reduce_any" => simd_reduce(args, destination, call_instance, ctx, "simd_eq_any"),
         "select_unpredictable" => {
             let tpe = ctx.type_from_cache(
                 call_instance.args[0]
@@ -1032,21 +1081,7 @@ pub fn handle_intrinsic<'tcx>(
             let select = ctx.select(tpe, true_val, false_val, cond);
             vec![place_set(destination, select, ctx)]
         }
-        "simd_reduce_all" => {
-            // Special case: `x` is "all lanes set?" iff it equals the all-set vector, so this folds
-            // against `simd_allset` + `simd_eq_all` (two builtins), not a plain reduce.
-            let vec = simd_ty(ctx, call_instance, 0);
-            let x = handle_operand(&args[0].node, ctx);
-            let simd_eq = ctx.alloc_string("simd_eq_all");
-            let allset = ctx.alloc_string("simd_allset");
-            let main_module = ctx.main_module();
-            let main_module = ctx[*main_module].clone();
-            let eq = main_module.static_mref(&[vec, vec], Type::Bool, simd_eq, ctx);
-            let allset = main_module.static_mref(&[], vec, allset, ctx);
-            let allset = ctx.call(allset, EMPTY_ARGS, IsPure::NOT);
-            let value = ctx.call(eq, &[x, allset], IsPure::NOT);
-            vec![place_set(destination, value, ctx)]
-        }
+        "simd_reduce_all" => simd_reduce(args, destination, call_instance, ctx, "simd_eq_all"),
         "simd_select" => {
             // `simd_select<M, T>(mask: M, if_true: T, if_false: T) -> T`: per-lane blend. The
             // builtin (`simd_select` in `register_value_lane_ops`) does `mask[i] != 0 ? a[i] : b[i]`.
@@ -1062,6 +1097,28 @@ pub fn handle_intrinsic<'tcx>(
                 val_ty,
                 "simd_select",
                 &[mask, a, b],
+            )
+        }
+        "simd_select_bitmask" => {
+            // `simd_select_bitmask<M, T>(mask: M, yes: T, no: T) -> T` expands a compact scalar
+            // bitmask into per-lane selection.  The builtin keeps the mask scalar and selects
+            // source addresses, so it works for floats and fixed-array vector fallbacks too.
+            let mask_ty = ctx.type_from_cache(
+                call_instance.args[0]
+                    .as_type()
+                    .expect("simd_select_bitmask mask generic arg must be a type"),
+            );
+            let val_ty = simd_ty(ctx, call_instance, 1);
+            let mask = handle_operand(&args[0].node, ctx);
+            let yes = handle_operand(&args[1].node, ctx);
+            let no = handle_operand(&args[2].node, ctx);
+            simd_passthrough_call(
+                ctx,
+                destination,
+                &[mask_ty, val_ty, val_ty],
+                val_ty,
+                "simd_select_bitmask",
+                &[mask, yes, no],
             )
         }
         "simd_reduce_add_ordered" | "simd_reduce_mul_ordered" => {
@@ -1087,14 +1144,54 @@ pub fn handle_intrinsic<'tcx>(
             let x = handle_operand(&args[0].node, ctx);
             simd_passthrough_call(ctx, destination, &[vec], scalar, fn_name, &[x])
         }
-        // SIMD WALLS — intrinsics with no clean BCL `Vector` primitive (gather/scatter walk a vector
-        // of raw pointers per lane; masked_load/store add a const ALIGN generic on top of that;
-        // funnel shifts are out of the current target list). These are left as explicit walls so the
-        // failure mode is a clear message rather than a confusing generic-call fall-through. The safe
-        // path when wiring them later is the per-lane spill-and-index builtin (see
-        // `cilly/src/ir/builtins/simd/tail.rs`).
-        "simd_gather" | "simd_scatter" | "simd_masked_load" | "simd_masked_store"
-        | "simd_funnel_shl" | "simd_funnel_shr" => {
+        "simd_masked_load" => {
+            // `simd_masked_load<V, U, T, ALIGN>(mask: V, ptr: U, passthrough: T) -> T` has no
+            // generic BCL equivalent.  The builtin uses a per-lane CFG so disabled lanes do not
+            // evaluate or dereference their source address (the Rust contract is stronger than a
+            // vector blend).  `U` is a raw pointer type rather than a SIMD type, so recover it
+            // directly instead of using `simd_ty`.
+            let mask_ty = simd_ty(ctx, call_instance, 0);
+            let ptr_ty = ctx.type_from_cache(
+                call_instance.args[1]
+                    .as_type()
+                    .expect("simd_masked_load pointer generic arg must be a type"),
+            );
+            let val_ty = simd_ty(ctx, call_instance, 2);
+            let mask = handle_operand(&args[0].node, ctx);
+            let ptr = handle_operand(&args[1].node, ctx);
+            let passthrough = handle_operand(&args[2].node, ctx);
+            simd_passthrough_call(
+                ctx,
+                destination,
+                &[mask_ty, ptr_ty, val_ty],
+                val_ty,
+                "simd_masked_load",
+                &[mask, ptr, passthrough],
+            )
+        }
+        "simd_masked_store" => {
+            // `simd_masked_store<V, U, T, ALIGN>` is side-effecting and returns `()`, so it cannot
+            // use `simd_passthrough_call`'s destination store.  Emit the builtin as a root call.
+            let mask_ty = simd_ty(ctx, call_instance, 0);
+            let ptr_ty = ctx.type_from_cache(
+                call_instance.args[1]
+                    .as_type()
+                    .expect("simd_masked_store pointer generic arg must be a type"),
+            );
+            let val_ty = simd_ty(ctx, call_instance, 2);
+            let mask = handle_operand(&args[0].node, ctx);
+            let ptr = handle_operand(&args[1].node, ctx);
+            let value = handle_operand(&args[2].node, ctx);
+            let name = ctx.alloc_string("simd_masked_store");
+            let main_module = ctx.main_module();
+            let main_module = ctx[*main_module].clone();
+            let op = main_module.static_mref(&[mask_ty, ptr_ty, val_ty], Type::Void, name, ctx);
+            vec![ctx.call_root(op, &[mask, ptr, value], IsPure::NOT)]
+        }
+        // SIMD WALLS — gather/scatter walk a vector of raw pointers per lane, and funnel shifts
+        // are outside the current target list. Keep these as explicit walls so an unsupported
+        // intrinsic fails with an actionable message rather than a generic-call fall-through.
+        "simd_gather" | "simd_scatter" | "simd_funnel_shl" | "simd_funnel_shr" => {
             todo!(
                 "SIMD intrinsic `{fn_name}` is not yet supported (no clean BCL Vector primitive; wire per-lane in cilly/src/ir/builtins/simd/tail.rs)"
             )
@@ -1102,7 +1199,7 @@ pub fn handle_intrinsic<'tcx>(
         _ => intrinsic_slow(fn_name, args, destination, ctx, call_instance, source_info),
     }
 }
-use rustc_middle::span_bug;
+use rustc_span::span_bug;
 fn intrinsic_slow<'tcx>(
     fn_name: &str,
     args: &[Spanned<Operand<'tcx>>],
@@ -1188,16 +1285,19 @@ fn float_unop<'tcx>(
     float: Float,
     name: &str,
 ) -> Vec<Root> {
-    let log = MethodRef::new(
+    let method = MethodRef::new(
         float.class(ctx),
         ctx.alloc_string(name),
-        ctx.sig([Type::Float(float)], float),
+        ctx.sig(vec![Type::Float(float); args.len()], float),
         MethodKind::Static,
         vec![].into(),
     );
-    let log = ctx.alloc_methodref(log);
-    let arg0 = handle_operand(&args[0].node, ctx);
-    let value = ctx.call(log, &[arg0], IsPure::NOT);
+    let method = ctx.alloc_methodref(method);
+    let operands: Vec<_> = args
+        .iter()
+        .map(|arg| handle_operand(&arg.node, ctx))
+        .collect();
+    let value = ctx.call(method, &operands, IsPure::NOT);
     vec![place_set(destination, value, ctx)]
 }
 /// Lower an `*_algebraic` float intrinsic to the plain IR binary op (`a OP b`). The operand type
@@ -1213,26 +1313,6 @@ fn float_algebraic<'tcx>(
     let value = ctx.biop(arg0, arg1, op);
     vec![place_set(destination, value, ctx)]
 }
-fn float_binop<'tcx>(
-    args: &[Spanned<Operand<'tcx>>],
-    destination: &Place<'tcx>,
-    ctx: &mut MethodCompileCtx<'tcx, '_>,
-    float: Float,
-    name: &str,
-) -> Vec<Root> {
-    let log = MethodRef::new(
-        float.class(ctx),
-        ctx.alloc_string(name),
-        ctx.sig([Type::Float(float), Type::Float(float)], float),
-        MethodKind::Static,
-        vec![].into(),
-    );
-    let log = ctx.alloc_methodref(log);
-    let arg0 = handle_operand(&args[0].node, ctx);
-    let arg1 = handle_operand(&args[1].node, ctx);
-    let value = ctx.call(log, &[arg0, arg1], IsPure::NOT);
-    vec![place_set(destination, value, ctx)]
-}
 /// Read the `idx`-th generic type argument of a SIMD intrinsic instance (`call_instance.args[idx]`)
 /// and lower it to a cilly `Type`. SIMD intrinsics carry their vector/element/mask types as type
 /// generics, so every passthrough arm starts by pulling one or more of them out of the instance.
@@ -1246,6 +1326,27 @@ fn simd_ty<'tcx>(
             .as_type()
             .unwrap_or_else(|| panic!("simd intrinsic generic arg {idx} works only on types!")),
     )
+}
+/// Reduce a SIMD value by comparing it with the all-set vector. The `any` and `all` intrinsics
+/// differ only in the equality builtin used to interpret that comparison.
+fn simd_reduce<'tcx>(
+    args: &[Spanned<Operand<'tcx>>],
+    destination: &Place<'tcx>,
+    call_instance: Instance<'tcx>,
+    ctx: &mut MethodCompileCtx<'tcx, '_>,
+    equality_name: &str,
+) -> Vec<Root> {
+    let vec = simd_ty(ctx, call_instance, 0);
+    let x = handle_operand(&args[0].node, ctx);
+    let equality = ctx.alloc_string(equality_name);
+    let allset = ctx.alloc_string("simd_allset");
+    let main_module = ctx.main_module();
+    let main_module = ctx[*main_module].clone();
+    let equality = main_module.static_mref(&[vec, vec], Type::Bool, equality, ctx);
+    let allset = main_module.static_mref(&[], vec, allset, ctx);
+    let allset = ctx.call(allset, EMPTY_ARGS, IsPure::NOT);
+    let value = ctx.call(equality, &[x, allset], IsPure::NOT);
+    vec![place_set(destination, value, ctx)]
 }
 /// Emit the body shared by every "passthrough" SIMD intrinsic: look up a same-shaped static builtin
 /// `name` in the main module over `inputs -> output`, call it with `ops`, and store the result into

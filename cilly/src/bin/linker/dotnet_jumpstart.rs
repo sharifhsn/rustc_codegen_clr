@@ -58,7 +58,16 @@ fn main(){{
     }}
     let args:Vec<String> = std::env::args().collect();
     let args = &args[1..];
-    let status = std::process::Command::new("{jumpstart_cmd}").arg(dll_path).args(args).status().expect("Could not start the .NET runtime.");
+    // `Environment.ProcessPath` inside the managed payload is the `dotnet` host,
+    // not this launcher. Preserve the actual executable path explicitly so Rust's
+    // `current_exe()` contract remains useful (notably for tests that copy and
+    // relaunch their own binary under a different name).
+    let status = std::process::Command::new("{jumpstart_cmd}")
+        .env("RUST_DOTNET_APPHOST", &curr_path)
+        .arg(dll_path)
+        .args(args)
+        .status()
+        .expect("Could not start the .NET runtime.");
     // The apphost is transparent: the program's exit code (a panic's 101, a process::exit N)
     // must survive to the invoking shell. A signal death has no code — report the
     // conventional 128+SIGABRT.

@@ -39,7 +39,7 @@ use crate::cli::{NewArgs, Template};
 pub fn run(args: &NewArgs) -> Result<i32> {
     let template = args.template()?;
     let name = resolve_name(args)?;
-    let dir = target_dir(args, &name)?;
+    let dir = target_dir(args)?;
 
     if dir.exists()
         && dir
@@ -108,7 +108,7 @@ fn resolve_name(args: &NewArgs) -> Result<String> {
 }
 
 /// The absolute target directory for the scaffold.
-fn target_dir(args: &NewArgs, name: &str) -> Result<PathBuf> {
+fn target_dir(args: &NewArgs) -> Result<PathBuf> {
     // If the caller passed an explicit path use it verbatim; otherwise the path IS the
     // name (cargo-new convention). Resolve against cwd without requiring it to exist.
     let raw = &args.path;
@@ -119,8 +119,6 @@ fn target_dir(args: &NewArgs, name: &str) -> Result<PathBuf> {
             .context("could not read the current directory")?
             .join(raw)
     };
-    // For the derive-name-from-last-component case this is already `<cwd>/<name>`.
-    let _ = name;
     Ok(abs)
 }
 

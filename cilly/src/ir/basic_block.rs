@@ -567,13 +567,15 @@ fn constant_equality(lhs: &Const, rhs: &Const) -> Option<bool> {
         (Const::I8(lhs), Const::I8(rhs)) => Some(lhs == rhs),
         (Const::I16(lhs), Const::I16(rhs)) => Some(lhs == rhs),
         (Const::I32(lhs), Const::I32(rhs)) => Some(lhs == rhs),
-        (Const::I64(lhs), Const::I64(rhs)) => Some(lhs == rhs),
-        (Const::ISize(lhs), Const::ISize(rhs)) => Some(lhs == rhs),
+        (Const::I64(lhs), Const::I64(rhs)) | (Const::ISize(lhs), Const::ISize(rhs)) => {
+            Some(lhs == rhs)
+        }
         (Const::U8(lhs), Const::U8(rhs)) => Some(lhs == rhs),
         (Const::U16(lhs), Const::U16(rhs)) => Some(lhs == rhs),
         (Const::U32(lhs), Const::U32(rhs)) => Some(lhs == rhs),
-        (Const::U64(lhs), Const::U64(rhs)) => Some(lhs == rhs),
-        (Const::USize(lhs), Const::USize(rhs)) => Some(lhs == rhs),
+        (Const::U64(lhs), Const::U64(rhs)) | (Const::USize(lhs), Const::USize(rhs)) => {
+            Some(lhs == rhs)
+        }
         (Const::F32(lhs), Const::F32(rhs)) => Some(lhs.0 == rhs.0),
         (Const::F64(lhs), Const::F64(rhs)) => Some(lhs.0 == rhs.0),
         _ => None,

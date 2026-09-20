@@ -12,8 +12,8 @@ use crate::ir::asm::{MissingMethodPatcher, RuntimeService};
 use crate::ir::cilnode::{ExtendKind, MethodKind};
 use crate::ir::cilroot::{BranchCond, CmpKind};
 use crate::ir::{
-    BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Int, MethodDef, MethodImpl, MethodRef,
-    StaticFieldDesc, Type,
+    BasicBlock, BinOp, CILNode, CILRoot, ClassRef, Const, Int, Interned, MethodDef, MethodImpl,
+    MethodRef, StaticFieldDesc, Type,
 };
 
 const SIZE_CLASSES: [u64; 11] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
@@ -446,21 +446,8 @@ fn pool_free_blocks(asm: &mut Assembly) -> Vec<BasicBlock> {
         } else {
             block_id + 1
         };
-        let size = asm.alloc_node(CILNode::LdArg(1));
-        let align = asm.alloc_node(CILNode::LdArg(2));
-        let class = asm.alloc_node(Const::USize(class_size));
         let mut roots = Vec::new();
-        roots.push(asm.alloc_root(CILRoot::Branch(Box::new((
-            next,
-            0,
-            Some(BranchCond::Gt(size, class, CmpKind::Unsigned)),
-        )))));
-        let class = asm.alloc_node(Const::USize(class_size));
-        roots.push(asm.alloc_root(CILRoot::Branch(Box::new((
-            next,
-            0,
-            Some(BranchCond::Gt(align, class, CmpKind::Unsigned)),
-        )))));
+        append_size_class_branches(asm, &mut roots, 1, 2, class_size, next);
         roots.push(asm.alloc_root(CILRoot::Branch(Box::new((
             class_start + idx as u32,
             0,
@@ -618,25 +605,32 @@ fn append_classify_blocks(
         } else {
             block_id + 1
         };
-        let size = asm.alloc_node(CILNode::LdArg(size_arg));
-        let align = asm.alloc_node(CILNode::LdArg(align_arg));
-        let class = asm.alloc_node(Const::USize(class_size));
         let mut roots = Vec::new();
-        roots.push(asm.alloc_root(CILRoot::Branch(Box::new((
-            next,
-            0,
-            Some(BranchCond::Gt(size, class, CmpKind::Unsigned)),
-        )))));
-        let class = asm.alloc_node(Const::USize(class_size));
-        roots.push(asm.alloc_root(CILRoot::Branch(Box::new((
-            next,
-            0,
-            Some(BranchCond::Gt(align, class, CmpKind::Unsigned)),
-        )))));
+        append_size_class_branches(asm, &mut roots, size_arg, align_arg, class_size, next);
         let class = asm.alloc_node(Const::USize(class_size));
         roots.push(asm.alloc_root(CILRoot::StLoc(class_local, class)));
         roots.push(asm.alloc_root(CILRoot::Branch(Box::new((done_block, 0, None)))));
         blocks.push(BasicBlock::new(roots, block_id, None));
+    }
+}
+
+fn append_size_class_branches(
+    asm: &mut Assembly,
+    roots: &mut Vec<Interned<CILRoot>>,
+    size_arg: u32,
+    align_arg: u32,
+    class_size: u64,
+    next: u32,
+) {
+    let size = asm.alloc_node(CILNode::LdArg(size_arg));
+    let align = asm.alloc_node(CILNode::LdArg(align_arg));
+    for value in [size, align] {
+        let class = asm.alloc_node(Const::USize(class_size));
+        roots.push(asm.alloc_root(CILRoot::Branch(Box::new((
+            next,
+            0,
+            Some(BranchCond::Gt(value, class, CmpKind::Unsigned)),
+        )))));
     }
 }
 

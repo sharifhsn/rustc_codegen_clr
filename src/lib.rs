@@ -98,6 +98,7 @@ extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_structures;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
 extern crate rustc_trait_selection;
@@ -118,9 +119,8 @@ mod binop;
 mod casts;
 /// Runtime errors and utlity functions/macros related to them
 mod codegen_error;
-/// Test harnesses — four non-interchangeable strategies (`compare_tests!` diffs output against
-/// native rustc; `run_test!` only checks the .NET run produced no stderr; `test_lib!`/`cargo_test!`
-/// only compile, never execute). See each macro's doc comment before picking one for a new test.
+/// Test harnesses: `compare_tests!` diffs output against native rustc and `test_lib!` checks
+/// library compilation. Product-shaped crate coverage lives under `cargo_tests/` and feasibility.
 pub mod compile_test;
 /// Implementation of compiletime features neccessary for interop.
 mod comptime;
@@ -167,16 +167,15 @@ use rustc_abi::HasDataLayout;
 use rustc_codegen_ssa::{
     CompiledModule, CompiledModules, CrateInfo, ModuleKind,
     back::archive::{ArArchiveBuilder, ArchiveBuilder, ArchiveBuilderBuilder},
+    target_features::internal_target_features,
     traits::CodegenBackend,
 };
-
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::{dep_graph::WorkProductMap, ty::TyCtxt};
 use rustc_session::{
-    Session,
+    EarlySession, IncrCompSession, Session,
     config::{OutputFilenames, OutputType},
 };
-
 use std::{any::Any, path::Path};
 /// Immutable string - used to save a bit of memory on storage.
 pub type IString = cilly::IString;
@@ -195,9 +194,9 @@ struct MyBackend {
 /// declaration macro.
 fn collect_native_imports(tcx: TyCtxt<'_>, asm: &mut Assembly) {
     use rustc_abi::ExternAbi;
-    use rustc_hir::attrs::NativeLibKind;
     use rustc_hir::def::DefKind;
     use rustc_span::def_id::LOCAL_CRATE;
+    use rustc_structures::NativeLibKind;
 
     let foreign_modules = tcx.foreign_modules(LOCAL_CRATE);
     for library in tcx.native_libraries(LOCAL_CRATE) {
@@ -327,7 +326,7 @@ fn pinvoke_type_error<'tcx>(
     ty: rustc_middle::ty::Ty<'tcx>,
     is_return: bool,
 ) -> Option<String> {
-    use rustc_hir::LangItem;
+    use rustc_hir::attrs::lang_items::LangItem;
     use rustc_middle::ty::TyKind;
 
     match ty.kind() {
@@ -596,7 +595,7 @@ impl CodegenBackend for MyBackend {
                 let rustc_session::config::EntryFnType::Main { sigpipe } = kind;
                 let main_ret_ty = entrypoint.ty(tcx, penv).fn_sig(tcx).output().skip_binder();
                 let start_did = tcx.require_lang_item(
-                    rustc_hir::lang_items::LangItem::Start,
+                    rustc_hir::attrs::lang_items::LangItem::Start,
                     rustc_span::DUMMY_SP,
                 );
                 let start_inst = rustc_middle::ty::Instance::expect_resolve(
@@ -648,23 +647,21 @@ impl CodegenBackend for MyBackend {
         Box::new((name, asm))
     }
 
-    fn target_config(&self, sess: &Session) -> rustc_codegen_ssa::TargetConfig {
+    fn target_config(&self, sess: &EarlySession) -> rustc_codegen_ssa::TargetConfig {
+        // The managed backend lowers Rust operations to portable CIL, but rustc still needs the
+        // architecture-mandated feature closure when evaluating `cfg(target_feature)` and ABI
+        // checks.  Current rustc asks backends to provide these as internal target features. Use
+        // rustc's shared parser so explicit `-Ctarget-feature` enables/disables are reflected in
+        // `cfg(target_feature)` as they are for the native backend; the CLR backend contributes
+        // only its portable baseline rather than pretending the host CPU is available.
         let baseline = baseline_target_features(&sess.target.arch, &sess.target.os);
-
-        // Use rustc's canonical parser so `-Ctarget-feature` participates in cfg computation,
-        // including implication closure, tied-feature validation, stability filtering, and the
-        // mandatory-ABI diagnostic.  Rust feature spellings are also our diagnostic backend
-        // spellings: actual lowering is semantic MIR/CIL lowering rather than an LLVM ISA flag.
-        let (unstable_target_features, target_features) =
-            rustc_codegen_ssa::target_features::cfg_target_feature::<1>(
-                sess,
-                |feature| std::iter::once(feature).collect(),
-                |feature| baseline.contains(&feature),
-            );
-
+        let internal_target_features = internal_target_features::<0>(
+            sess,
+            |_feature| Default::default(),
+            |feature| baseline.contains(&feature),
+        );
         rustc_codegen_ssa::TargetConfig {
-            target_features,
-            unstable_target_features,
+            internal_target_features,
             // Cranelift does not yet support f16 or f128
             has_reliable_f16: false,
             has_reliable_f16_math: false,
@@ -677,6 +674,7 @@ impl CodegenBackend for MyBackend {
         &self,
         ongoing_codegen: Box<dyn Any>,
         _sess: &Session,
+        _incr_comp_session: Option<&IncrCompSession>,
         outputs: &OutputFilenames,
         _crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
@@ -807,24 +805,4 @@ use std::alloc::Layout;
 
 pub fn custom_alloc_error_hook(layout: Layout) {
     panic!("memory allocation of {} bytes failed", layout.size());
-}
-
-// Retained as a generic MIR→cilly binop mapper. No longer used since `Assert` overflow lowering
-// switched from the `assert_<op>` surrogate to the native `panic_*_overflow` lang items.
-#[allow(dead_code)]
-fn map_binop(op: &rustc_middle::mir::BinOp) -> cilly::BinOp {
-    use rustc_middle::mir::BinOp::*;
-    match op {
-        Add | AddUnchecked | AddWithOverflow => cilly::BinOp::Add,
-        Sub | SubUnchecked | SubWithOverflow => cilly::BinOp::Sub,
-        Mul | MulUnchecked | MulWithOverflow => cilly::BinOp::Mul,
-        Div => cilly::BinOp::Div,
-        Rem => cilly::BinOp::Rem,
-        BitXor => cilly::BinOp::XOr,
-        BitOr => cilly::BinOp::Or,
-        BitAnd => cilly::BinOp::And,
-        Shl | ShlUnchecked => cilly::BinOp::Shl,
-        Shr | ShrUnchecked => cilly::BinOp::Shr,
-        _ => todo!(),
-    }
 }

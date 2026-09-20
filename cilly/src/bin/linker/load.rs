@@ -122,9 +122,7 @@ fn load_ar(r: &mut impl std::io::Read, merged: &mut AssemblyAccumulator) -> std:
     while let Some(entry_result) = archive.next_entry() {
         let mut entry = entry_result?;
         let name: String = String::from_utf8_lossy(entry.header().identifier()).into();
-        let ext = if let Some(ext) = name.split('.').next_back() {
-            ext
-        } else {
+        let Some(ext) = name.split('.').next_back() else {
             continue;
         };
         if ext.contains("bc") || ext.contains("cilly") {

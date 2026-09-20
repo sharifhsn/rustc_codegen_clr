@@ -250,40 +250,5 @@ impl DateTime {
     }
 }
 
-impl core::fmt::Display for DateTime {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Delegate to the managed `ToString()` (the invariant round-trip form) and print its UTF-16
-        // content through the idiomatic string wrapper, which decodes to Rust text.
-        let s =
-            crate::system::DotNetString::from_handle((*self).vt_instance0::<"ToString", MString>());
-        core::fmt::Display::fmt(&s, f)
-    }
-}
-
-impl core::fmt::Debug for DateTime {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Display::fmt(self, f)
-    }
-}
-
-impl PartialEq for DateTime {
-    #[inline(always)]
-    fn eq(&self, other: &Self) -> bool {
-        self.equals(*other)
-    }
-}
-impl Eq for DateTime {}
-
-impl PartialOrd for DateTime {
-    #[inline(always)]
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for DateTime {
-    #[inline(always)]
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        // `CompareTo` already returns the total-order sign, so map it straight onto `Ordering`.
-        self.compare_to(*other).cmp(&0)
-    }
-}
+impl_managed_display_value!(DateTime);
+impl_managed_ordering!(DateTime, equals);

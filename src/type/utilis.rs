@@ -1,5 +1,4 @@
 use cilly::{Assembly, ClassRef, Type, bimap::Interned, utilis::escape_class_name};
-use rustc_hir::attrs::CrateType;
 use rustc_middle::ty::Const;
 use rustc_middle::ty::List;
 use rustc_middle::ty::{
@@ -7,6 +6,7 @@ use rustc_middle::ty::{
     TypeFoldable,
 };
 use rustc_span::def_id::DefId;
+use rustc_structures::CrateType;
 
 /// This struct represetnts either a primitive .NET type (F32,F64), or stores information on how to lookup a more complex type (struct,class,array)
 use serde::{Deserialize, Serialize};
@@ -43,25 +43,12 @@ pub fn is_name_magic(name: &str) -> bool {
 }
 #[must_use]
 pub fn garg_to_usize<'tcx>(garg: GenericArg<'tcx>, _ctx: TyCtxt<'tcx>) -> u64 {
-    let usize_const = garg
-        .as_const()
-        .expect("Generic argument was not an constant!");
-    let kind = usize_const.kind();
-    match kind {
-        ConstKind::Value(val) => {
-            let scalar = val
-                .try_to_leaf()
-                .expect("String const did not contain valid scalar!");
-            let ty = val.ty;
-            assert!(
-                ty.is_integral(),
-                "Generic argument was not a unit type! ty:{ty:?}",
-            );
-            u64::try_from(scalar.to_uint(scalar.size()))
-                .expect("Scalar of type usize has value over 2^64")
-        }
-        _ => todo!("Can't convert generic arg of const kind {kind:?} to string!"),
-    }
+    let (value, ty) = crate::utilis::garg_to_uint(garg);
+    assert!(
+        ty.is_integral(),
+        "Generic argument was not a unit type! ty:{ty:?}",
+    );
+    u64::try_from(value).expect("Scalar of type usize has value over 2^64")
 }
 #[must_use]
 pub fn tuple_name(elements: &[Type], asm: &Assembly) -> String {
@@ -70,6 +57,36 @@ pub fn tuple_name(elements: &[Type], asm: &Assembly) -> String {
         "Tuple{generic_count}{generics}",
         generic_count = generics.len()
     )
+}
+
+/// Names a Rust tuple while retaining layout information erased by CIL lowering.
+///
+/// Every Rust ZST lowers to [`Type::Void`], but ZSTs can still impose different alignment on their
+/// containing tuple. For example, `(i32, ())` is four bytes while `(i32, Align8Zst)` is eight. A
+/// name based only on lowered element types aliases those distinct CLR value types and makes the
+/// transactional shard merge correctly reject their conflicting explicit layouts.
+#[must_use]
+pub fn rust_tuple_name(
+    elements: &[Type],
+    asm: &Assembly,
+    semantic_size: u64,
+    semantic_align: u64,
+    source_field_offsets: &[u64],
+) -> String {
+    let name = tuple_name(elements, asm);
+    if elements.contains(&Type::Void) {
+        assert_eq!(elements.len(), source_field_offsets.len());
+        let mut name = format!(
+            "{name}_sz{semantic_size}_al{semantic_align}_fc{}",
+            source_field_offsets.len()
+        );
+        for offset in source_field_offsets {
+            name.push_str(&format!("_o{offset}"));
+        }
+        name
+    } else {
+        name
+    }
 }
 /// Creates a tuple with no more than 8 elements.
 #[must_use]
@@ -97,7 +114,7 @@ pub fn is_fat_ptr<'tcx>(
     let abi = layout.0.0.backend_repr;
     match abi {
         BackendRepr::Scalar(_) => false,
-        BackendRepr::ScalarPair(_, _) => true,
+        BackendRepr::ScalarPair { .. } => true,
         _ => panic!("Unexpected abi of pointer to {ptr_type:?}. The ABI was:{abi:?}"),
     }
 }
@@ -110,7 +127,7 @@ pub fn monomorphize<'tcx, T: TypeFoldable<TyCtxt<'tcx>> + Clone>(
     instance.instantiate_mir_and_normalize_erasing_regions(
         ctx,
         rustc_middle::ty::TypingEnv::fully_monomorphized(),
-        EarlyBinder::bind(ty),
+        EarlyBinder::bind(ctx, ty),
     )
 }
 /// Converts a generic argument to a string, and panics if it could not.
@@ -267,7 +284,8 @@ pub fn stable_adt_name<'tcx>(
 
 #[cfg(test)]
 mod identity_tests {
-    use super::internal_adt_name;
+    use super::{internal_adt_name, rust_tuple_name, tuple_name};
+    use cilly::{Assembly, Int, Type};
 
     #[test]
     fn same_display_name_with_different_def_path_hashes_stays_distinct() {
@@ -281,6 +299,41 @@ mod identity_tests {
         let left = internal_adt_name("crate::f::__DeserializeWith", "11112222");
         let right = internal_adt_name("crate::f::__DeserializeWith", "11112222");
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn erased_zst_tuple_names_retain_size_and_alignment() {
+        let asm = Assembly::default();
+        let elements = [Type::Int(Int::I32), Type::Void];
+
+        let ordinary = rust_tuple_name(&elements, &asm, 4, 4, &[0, 4]);
+        let aligned = rust_tuple_name(&elements, &asm, 8, 8, &[0, 0]);
+
+        assert_ne!(ordinary, aligned);
+        assert!(ordinary.ends_with("_sz4_al4_fc2_o0_o4"));
+        assert!(aligned.ends_with("_sz8_al8_fc2_o0_o0"));
+    }
+
+    #[test]
+    fn materialized_tuple_names_keep_the_existing_identity() {
+        let asm = Assembly::default();
+        let elements = [Type::Int(Int::I32), Type::Bool];
+
+        assert_eq!(
+            rust_tuple_name(&elements, &asm, 8, 4, &[0, 4]),
+            tuple_name(&elements, &asm)
+        );
+    }
+
+    #[test]
+    fn erased_zst_tuple_names_retain_each_source_field_offset() {
+        let asm = Assembly::default();
+        let elements = [Type::Void, Type::Int(Int::I32), Type::Void];
+
+        let left = rust_tuple_name(&elements, &asm, 8, 8, &[0, 0, 4]);
+        let right = rust_tuple_name(&elements, &asm, 8, 8, &[4, 0, 0]);
+
+        assert_ne!(left, right);
     }
 }
 // WARNING: this is *wrong*: For some reason, `Instance::try_resolve` should not operate on structs(why?), and this just silences the newly introduced warning.

@@ -89,6 +89,117 @@ macro_rules! dotnet_generic_impl {
     };
 }
 
+/// Internal call builder shared by the arity-specific arms below. A missing return clause maps to
+/// the generic bridge's `()` output and `()` receiver slot; a present clause carries the concrete
+/// return type plus its definition-shape signature type.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __dotnet_generic_call {
+    (@call1 $asm:expr, $class:expr, $cgtuple:ty, $recv_ty:ty, $mname:literal, $recv:ident
+        -> $rty:ty as $rsig:ty) => {
+        $crate::intrinsics::rustc_clr_interop_generic_call1::<
+            { $asm },
+            { $class },
+            false,
+            $mname,
+            2,
+            $cgtuple,
+            ($rsig,),
+            $rty,
+            $recv_ty,
+        >($recv)
+    };
+    (@call1 $asm:expr, $class:expr, $cgtuple:ty, $recv_ty:ty, $mname:literal, $recv:ident) => {
+        $crate::intrinsics::rustc_clr_interop_generic_call1::<
+            { $asm },
+            { $class },
+            false,
+            $mname,
+            2,
+            $cgtuple,
+            ((),),
+            (),
+            $recv_ty,
+        >($recv)
+    };
+    (@call2
+        $asm:expr, $class:expr, $cgtuple:ty, $recv_ty:ty, $mname:literal,
+        $recv:ident, $a1:ident: $a1ty:ty as $a1sig:ty
+        , -> $rty:ty as $rsig:ty
+    ) => {
+        $crate::intrinsics::rustc_clr_interop_generic_call2::<
+            { $asm },
+            { $class },
+            false,
+            $mname,
+            2,
+            $cgtuple,
+            ($rsig, $a1sig),
+            $rty,
+            $recv_ty,
+            $a1ty,
+        >($recv, $a1)
+    };
+    (@call2
+        $asm:expr, $class:expr, $cgtuple:ty, $recv_ty:ty, $mname:literal,
+        $recv:ident, $a1:ident: $a1ty:ty as $a1sig:ty
+    ) => {
+        $crate::intrinsics::rustc_clr_interop_generic_call2::<
+            { $asm },
+            { $class },
+            false,
+            $mname,
+            2,
+            $cgtuple,
+            ((), $a1sig),
+            (),
+            $recv_ty,
+            $a1ty,
+        >($recv, $a1)
+    };
+    (@call3
+        $asm:expr, $class:expr, $cgtuple:ty, $recv_ty:ty, $mname:literal,
+        $recv:ident,
+        $a1:ident: $a1ty:ty as $a1sig:ty,
+        $a2:ident: $a2ty:ty as $a2sig:ty
+        , -> $rty:ty as $rsig:ty
+    ) => {
+        $crate::intrinsics::rustc_clr_interop_generic_call3::<
+            { $asm },
+            { $class },
+            false,
+            $mname,
+            2,
+            $cgtuple,
+            ($rsig, $a1sig, $a2sig),
+            $rty,
+            $recv_ty,
+            $a1ty,
+            $a2ty,
+        >($recv, $a1, $a2)
+    };
+    (@call3
+        $asm:expr, $class:expr, $cgtuple:ty, $recv_ty:ty, $mname:literal,
+        $recv:ident,
+        $a1:ident: $a1ty:ty as $a1sig:ty,
+        $a2:ident: $a2ty:ty as $a2sig:ty
+    ) => {
+        $crate::intrinsics::rustc_clr_interop_generic_call3::<
+            { $asm },
+            { $class },
+            false,
+            $mname,
+            2,
+            $cgtuple,
+            ((), $a1sig, $a2sig),
+            (),
+            $recv_ty,
+            $a1ty,
+            $a2ty,
+        >($recv, $a1, $a2)
+    };
+}
+
 /// Internal muncher: emits one wrapper fn per method line, then recurses on the rest.
 ///
 /// `Sig`-type slots are captured as `:ty` so a `r#gen!(N)` macro-call (a valid type-position macro)
@@ -121,21 +232,18 @@ macro_rules! __dotnet_generic_methods {
         }
     };
 
-    // ---- instance method, 0 value args (receiver only): -> Ret ----
+    // ---- instance method, 0 value args (receiver only), optional return ----
     (
         @alias $alias:ident < $($cg:ident),+ >
         @asm { $asm:expr } @class { $class:expr } @cg { $cgtuple:ty }
-        fn $fname:ident = $mname:literal ( $recv:ident ) -> $rty:ty as $rsig:ty ;
+        fn $fname:ident = $mname:literal ( $recv:ident ) $(-> $rty:ty as $rsig:ty)? ;
         $( $rest:tt )*
     ) => {
-        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >) -> $rty {
-            $crate::intrinsics::rustc_clr_interop_generic_call1::<
-                { $asm }, { $class }, false, $mname, 2,
-                $cgtuple,
-                ( $rsig, ),
-                $rty,
-                $alias< $($cg),+ >,
-            >($recv)
+        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >) $(-> $rty)? {
+            $crate::__dotnet_generic_call! {
+                @call1 { $asm }, { $class }, $cgtuple, $alias< $($cg),+ >, $mname, $recv
+                $(-> $rty as $rsig)?
+            }
         }
         $crate::__dotnet_generic_methods! {
             @alias $alias < $($cg),+ >
@@ -144,21 +252,19 @@ macro_rules! __dotnet_generic_methods {
         }
     };
 
-    // ---- instance method, 0 value args (receiver only), void return (e.g. `Clear()`) ----
+    // ---- instance method, 1 value arg, optional return ----
     (
         @alias $alias:ident < $($cg:ident),+ >
         @asm { $asm:expr } @class { $class:expr } @cg { $cgtuple:ty }
-        fn $fname:ident = $mname:literal ( $recv:ident );
+        fn $fname:ident = $mname:literal ( $recv:ident , $a1:ident : $a1ty:ty as $a1sig:ty ) $(-> $rty:ty as $rsig:ty)? ;
         $( $rest:tt )*
     ) => {
-        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >) {
-            $crate::intrinsics::rustc_clr_interop_generic_call1::<
-                { $asm }, { $class }, false, $mname, 2,
-                $cgtuple,
-                ( (), ),
-                (),
-                $alias< $($cg),+ >,
-            >($recv)
+        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >, $a1: $a1ty) $(-> $rty)? {
+            $crate::__dotnet_generic_call! {
+                @call2 { $asm }, { $class }, $cgtuple, $alias< $($cg),+ >, $mname,
+                $recv, $a1: $a1ty as $a1sig
+                $(, -> $rty as $rsig)?
+            }
         }
         $crate::__dotnet_generic_methods! {
             @alias $alias < $($cg),+ >
@@ -167,96 +273,19 @@ macro_rules! __dotnet_generic_methods {
         }
     };
 
-    // ---- instance method, 1 value arg: -> Ret ----
+    // ---- instance method, 2 value args, optional return ----
     (
         @alias $alias:ident < $($cg:ident),+ >
         @asm { $asm:expr } @class { $class:expr } @cg { $cgtuple:ty }
-        fn $fname:ident = $mname:literal ( $recv:ident , $a1:ident : $a1ty:ty as $a1sig:ty ) -> $rty:ty as $rsig:ty ;
+        fn $fname:ident = $mname:literal ( $recv:ident , $a1:ident : $a1ty:ty as $a1sig:ty , $a2:ident : $a2ty:ty as $a2sig:ty ) $(-> $rty:ty as $rsig:ty)? ;
         $( $rest:tt )*
     ) => {
-        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >, $a1: $a1ty) -> $rty {
-            $crate::intrinsics::rustc_clr_interop_generic_call2::<
-                { $asm }, { $class }, false, $mname, 2,
-                $cgtuple,
-                ( $rsig, $a1sig ),
-                $rty,
-                $alias< $($cg),+ >,
-                $a1ty,
-            >($recv, $a1)
-        }
-        $crate::__dotnet_generic_methods! {
-            @alias $alias < $($cg),+ >
-            @asm { $asm } @class { $class } @cg { $cgtuple }
-            $( $rest )*
-        }
-    };
-
-    // ---- instance method, 1 value arg, void return ----
-    (
-        @alias $alias:ident < $($cg:ident),+ >
-        @asm { $asm:expr } @class { $class:expr } @cg { $cgtuple:ty }
-        fn $fname:ident = $mname:literal ( $recv:ident , $a1:ident : $a1ty:ty as $a1sig:ty );
-        $( $rest:tt )*
-    ) => {
-        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >, $a1: $a1ty) {
-            $crate::intrinsics::rustc_clr_interop_generic_call2::<
-                { $asm }, { $class }, false, $mname, 2,
-                $cgtuple,
-                ( (), $a1sig ),
-                (),
-                $alias< $($cg),+ >,
-                $a1ty,
-            >($recv, $a1)
-        }
-        $crate::__dotnet_generic_methods! {
-            @alias $alias < $($cg),+ >
-            @asm { $asm } @class { $class } @cg { $cgtuple }
-            $( $rest )*
-        }
-    };
-
-    // ---- instance method, 2 value args: -> Ret ----
-    (
-        @alias $alias:ident < $($cg:ident),+ >
-        @asm { $asm:expr } @class { $class:expr } @cg { $cgtuple:ty }
-        fn $fname:ident = $mname:literal ( $recv:ident , $a1:ident : $a1ty:ty as $a1sig:ty , $a2:ident : $a2ty:ty as $a2sig:ty ) -> $rty:ty as $rsig:ty ;
-        $( $rest:tt )*
-    ) => {
-        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >, $a1: $a1ty, $a2: $a2ty) -> $rty {
-            $crate::intrinsics::rustc_clr_interop_generic_call3::<
-                { $asm }, { $class }, false, $mname, 2,
-                $cgtuple,
-                ( $rsig, $a1sig, $a2sig ),
-                $rty,
-                $alias< $($cg),+ >,
-                $a1ty,
-                $a2ty,
-            >($recv, $a1, $a2)
-        }
-        $crate::__dotnet_generic_methods! {
-            @alias $alias < $($cg),+ >
-            @asm { $asm } @class { $class } @cg { $cgtuple }
-            $( $rest )*
-        }
-    };
-
-    // ---- instance method, 2 value args, void return ----
-    (
-        @alias $alias:ident < $($cg:ident),+ >
-        @asm { $asm:expr } @class { $class:expr } @cg { $cgtuple:ty }
-        fn $fname:ident = $mname:literal ( $recv:ident , $a1:ident : $a1ty:ty as $a1sig:ty , $a2:ident : $a2ty:ty as $a2sig:ty );
-        $( $rest:tt )*
-    ) => {
-        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >, $a1: $a1ty, $a2: $a2ty) {
-            $crate::intrinsics::rustc_clr_interop_generic_call3::<
-                { $asm }, { $class }, false, $mname, 2,
-                $cgtuple,
-                ( (), $a1sig, $a2sig ),
-                (),
-                $alias< $($cg),+ >,
-                $a1ty,
-                $a2ty,
-            >($recv, $a1, $a2)
+        fn $fname< $($cg),+ >($recv: $alias< $($cg),+ >, $a1: $a1ty, $a2: $a2ty) $(-> $rty)? {
+            $crate::__dotnet_generic_call! {
+                @call3 { $asm }, { $class }, $cgtuple, $alias< $($cg),+ >, $mname,
+                $recv, $a1: $a1ty as $a1sig, $a2: $a2ty as $a2sig
+                $(, -> $rty as $rsig)?
+            }
         }
         $crate::__dotnet_generic_methods! {
             @alias $alias < $($cg),+ >

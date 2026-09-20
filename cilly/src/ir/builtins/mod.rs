@@ -3,8 +3,8 @@ use std::num::{NonZeroU8, NonZeroU32};
 use crate::{StaticFieldDesc, utilis::mstring_to_utf8ptr};
 
 use super::{
-    Access, Assembly, BasicBlock, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc, Int,
-    MethodDef, MethodImpl, MethodRef, Type,
+    Access, Assembly, BasicBlock, BinOp, CILNode, CILRoot, ClassDef, ClassRef, Const, FieldDesc,
+    Int, MethodDef, MethodImpl, MethodRef, Type,
     asm::{MissingMethodPatcher, RuntimeService},
     bimap::Interned,
     cilnode::{MethodKind, PtrCastRes},
@@ -23,6 +23,8 @@ pub mod thread;
 pub use thread::*;
 pub mod int128;
 pub use int128::*;
+pub mod int_to_float;
+pub use int_to_float::*;
 pub mod f16;
 pub use f16::*;
 pub mod simd;
@@ -41,6 +43,37 @@ pub(super) fn adapt_runtime_result(
 ) -> Interned<CILNode> {
     let output = *asm[asm[mref].sig()].output();
     asm.adapt_call_result(value, source, output)
+}
+
+/// Registers a binary operation implemented by a BCL operator method. The Half and Int128
+/// shims use the same one-block body; only the operand/return types and owning class differ.
+pub(super) fn indirect_binop(
+    patcher: &mut MissingMethodPatcher,
+    name: Interned<crate::IString>,
+    class: ClassRef,
+    lhs_type: Type,
+    rhs_type: Type,
+    op: BinOp,
+    ret_type: Type,
+) {
+    let generator = move |_, asm: &mut Assembly| {
+        let lhs = asm.alloc_node(CILNode::LdArg(0));
+        let rhs = asm.alloc_node(CILNode::LdArg(1));
+        let class = class.clone();
+        let call_op = class.static_mref(
+            &[lhs_type, rhs_type],
+            ret_type,
+            asm.alloc_string(op.dotnet_name()),
+            asm,
+        );
+        let call = asm.alloc_node(CILNode::call(call_op, [lhs, rhs]));
+        let ret = asm.alloc_root(CILRoot::Ret(call));
+        MethodImpl::MethodBody {
+            blocks: vec![BasicBlock::new(vec![ret], 0, None)],
+            locals: vec![],
+        }
+    };
+    patcher.insert(name, Box::new(generator));
 }
 
 #[cfg(test)]

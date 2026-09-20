@@ -142,7 +142,7 @@ impl<'tcx, 'asm> MethodCompileCtx<'tcx, 'asm> {
             .instantiate_mir_and_normalize_erasing_regions(
                 self.tcx(),
                 rustc_middle::ty::TypingEnv::fully_monomorphized(),
-                rustc_middle::ty::EarlyBinder::bind(ty),
+                rustc_middle::ty::EarlyBinder::bind(self.tcx(), ty),
             )
     }
 

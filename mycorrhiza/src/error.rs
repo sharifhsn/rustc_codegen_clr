@@ -156,12 +156,11 @@ impl core::fmt::Display for ManagedException {
 // triggers a `FailFast` ("unwinding crossed a nounwind ABI boundary") before the IL catch ever runs.
 #[doc = "__rustc_codegen_clr_intrinsic_v1"]
 #[doc(hidden)]
-#[allow(unused_variables)]
 #[inline(never)]
 pub unsafe fn rustc_clr_interop_try_catch(
-    try_fn: fn(*mut u8),
-    data: *mut u8,
-    catch_fn: fn(*mut u8),
+    _try_fn: fn(*mut u8),
+    _data: *mut u8,
+    _catch_fn: fn(*mut u8),
 ) -> i32 {
     core::intrinsics::abort();
 }

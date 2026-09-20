@@ -182,19 +182,20 @@ fn endpoint_from_sockaddr(asm: &mut Assembly, sa_ptr: Interned<CILNode>) -> Inte
 /// For the FLOOR proof only SOCKET read/write are exercised, so `read`/`write`
 /// dispatch SOCKET vs FILE with a branch in the wrapper body. We special-case it
 /// without the generic errno wrapper because the body needs internal blocks.
+macro_rules! insert_rw {
+    ($asm:expr, $patcher:expr, $name:literal, $file_fn:literal, $sock_fn:literal) => {{
+        $patcher.insert(
+            $asm.alloc_string($name),
+            Box::new(move |_, asm: &mut Assembly| rw_dispatch_body(asm, $file_fn, $sock_fn)),
+        );
+    }};
+}
+
 fn insert_read(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("read");
-    let generator = move |_, asm: &mut Assembly| {
-        rw_dispatch_body(asm, "rcl_dotnet_fs_read", "rcl_dotnet_net_recv")
-    };
-    patcher.insert(name, Box::new(generator));
+    insert_rw!(asm, patcher, "read", "rcl_dotnet_fs_read", "rcl_dotnet_net_recv");
 }
 fn insert_write(asm: &mut Assembly, patcher: &mut MissingMethodPatcher) {
-    let name = asm.alloc_string("write");
-    let generator = move |_, asm: &mut Assembly| {
-        rw_dispatch_body(asm, "rcl_dotnet_fs_write", "rcl_dotnet_net_send")
-    };
-    patcher.insert(name, Box::new(generator));
+    insert_rw!(asm, patcher, "write", "rcl_dotnet_fs_write", "rcl_dotnet_net_send");
 }
 
 /// Body shared by `read`/`write`: `(fd, buf, len) -> isize`.
@@ -1377,7 +1378,8 @@ fn insert_timerfd_fallback(asm: &mut Assembly, patcher: &mut MissingMethodPatche
                 Type::Int(Int::I32),
                 "{symbol} must return c_int"
             );
-            let set_errno = set_errno(asm, ENOSYS);
+            let errno = asm.alloc_node(Const::I32(ENOSYS));
+            let set_errno = set_errno_node(asm, errno);
             let unsupported = asm.alloc_node(Const::I32(-1));
             let ret = asm.alloc_root(CILRoot::Ret(unsupported));
             MethodImpl::MethodBody {

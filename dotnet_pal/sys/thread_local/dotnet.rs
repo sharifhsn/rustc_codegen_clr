@@ -29,12 +29,11 @@
 //!   the per-thread key table, each key a `GCHandle`-pinned `ThreadLocal<IntPtr>`
 //!   reached through the BCL hooks `rcl_dotnet_tls_{create,get,set}` (see
 //!   `cilly/src/ir/builtins/dotnet.rs`). This is what makes storage per-thread.
-//! * **`guard::enable`** — a leak-on-exit no-op. Real `pthread_key_create`
-//!   destructors run at thread exit; this slice has no thread-exit destructor
-//!   hook, so TLS values are leaked when a thread ends (acceptable: the same
-//!   trade-off the wasm/zkvm guards make, and no test relies on TLS-drop). Because
-//!   the destructor never runs, the `os.rs` "destructor running" sentinel (`1`) is
-//!   never written, but the storage logic handles it correctly regardless.
+//! * **`guard::enable`** — a cheap registration hook. The managed thread entry
+//!   invokes [`run_dtors`] after the Rust start closure returns, so values are
+//!   dropped before the managed `Thread` reports completion. The key list is
+//!   intentionally process-lived (matching the Windows/Xous PALs): keys cannot
+//!   be unregistered, but their per-thread values are reclaimed at thread exit.
 //!
 //! The BCL hooks are the only `extern`/PAL surface; everything else is the std
 //! `os.rs` storage logic unchanged.
@@ -361,7 +360,11 @@ fn abort_on_dtor_unwind(f: impl FnOnce()) {
 // ---------------------------------------------------------------------------
 
 pub mod key {
-    use crate::sync::atomic::{Atomic, AtomicUsize, Ordering};
+    use crate::alloc::System;
+    use crate::boxed::Box;
+    use crate::mem::ManuallyDrop;
+    use crate::ptr;
+    use crate::sync::atomic::{Atomic, AtomicPtr, AtomicUsize, Ordering};
 
     unsafe extern "C" {
         /// `new ThreadLocal<nint>()`, `GCHandle`-pinned; returns the handle as the
@@ -386,8 +389,9 @@ pub mod key {
 
     /// Allocate a fresh per-thread TLS key (a managed `ThreadLocal<IntPtr>`).
     ///
-    /// The destructor is accepted for API parity with the OS key path but is
-    /// NEVER stored/run in this slice (see `guard::enable` — leak on thread exit).
+    /// The destructor is accepted for API parity with the OS key path. The
+    /// [`LazyKey`] owner registers it once its managed key wins initialization;
+    /// [`run_dtors`] then invokes it on the owning thread during thread exit.
     #[inline]
     pub fn create(_dtor: Option<Dtor>) -> Key {
         // SAFETY: a pure BCL constructor call; always returns a fresh handle.
@@ -423,6 +427,80 @@ pub mod key {
     /// `key` must be a key returned by [`create`]; it must not be used again.
     #[inline]
     pub unsafe fn destroy(_key: Key) {}
+
+    struct DtorNode {
+        key: Key,
+        dtor: Dtor,
+        next: *mut DtorNode,
+    }
+
+    // The list is process-global and intentionally never unregistered. The
+    // managed key and function pointer are both process-lived, so the node can
+    // safely be leaked until process teardown. This also avoids taking a mutex
+    // from the allocator/TLS path.
+    unsafe impl Send for DtorNode {}
+    unsafe impl Sync for DtorNode {}
+
+    static DTORS: Atomic<*mut DtorNode> = AtomicPtr::new(ptr::null_mut());
+
+    unsafe fn register_dtor(key: Key, dtor: Dtor) {
+        // Use the system allocator rather than a potentially TLS-backed global
+        // allocator. This is the same bootstrap discipline used by upstream's
+        // Windows/Xous key lists.
+        let mut node = ManuallyDrop::new(Box::new_in(
+            DtorNode { key, dtor, next: ptr::null_mut() },
+            System,
+        ));
+
+        let mut head = DTORS.load(Ordering::Acquire);
+        loop {
+            node.next = head;
+            match DTORS.compare_exchange_weak(head, &mut **node, Ordering::Release, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(new_head) => head = new_head,
+            }
+        }
+    }
+
+    /// Run all destructors belonging to the current managed thread.
+    ///
+    /// .NET's `ThreadLocal<T>` gives us per-thread storage but has no callback
+    /// equivalent to `pthread_key_create`'s destructor. The thread PAL calls
+    /// this function immediately after the Rust start closure returns. Like
+    /// upstream's Windows implementation, we make several passes so a
+    /// destructor may initialize another TLS value without leaking it forever.
+    pub unsafe fn run_dtors() {
+        for _ in 0..5 {
+            let mut any_run = false;
+            let mut cur = DTORS.load(Ordering::Acquire);
+            while !cur.is_null() {
+                let (key, dtor, next) = unsafe {
+                    let node = &*cur;
+                    (node.key, node.dtor, node.next)
+                };
+                cur = next;
+
+                // `1` is the in-destructor sentinel used by Storage. Do not
+                // feed it to user code as though it were an allocated value.
+                let value = unsafe { get(key) };
+                if value.is_null() || value.addr() <= 1 {
+                    continue;
+                }
+
+                // Clear before invoking user code. This is required for
+                // reentrant `thread_local!` access and mirrors the native key
+                // implementations.
+                unsafe { set(key, ptr::null_mut()) };
+                unsafe { dtor(value) };
+                any_run = true;
+            }
+
+            if !any_run {
+                break;
+            }
+        }
+    }
 
     /// A `LazyKey` lazily allocates a `Key` on first use. Same shape and racy-CAS
     /// initialization as `sys::thread_local::key::racy::LazyKey`, specialised to
@@ -461,8 +539,19 @@ pub mod key {
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                // The CAS succeeded, so we've created the actual key.
-                Ok(_) => key,
+                // The CAS succeeded, so we've created the actual key. Publish
+                // its destructor after the key is fully initialized; a thread
+                // can only observe its own TLS value, so another thread racing
+                // with this registration cannot lose a destructor for itself.
+                Ok(_) => {
+                    if let Some(dtor) = self.dtor {
+                        // SAFETY: `key` is the live managed key just installed
+                        // in this `LazyKey`; `dtor` is a static callback from
+                        // the thread-local storage implementation.
+                        unsafe { register_dtor(key, dtor) };
+                    }
+                    key
+                }
                 // Someone beat us to it: adopt their key, drop ours.
                 Err(n) => {
                     // SAFETY: `key` is freshly created and used nowhere else.
@@ -479,16 +568,22 @@ pub mod key {
 }
 
 // ---------------------------------------------------------------------------
-// guard::enable — leak-on-exit no-op (no thread-exit destructor hook yet).
+// guard::enable — registration hook. The actual callback runs from the managed
+// thread trampoline, where the PAL has a precise thread-exit boundary.
 // ---------------------------------------------------------------------------
 
 pub fn enable() {
-    // FIXME: once the .NET PAL grows a thread-exit callback, this should walk the
-    // live keys running destructors and then call `crate::rt::thread_cleanup`.
-    // For now — exactly like the wasm/zkvm guards — we leak TLS values on thread
-    // exit and rely on process teardown. NOTE: this is a genuine no-op (it
-    // introduces NO global state), so it does not reintroduce the global-storage
-    // bug this slice fixes.
-    #[allow(unused_imports)]
-    use crate::rt::thread_cleanup;
+    // The key list is populated by `LazyKey::force`; no per-thread state is
+    // needed here. Keeping this function cheap preserves the hot TLS access
+    // path while retaining the upstream `guard::enable` contract.
+}
+
+/// Called by the .NET thread trampoline after the Rust start closure returns.
+/// Keep the unsafe key walk private to this PAL module and finish with the
+/// standard runtime cleanup (which drops `thread::current()`'s handle).
+pub(crate) fn run_dtors() {
+    // SAFETY: the caller is the managed thread's exit boundary. No Rust user
+    // code runs on this thread after this function returns.
+    unsafe { key::run_dtors() };
+    crate::rt::thread_cleanup();
 }
